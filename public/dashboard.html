@@ -114,7 +114,9 @@
   async function get(path) {
     const headers = {};
     const key = keyEl.value.trim();
+    const store = storeEl.value.trim();
     if (key) headers['X-Api-Key'] = key;
+    if (store) headers['X-Store-Id'] = store;
     const r = await fetch(path, { headers });
     if (!r.ok) {
       let msg = r.statusText;
@@ -123,6 +125,15 @@
     }
     return r.json();
   }
+
+  keyEl.addEventListener('change', () => {
+    if (keyEl.value.trim()) localStorage.setItem('store_api_key', keyEl.value.trim());
+  });
+  storeEl.addEventListener('change', () => {
+    if (storeEl.value.trim()) localStorage.setItem('store_id', storeEl.value.trim());
+  });
+  keyEl.value = localStorage.getItem('store_api_key') ?? '';
+  storeEl.value = localStorage.getItem('store_id') ?? '';
 
   async function load() {
     const store = storeEl.value.trim();

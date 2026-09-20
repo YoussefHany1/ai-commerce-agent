@@ -3,10 +3,12 @@ import { z } from 'zod';
 import { automationRepo } from '../db/repos.js';
 import { runAllAutomation } from '../services/automation.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey } from '../lib/auth.js';
+import { requireApiKey, requireStoreOrOperator } from '../lib/auth.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
+const storeIdRef = (req: any) =>
+  ((req as any).params as { storeId?: string })?.storeId ?? ((req as any).body as { storeId?: string })?.storeId;
 const actionSchema = z.object({ type: z.literal('whatsapp_text'), text: z.string().min(1) });
 const createSchema = z.object({
   storeId: z.string(),
@@ -21,7 +23,7 @@ const updateSchema = createSchema.partial().required({ storeId: true });
 export async function automation(app: FastifyInstance) {
   app.post(
     '/api/automation/rules',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = createSchema.parse(req.body);
       const id = await automationRepo.create(body.storeId, body);
@@ -29,14 +31,14 @@ export async function automation(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/automation/rules/:storeId', { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] }, async (req) => {
+  app.get('/api/automation/rules/:storeId', { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] }, async (req) => {
     const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
     return { storeId, rules: await automationRepo.list(storeId) };
   });
 
   app.put(
     '/api/automation/rules/:ruleId',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { ruleId } = z.object({ ruleId: z.string().min(1) }).parse(req.params);
       const body = updateSchema.parse(req.body);
@@ -48,7 +50,7 @@ export async function automation(app: FastifyInstance) {
 
   app.delete(
     '/api/automation/rules/:ruleId',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { ruleId } = z.object({ ruleId: z.string().min(1) }).parse(req.params);
       const body = z.object({ storeId: z.string() }).parse(req.body);

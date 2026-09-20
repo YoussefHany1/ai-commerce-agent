@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, beforeAll, afterAll } from 'vitest';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -38,6 +38,9 @@ const mocks = vi.hoisted(() => {
     remove: vi.fn(),
     updateSettings: vi.fn(),
     updateSettingsEncrypted: vi.fn(),
+    setApiKey: vi.fn(async () => {}),
+    clearApiKey: vi.fn(async () => {}),
+    getApiKeyHint: vi.fn(async () => null),
   };
   const connectionRepo = { setTokens: vi.fn(), getTokens: vi.fn(), get: vi.fn() };
   const catalogRepo = { list: vi.fn() };
@@ -131,8 +134,21 @@ const infra = vi.hoisted(() => {
   return { store, redis };
 });
 
+const tenant = vi.hoisted(() => ({
+  rows: vi.fn(async () => [] as Array<{ hash: string | null; hint: string | null }>),
+}));
+
 vi.mock('../lib/redis.js', () => ({ getRedis: async () => infra.redis }));
 vi.mock('../db/repos.js', () => ({ ...mocks }));
+vi.mock('../db/client.js', () => ({
+  withTenant: async (_storeId: string, fn: (tx: any) => Promise<unknown>) =>
+    fn({
+      select: () => ({
+        from: () => ({ where: async () => tenant.rows() }),
+      }),
+    }),
+  withOperator: async (fn: (tx: any) => Promise<unknown>) => fn({}),
+}));
 vi.mock('../lib/health.js', () => services.health);
 vi.mock('../services/retrieval.js', () => services.retrieval);
 vi.mock('../services/agent.js', () => services.agent);
@@ -630,5 +646,131 @@ describe('routes: pdpl access + erasure', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ erased: true });
+  });
+});
+
+describe('routes: store-scoped api keys', () => {
+  let app: App;
+  beforeEach(async () => {
+    infra.store.clear();
+    vi.clearAllMocks();
+    app = await buildApp();
+  });
+
+  const key = `sk_live_${'b'.repeat(64)}`;
+  const secondKey = `sk_live_${'c'.repeat(64)}`;
+  const keyRow = (token: string) => ({ hash: createHash('sha256').update(token).digest('hex'), hint: token.slice(-4) });
+
+  function seedStoreKey(token: string) {
+    tenant.rows.mockResolvedValue([keyRow(token)]);
+  }
+
+  it('mints a session with a valid store api key via X-Store-Id/X-Api-Key', async () => {
+    seedStoreKey(key);
+    mocks.storeRepo.get.mockImplementation(async () => store('s1'));
+    mocks.customerRepo.upsert.mockResolvedValue('cust-1');
+    mocks.conversationRepo.ensureOpen.mockResolvedValue('conv-1');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/session',
+      headers: { 'x-api-key': key, 'x-store-id': 's1', 'content-type': 'application/json' },
+      payload: JSON.stringify({ storeId: 's1', phone: '+966555111222' }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(typeof res.json().token).toBe('string');
+  });
+
+  it('rejects a store api key that does not match the requested store', async () => {
+    seedStoreKey(secondKey);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/session',
+      headers: { 'x-api-key': key, 'content-type': 'application/json' },
+      payload: JSON.stringify({ storeId: 's2', phone: '+966555111222' }),
+    });
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toMatchObject({ error: 'unauthorized' });
+  });
+
+  it('rejects a malformed store api key', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/session',
+      headers: { 'x-api-key': 'sk_live_short', 'content-type': 'application/json' },
+      payload: JSON.stringify({ storeId: 's1' }),
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('rejects missing credentials', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/session',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({ storeId: 's1' }),
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('requires a store for a store scoped key', async () => {
+    seedStoreKey(key);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/session',
+      headers: { 'x-api-key': key, 'content-type': 'application/json' },
+      payload: JSON.stringify({ phone: '+966555111222' }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ error: 'store_required' });
+  });
+
+  it('accepts the operator key via bearer token on tenant routes', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/jobs/s1',
+      headers: { authorization: `Bearer ${ADMIN_KEY}` },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('generates and rotates a store key as operator', async () => {
+    mocks.storeRepo.get.mockImplementation(async () => store('s1'));
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/stores/s1/keys',
+      headers: { 'x-api-key': ADMIN_KEY },
+    });
+    expect(created.statusCode).toBe(200);
+    const { key: newKey, apiKeyHint } = created.json();
+    expect(newKey).toMatch(/^sk_live_[0-9a-f]{64}$/);
+    expect(newKey.slice(-4)).toBe(apiKeyHint);
+    expect(mocks.storeRepo.setApiKey).toHaveBeenCalledWith('s1', expect.stringMatching(/^[0-9a-f]{64}$/), apiKeyHint);
+
+    mocks.storeRepo.getApiKeyHint.mockResolvedValue(apiKeyHint);
+    const hint = await app.inject({
+      method: 'GET',
+      url: '/api/stores/s1/keys',
+      headers: { 'x-api-key': ADMIN_KEY },
+    });
+    expect(hint.statusCode).toBe(200);
+    expect(hint.json()).toEqual({ storeId: 's1', apiKeyHint });
+
+    const revoked = await app.inject({
+      method: 'DELETE',
+      url: '/api/stores/s1/keys',
+      headers: { 'x-api-key': ADMIN_KEY },
+    });
+    expect(revoked.statusCode).toBe(200);
+    expect(mocks.storeRepo.clearApiKey).toHaveBeenCalledWith('s1');
+  });
+
+  it('does not expose store keys to a store scoped key', async () => {
+    seedStoreKey(key);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/stores/s1/keys',
+      headers: { 'x-api-key': key, 'x-store-id': 's1' },
+    });
+    expect(res.statusCode).toBe(401);
   });
 });

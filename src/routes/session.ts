@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { storeRepo, customerRepo, conversationRepo } from '../db/repos.js';
-import { requireApiKey } from '../lib/auth.js';
+import { requireStoreOrOperator } from '../lib/auth.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
 import { createSession } from '../lib/session.js';
 import { config } from '../config.js';
@@ -11,7 +11,7 @@ const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
 export async function session(app: FastifyInstance) {
   app.post(
     '/api/session',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator((req) => (req.body as { storeId?: string })?.storeId), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = z
         .object({

@@ -1,8 +1,11 @@
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import { eq } from 'drizzle-orm';
 import { config } from '../config.js';
 import { getRedis } from './redis.js';
 import { reqIp } from './rateLimit.js';
+import { withTenant } from '../db/client.js';
+import { stores } from '../db/schema.js';
 
 const BRUTE_WINDOW = 60;
 const BRUTE_LIMIT = 30;
@@ -49,4 +52,54 @@ export async function requireApiKey(req: FastifyRequest, reply: FastifyReply): P
   }
 
   reply.code(401).send({ error: 'unauthorized' });
+}
+
+export function sha256Hex(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+export const STORE_KEY_PATTERN = /^sk_live_[0-9a-f]{64}$/;
+
+export type StoreIdRef = (req: FastifyRequest) => string | undefined;
+
+async function verifyStoreApiKey(storeId: string, token: string): Promise<boolean> {
+  const hash = sha256Hex(token);
+  const hint = token.slice(-4);
+  const [row] = await withTenant(storeId, (tx) =>
+    tx
+      .select({ hash: stores.apiKeyHash, hint: stores.apiKeyHint })
+      .from(stores)
+      .where(eq(stores.id, storeId)),
+  );
+  return row?.hash === hash && row?.hint === hint;
+}
+
+export function requireStoreOrOperator(storeIdRef: StoreIdRef) {
+  return async function preHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+    if (!config.ADMIN_API_KEY) {
+      reply.code(503).send({ error: 'auth_not_configured' });
+      return;
+    }
+    const header = req.headers.authorization;
+    const bearer = Array.isArray(header) ? header[0] : header;
+    let token = bearer?.startsWith('Bearer ') ? bearer.slice('Bearer '.length) : null;
+
+    if (!token) {
+      const apiKeyHeader = req.headers['x-api-key'];
+      token = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader ?? null;
+    }
+
+    if (!token) return reply.code(401).send({ error: 'unauthorized' });
+    if (safeEqual(token, config.ADMIN_API_KEY)) {
+      await resetApiKeyBruteCounter(reqIp(req));
+      return;
+    }
+    const storeIdFromRef = storeIdRef(req);
+    const storeIdHeader = req.headers['x-store-id'];
+    const storeId = storeIdFromRef ?? (Array.isArray(storeIdHeader) ? storeIdHeader[0] : storeIdHeader);
+    if (!storeId) return reply.code(400).send({ error: 'store_required' });
+    if (!STORE_KEY_PATTERN.test(token)) return reply.code(401).send({ error: 'unauthorized' });
+    const ok = await verifyStoreApiKey(storeId, token).catch(() => false);
+    if (!ok) return reply.code(401).send({ error: 'unauthorized' });
+  };
 }

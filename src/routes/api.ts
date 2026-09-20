@@ -1,4 +1,5 @@
 import { FastifyInstance } from 'fastify';
+import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import {
   storeRepo,
@@ -11,12 +12,13 @@ import { answerWithTools, toChatHistory } from '../services/agent.js';
 import { retrieve, embedMissingCatalog } from '../services/retrieval.js';
 import { dbPing, redisPing, rlsPing } from '../lib/health.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey } from '../lib/auth.js';
+import { requireApiKey, requireStoreOrOperator, sha256Hex } from '../lib/auth.js';
 import { requireSession, type CustomerSession } from '../lib/session.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
 const chatWindow = { limit: config.RATE_LIMIT_CHAT_PER_MIN, windowSec: 60 };
+const storeIdParam = z.object({ storeId: z.string().min(1) });
 
 export async function api(app: FastifyInstance) {
   app.get('/api/health', async (_req, reply) => {
@@ -63,7 +65,7 @@ export async function api(app: FastifyInstance) {
     '/api/stores/:storeId',
     { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
-      const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
+      const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);
       if (!store) return rep.code(404).send({ error: 'store_not_found' });
       await storeRepo.remove(storeId);
@@ -71,11 +73,47 @@ export async function api(app: FastifyInstance) {
     },
   );
 
-  app.get(
-    '/api/products/:storeId',
+  app.post(
+    '/api/stores/:storeId/keys',
     { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
-      const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
+      const { storeId } = storeIdParam.parse(req.params);
+      const store = await storeRepo.get(storeId);
+      if (!store) return rep.code(404).send({ error: 'store_not_found' });
+      const key = `sk_live_${randomBytes(32).toString('hex')}`;
+      await storeRepo.setApiKey(storeId, sha256Hex(key), key.slice(-4));
+      return { storeId, key, apiKeyHint: key.slice(-4) };
+    },
+  );
+
+  app.get(
+    '/api/stores/:storeId/keys',
+    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    async (req, rep) => {
+      const { storeId } = storeIdParam.parse(req.params);
+      const store = await storeRepo.get(storeId);
+      if (!store) return rep.code(404).send({ error: 'store_not_found' });
+      return { storeId, apiKeyHint: await storeRepo.getApiKeyHint(storeId) };
+    },
+  );
+
+  app.delete(
+    '/api/stores/:storeId/keys',
+    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    async (req, rep) => {
+      const { storeId } = storeIdParam.parse(req.params);
+      const store = await storeRepo.get(storeId);
+      if (!store) return rep.code(404).send({ error: 'store_not_found' });
+      await storeRepo.clearApiKey(storeId);
+      return { ok: true };
+    },
+  );
+
+  app.get(
+    '/api/products/:storeId',
+    { preHandler: [requireStoreOrOperator((req) => (req.params as { storeId?: string }).storeId), storeRateLimitWindow('api', apiWindow)] },
+    async (req, rep) => {
+      const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);
       if (!store) return rep.code(404).send({ error: 'store_not_found' });
       let list = await catalogRepo.list(storeId);

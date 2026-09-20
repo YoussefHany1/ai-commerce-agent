@@ -36,6 +36,13 @@
       "when": 1789700000000,
       "tag": "0004_security_rls",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790000000000,
+      "tag": "0005_store_api_keys",
+      "breakpoints": true
     }
   ]
 }

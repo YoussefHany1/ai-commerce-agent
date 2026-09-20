@@ -29,6 +29,8 @@ export const stores = pgTable('stores', {
   platform: text('platform').notNull(),
   shopDomain: text('shop_domain'),
   planStatus: text('plan_status').notNull().default('trial'),
+  apiKeyHash: text('api_key_hash'),
+  apiKeyHint: text('api_key_hint'),
   settings: jsonb('settings').$type<Record<string, unknown>>(),
   createdAt: ts(),
 });

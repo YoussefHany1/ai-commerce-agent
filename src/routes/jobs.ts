@@ -3,17 +3,19 @@ import { z } from 'zod';
 import { jobsRepo } from '../db/repos.js';
 import { resolveHandler } from '../workers/jobs.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey } from '../lib/auth.js';
+import { requireApiKey, requireStoreOrOperator } from '../lib/auth.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
+const storeIdRef = (req: any) =>
+  ((req as any).params as { storeId?: string })?.storeId ?? ((req as any).body as { storeId?: string })?.storeId;
 
 const TYPES = ['catalog.sync', 'embedding.backfill', 'metrics.rollup', 'retention.purge'] as const;
 
 export async function jobs(app: FastifyInstance) {
   app.post(
     '/api/jobs',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = z
         .object({
@@ -27,7 +29,7 @@ export async function jobs(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/jobs/:storeId', { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] }, async (req) => {
+  app.get('/api/jobs/:storeId', { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] }, async (req) => {
     const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
     const q = z.object({ status: z.string().optional() }).parse(req.query);
     return { storeId, jobs: await jobsRepo.list(storeId, q.status) };
@@ -35,7 +37,7 @@ export async function jobs(app: FastifyInstance) {
 
   app.post(
     '/api/jobs/:jobId/retry',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { jobId } = z.object({ jobId: z.string().min(1) }).parse(req.params);
       const body = z.object({ storeId: z.string() }).parse(req.body);

@@ -84,6 +84,25 @@ export const storeRepo = {
     return row ?? null;
   },
 
+  async setApiKey(storeId: string, hash: string, hint: string): Promise<void> {
+    await withOperator((tx) =>
+      tx.update(stores).set({ apiKeyHash: hash, apiKeyHint: hint }).where(eq(stores.id, storeId)),
+    );
+  },
+
+  async clearApiKey(storeId: string): Promise<void> {
+    await withOperator((tx) =>
+      tx.update(stores).set({ apiKeyHash: null, apiKeyHint: null }).where(eq(stores.id, storeId)),
+    );
+  },
+
+  async getApiKeyHint(storeId: string): Promise<string | null> {
+    const [row] = await withOperator((tx) =>
+      tx.select({ hint: stores.apiKeyHint }).from(stores).where(eq(stores.id, storeId)),
+    );
+    return row?.hint ?? null;
+  },
+
   async updateSettings(storeId: string, patch: Record<string, unknown>): Promise<void> {
     await withOperator(async (tx) => {
       const [row] = await tx.select({ settings: stores.settings }).from(stores).where(eq(stores.id, storeId)).limit(1);

@@ -21,6 +21,18 @@ export const API_BASE_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhos
 
 const ADMIN_API_KEY = process.env.NEXT_PUBLIC_ADMIN_API_KEY ?? '';
 
+interface StoreCredentials {
+  storeId: string;
+  apiKey: string;
+}
+
+function storedCredentials(): StoreCredentials | null {
+  const storeId = localStorage.getItem('store_id');
+  const apiKey = localStorage.getItem('store_api_key');
+  if (!storeId || !apiKey) return null;
+  return { storeId, apiKey };
+}
+
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   body?: unknown;
@@ -61,6 +73,13 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const reqHeaders: Record<string, string> = { ...(headers ?? {}) };
   if (body !== undefined) reqHeaders['Content-Type'] = 'application/json';
   if (ADMIN_API_KEY) reqHeaders['X-Api-Key'] = ADMIN_API_KEY;
+  else if (typeof window !== 'undefined') {
+    const cred = storedCredentials();
+    if (cred) {
+      reqHeaders['X-Store-Id'] = cred.storeId;
+      reqHeaders['X-Api-Key'] = cred.apiKey;
+    }
+  }
 
   const res = await fetch(url, {
     method,

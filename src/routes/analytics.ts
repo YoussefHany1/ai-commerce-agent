@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { storeRepo } from '../db/repos.js';
 import { allowsAnalytics, attributionRows, conversionLag, funnelByChannel, getDailyMetrics, recordClick, topProducts } from '../services/analytics.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey } from '../lib/auth.js';
+import { requireStoreOrOperator } from '../lib/auth.js';
 import { requireSession, type CustomerSession } from '../lib/session.js';
 import { config } from '../config.js';
 
@@ -20,6 +20,7 @@ const gate = async (req: any, reply: any) => {
 };
 
 const storeIdParam = z.object({ storeId: z.string().min(1) });
+const storeIdRef = (req: any) => ((req as any).params as { storeId?: string })?.storeId;
 
 export async function analytics(app: FastifyInstance) {
   app.post(
@@ -36,7 +37,7 @@ export async function analytics(app: FastifyInstance) {
 
   app.get(
     '/api/metrics/:storeId',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
     async (req, reply) => {
     const { storeId } = storeIdParam.parse(req.params);
     const days = Math.min(Math.max(Number((req.query as { days?: string }).days ?? 14) || 14, 1), 90);
@@ -65,7 +66,7 @@ export async function analytics(app: FastifyInstance) {
 
   app.get(
     '/api/analytics/:storeId/attributions',
-    { preHandler: [requireApiKey, gate, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), gate, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { storeId } = storeIdParam.parse(req.params);
       const status = z
@@ -78,7 +79,7 @@ export async function analytics(app: FastifyInstance) {
 
   app.get(
     '/api/analytics/:storeId/sources',
-    { preHandler: [requireApiKey, gate, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), gate, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { storeId } = storeIdParam.parse(req.params);
       const channels = await funnelByChannel(storeId);
@@ -88,7 +89,7 @@ export async function analytics(app: FastifyInstance) {
 
   app.get(
     '/api/analytics/:storeId/top-products',
-    { preHandler: [requireApiKey, gate, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), gate, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { storeId } = storeIdParam.parse(req.params);
       const limit = Math.min(Math.max(Number((req.query as { limit?: string }).limit ?? 10) || 10, 1), 50);
@@ -99,7 +100,7 @@ export async function analytics(app: FastifyInstance) {
 
   app.get(
     '/api/analytics/:storeId/conversion-lag',
-    { preHandler: [requireApiKey, gate, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireStoreOrOperator(storeIdRef), gate, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { storeId } = storeIdParam.parse(req.params);
       const days = Math.min(Math.max(Number((req.query as { days?: string }).days ?? 14) || 14, 1), 90);
