@@ -33,9 +33,32 @@ jobs:
           POSTGRES_PASSWORD: ci-postgres
           APP_DB_PASSWORD: ci-agent-app
           REDIS_PASSWORD: ci-redis
+          NEXT_PUBLIC_API_URL: http://localhost:3000
         run: |
           docker compose build migrate
           docker compose build app
+          docker compose build web
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install (web)
+        run: npm ci
+        working-directory: web
+      - name: Lint + typecheck + build (web)
+        working-directory: web
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3000
+        run: |
+          npm run lint
+          npm run typecheck
+          npm run build
 
   coverage:
     runs-on: ubuntu-latest

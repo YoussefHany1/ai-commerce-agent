@@ -1,6 +1,7 @@
 node_modules
 dist
-web
+web/node_modules
+web/.next
 .env
 .env.*
 !.env.example

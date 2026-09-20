@@ -2,6 +2,7 @@
 const nextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  output: 'standalone',
   async rewrites() {
     const api = (process.env.NEXT_PUBLIC_API_URL ?? '').replace(/\/$/, '');
     if (!api) return [];

@@ -65,5 +65,21 @@ services:
     restart: unless-stopped
     mem_limit: 512m
 
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3000}
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3000}
+    depends_on:
+      app:
+        condition: service_started
+    restart: unless-stopped
+    mem_limit: 512m
+
 volumes:
   pgdata:

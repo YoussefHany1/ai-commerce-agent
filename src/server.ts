@@ -19,6 +19,9 @@ import { startJobsWorker } from './workers/jobs.js';
 import { startAutomationWorker } from './workers/automation.js';
 import { startRetentionWorker } from './workers/retention.js';
 import { config } from './config.js';
+import { initSentry, captureError } from './lib/sentry.js';
+
+void initSentry();
 
 const app = Fastify({ logger: true, trustProxy: config.trustProxy });
 
@@ -30,8 +33,19 @@ app.setErrorHandler((error: any, _req, reply) => {
   if (Number.isInteger(error.statusCode) && error.statusCode !== 500) {
     return reply.code(error.statusCode).send({ error: error.message });
   }
+  captureError(error);
   app.log.error(error);
   reply.code(500).send({ error: 'internal_error' });
+});
+
+process.on('unhandledRejection', (reason) => {
+  captureError(reason);
+  app.log.error({ err: reason }, 'unhandledRejection');
+});
+process.on('uncaughtException', (err) => {
+  captureError(err);
+  app.log.error({ err }, 'uncaughtException');
+  process.exit(1);
 });
 
 await app.register(cors, {

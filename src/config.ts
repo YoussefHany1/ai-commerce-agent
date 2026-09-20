@@ -6,6 +6,7 @@ const schema = z.object({
   OAUTH_REDIRECT_ALLOWLIST: z.string().optional(),
   CORS_ORIGINS: z.string().optional(),
   ADMIN_API_KEY: z.string().min(32).optional(),
+  SENTRY_DSN: z.string().optional(),
   TRUST_PROXY: z.enum(['1', '0', 'true', 'false']).default('false'),
   DATABASE_URL: z
     .string()

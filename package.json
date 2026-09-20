@@ -19,12 +19,14 @@
     "db:rotate-key": "tsx --env-file-if-exists=.env scripts/rotate-key.ts",
     "db:setup": "docker compose up -d postgres redis",
     "db:bootstrap": "npm run db:migrate && npm run db:apply-rls",
+    "db:backup": "bash scripts/pg-backup.sh",
     "build": "tsc",
     "start:prod": "node --env-file-if-exists=.env dist/server.js"
   },
   "dependencies": {
     "@fastify/cors": "11.3.0",
     "@fastify/formbody": "9.0.0",
+    "@sentry/node": "^10.75.0",
     "drizzle-orm": "0.45.2",
     "fastify": "5.12.3",
     "openai": "7.10.0",
