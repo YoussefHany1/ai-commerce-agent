@@ -1,0 +1,11 @@
+[
+  { "query": "tee", "relevant": ["631cecda-1653-467b-8cf0-c95c0875a10d"], "note": "english title match" },
+  { "query": "t shirt", "relevant": ["631cecda-1653-467b-8cf0-c95c0875a10d"], "note": "synonym phrasing" },
+  { "query": "white cotton tee", "relevant": ["631cecda-1653-467b-8cf0-c95c0875a10d"], "note": "attribute phrasing" },
+  { "query": "black shirt", "relevant": ["7310d144-2ae8-4ae4-953d-7a76c553cbea"], "note": "english for arabic product" },
+  { "query": "قميص", "relevant": ["7310d144-2ae8-4ae4-953d-7a76c553cbea"], "note": "arabic single word" },
+  { "query": "قميص قطن أسود", "relevant": ["7310d144-2ae8-4ae4-953d-7a76c553cbea"], "note": "arabic title" },
+  { "query": "نصف قميص رجالي", "relevant": ["7310d144-2ae8-4ae4-953d-7a76c553cbea"], "note": "arabic paraphrase" },
+  { "query": "catalog products", "relevant": ["631cecda-1653-467b-8cf0-c95c0875a10d", "7310d144-2ae8-4ae4-953d-7a76c553cbea"], "note": "both relevant" },
+  { "query": "nonexistent widget xyz", "relevant": [], "note": "expect no hits" }
+]

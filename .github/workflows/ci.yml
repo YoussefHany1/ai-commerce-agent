@@ -1,0 +1,112 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test
+      - run: npm run build
+      - name: Dependency vulnerability scan
+        run: npm audit --audit-level=high
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose + Dockerfiles build
+        env:
+          POSTGRES_PASSWORD: ci-postgres
+          APP_DB_PASSWORD: ci-agent-app
+          REDIS_PASSWORD: ci-redis
+        run: |
+          docker compose build migrate
+          docker compose build app
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:cov
+
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17@sha256:dca0d688bbb31d3f851502ffcb9c7791387b4fcc544ae434dab41761e5ece317
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-postgres
+          POSTGRES_DB: ai_commerce_agent
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_commerce_agent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine@sha256:ca0acbb137c1dc3339c8b147a58fd6f42775d4599327b50e7b116c23de501af2
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGADMIN_URL: postgres://postgres:ci-postgres@localhost:5432/ai_commerce_agent
+      DATABASE_URL: postgres://agent_app:ci-agent-app@localhost:5432/ai_commerce_agent
+      APP_DB_USER: agent_app
+      APP_DB_PASSWORD: ci-agent-app
+      ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      ADMIN_API_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef
+      NODE_ENV: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply migrations + RLS on a clean database
+        run: npm run db:migrate && npm run db:apply-rls
+      - name: Smoke boot the built server against the migrated DB
+        env:
+          REDIS_URL: redis://localhost:6379
+        run: |
+          npm run build
+          node dist/server.js &
+          SCRIPT_PID=$!
+          set +e
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000/api/health >/dev/null; then echo "health OK"; exit 0; fi
+            sleep 1
+          done
+          echo "server failed to become healthy"; kill $SCRIPT_PID 2>/dev/null; exit 1
+      - name: Teardown
+        run: kill $(jobs -p) 2>/dev/null || true
+
+      - name: Integration tests against migrated DB + Redis (RLS on)
+        env:
+          TEST_APP_DB_URL: postgres://agent_app:ci-agent-app@localhost:5432/ai_commerce_agent
+          TEST_PGADMIN_URL: postgres://postgres:ci-postgres@localhost:5432/ai_commerce_agent
+          TEST_REDIS_URL: redis://localhost:6379
+        run: npm run test -- src/tests/integration.spec.ts

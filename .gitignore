@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+coverage/
+*.local
+*.log
+.DS_Store
+server.pid
+server.out.log
+server.err.log

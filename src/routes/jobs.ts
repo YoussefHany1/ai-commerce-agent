@@ -1,0 +1,58 @@
+import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { jobsRepo } from '../db/repos.js';
+import { resolveHandler } from '../workers/jobs.js';
+import { storeRateLimitWindow } from '../lib/rateLimit.js';
+import { requireApiKey } from '../lib/auth.js';
+import { config } from '../config.js';
+
+const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
+
+const TYPES = ['catalog.sync', 'embedding.backfill', 'metrics.rollup', 'retention.purge'] as const;
+
+export async function jobs(app: FastifyInstance) {
+  app.post(
+    '/api/jobs',
+    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    async (req) => {
+      const body = z
+        .object({
+          storeId: z.string(),
+          type: z.enum(TYPES),
+          payload: z.record(z.string(), z.unknown()).optional(),
+        })
+        .parse(req.body);
+      const id = await jobsRepo.enqueue(body.storeId, body.type, body.payload ?? {});
+      return { id, enqueued: !!id };
+    },
+  );
+
+  app.get('/api/jobs/:storeId', { preHandler: [requireApiKey] }, async (req) => {
+    const { storeId } = req.params as { storeId: string };
+    const q = req.query as { status?: string };
+    return { storeId, jobs: await jobsRepo.list(storeId, q.status) };
+  });
+
+  app.post(
+    '/api/jobs/:jobId/retry',
+    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    async (req) => {
+      const { jobId } = req.params as { jobId: string };
+      const body = z.object({ storeId: z.string() }).parse(req.body);
+      const ok = await jobsRepo.retry(body.storeId, jobId);
+      if (!ok) throw Object.assign(new Error('job_not_found'), { statusCode: 404 });
+      return { ok: true };
+    },
+  );
+
+  app.post(
+    '/api/jobs/run',
+    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    async (req) => {
+      const body = z.object({ storeId: z.string(), type: z.enum(TYPES), payload: z.record(z.string(), z.unknown()).optional() }).parse(req.body);
+      const fn = resolveHandler(body.type);
+      await fn(body.storeId, body.payload ?? {});
+      return { ok: true };
+    },
+  );
+}
