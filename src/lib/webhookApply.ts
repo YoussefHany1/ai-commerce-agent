@@ -1,5 +1,6 @@
-import { catalogRepo, orderRepo } from '../db/repos.js';
+import { catalogRepo, orderRepo, storeRepo } from '../db/repos.js';
 import { markConversionsForOrder } from '../services/analytics.js';
+import { logger } from '../lib/logger.js';
 import type { Product, Order, Platform } from '../types.js';
 import type { WebhookEvent } from '../lib/webhooks.js';
 
@@ -52,6 +53,17 @@ export async function applyWebhook(
   storeId: string,
 ): Promise<void> {
   if (platform === 'shopify') {
+    if (event.type === 'app/uninstalled') {
+      await storeRepo.remove(storeId);
+      logger.info({ storeId }, 'shopify: app/uninstalled — removed store and tenant data');
+      return;
+    }
+    if (event.type === 'customers/data_request' || event.type === 'customers/redact' || event.type === 'shop/redact') {
+      // Shopify PDPL/GDPR topics are recorded as events (audit trail) and fulfilled
+      // manually through /api/pdpl/access + /api/pdpl/erase by the operator.
+      logger.info({ storeId, type: event.type }, 'shopify: pdpl webhook recorded');
+      return;
+    }
     if ((event.type === 'products/create' || event.type === 'products/update') && event.payload) {
       const p = mapShopifyProduct(event.payload);
       if (p) await catalogRepo.upsertWebhook(storeId, p);

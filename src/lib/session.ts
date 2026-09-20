@@ -10,6 +10,7 @@ export type CustomerSession = {
 };
 
 const PREFIX = 'sess:';
+const IDX_PREFIX = 'sess:idx:';
 
 function hash(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -17,8 +18,14 @@ function hash(token: string): string {
 
 export async function createSession(session: CustomerSession, ttlSec = config.SESSION_TTL_SECONDS): Promise<string> {
   const token = randomBytes(32).toString('hex');
+  const tokenHash = hash(token);
   const redis = await getRedis();
-  await redis.set(`${PREFIX}${hash(token)}`, JSON.stringify(session), { EX: ttlSec });
+  await redis.set(`${PREFIX}${tokenHash}`, JSON.stringify(session), { EX: ttlSec });
+  if (session.customerId) {
+    const idxKey = `${IDX_PREFIX}${session.storeId}:${session.customerId}`;
+    await redis.sAdd(idxKey, tokenHash);
+    await redis.expire(idxKey, ttlSec);
+  }
   return token;
 }
 
@@ -33,6 +40,17 @@ export async function getSession(token: string | undefined): Promise<CustomerSes
 export async function revokeSession(token: string): Promise<void> {
   const redis = await getRedis();
   await redis.del(`${PREFIX}${hash(token)}`);
+}
+
+export async function revokeSessionsForCustomers(storeId: string, customerIds: string[]): Promise<void> {
+  if (!customerIds.length) return;
+  const redis = await getRedis();
+  for (const customerId of customerIds) {
+    const idxKey = `${IDX_PREFIX}${storeId}:${customerId}`;
+    const hashes = await redis.sMembers(idxKey);
+    if (hashes.length) await redis.del(hashes.map((h) => `${PREFIX}${h}`));
+    await redis.del(idxKey);
+  }
 }
 
 function bearerToken(req: FastifyRequest): string | undefined {

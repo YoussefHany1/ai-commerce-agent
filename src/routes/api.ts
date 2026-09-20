@@ -94,7 +94,7 @@ export async function api(app: FastifyInstance) {
     '/api/chat',
     { preHandler: [requireSession, storeRateLimitWindow('chat', chatWindow)] },
     async (req, rep) => {
-      const body = z.object({ message: z.string().min(1) }).parse(req.body);
+      const body = z.object({ message: z.string().min(1).max(2000) }).parse(req.body);
       const sess = (req as any).session as CustomerSession;
       const store = await storeRepo.get(sess.storeId);
       if (!store) return rep.code(404).send({ error: 'store_not_found' });

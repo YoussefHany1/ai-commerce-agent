@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { storeRepo, eventRepo } from '../db/repos.js';
 import { extractEvent, verifyWebhook } from '../lib/webhooks.js';
 import { applyWebhook } from '../lib/webhookApply.js';
+import { config } from '../config.js';
 import type { Platform } from '../types.js';
 
 const PLATFORMS = ['shopify', 'salla', 'zid'] as const;
@@ -50,7 +51,16 @@ export async function registerRawBody(app: FastifyInstance) {
   app.addHook('preParsing', async (request, _reply, payload) => {
     if (!request.url.startsWith('/webhooks')) return payload;
     const chunks: Buffer[] = [];
-    for await (const chunk of payload) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    let total = 0;
+    for await (const chunk of payload) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > config.WEBHOOK_BODY_LIMIT) {
+        payload.destroy();
+        throw Object.assign(new Error('payload_too_large'), { statusCode: 413 });
+      }
+      chunks.push(buf);
+    }
     const raw = Buffer.concat(chunks);
     (request as any).rawBody = raw;
     return Readable.from([raw]);

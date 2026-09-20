@@ -2,6 +2,7 @@ import { and, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { withTenant, type Db } from '../db/client.js';
 import { attributions, automationLogs, conversations, customers, messages, orders } from '../db/schema.js';
 import { decryptPii } from './pii.js';
+import { revokeSessionsForCustomers } from '../lib/session.js';
 import { config } from '../config.js';
 
 export type RetentionSettings = {
@@ -145,10 +146,10 @@ export async function getCustomerData(storeId: string, ref: CustomerRef) {
 }
 
 export async function eraseCustomer(storeId: string, ref: CustomerRef): Promise<boolean> {
-  return withTenant(storeId, async (tx) => {
-    const ids = await resolveCustomerIds(tx, storeId, ref);
-    if (!ids.length) return false;
-    const convs = await tx.select({ id: conversations.id }).from(conversations).where(inArray(conversations.customerId, ids));
+  const ids = await withTenant(storeId, async (tx) => {
+    const resolved = await resolveCustomerIds(tx, storeId, ref);
+    if (!resolved.length) return [] as string[];
+    const convs = await tx.select({ id: conversations.id }).from(conversations).where(inArray(conversations.customerId, resolved));
     const convIds = convs.map((c) => c.id);
     if (convIds.length) {
       await tx.delete(automationLogs).where(inArray(automationLogs.conversationId, convIds));
@@ -158,8 +159,11 @@ export async function eraseCustomer(storeId: string, ref: CustomerRef): Promise<
     await tx
       .update(orders)
       .set({ customerId: null, customerName: null, customerPhone: null, customerEmail: null })
-      .where(inArray(orders.customerId, ids));
-    await tx.delete(customers).where(inArray(customers.id, ids));
-    return true;
+      .where(inArray(orders.customerId, resolved));
+    await tx.delete(customers).where(inArray(customers.id, resolved));
+    return resolved;
   });
+  if (!ids.length) return false;
+  await revokeSessionsForCustomers(storeId, ids).catch(() => {});
+  return true;
 }

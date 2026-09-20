@@ -2,6 +2,8 @@
 
 Runnable MVP for an AI sales agent connected to ecommerce stores.
 
+Licensed under the MIT License (see LICENSE).
+
 ## Run
 ```bash
 cp .env.example .env          # fill OPENAI_API_KEY, generate a 64-char hex ENCRYPTION_KEY,

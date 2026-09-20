@@ -10,6 +10,7 @@ import { requireApiKey } from '../lib/auth.js';
 import { logger } from '../lib/logger.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
+const MAX_TEXT_LENGTH = 2000;
 
 export async function whatsapp(app: FastifyInstance) {
   app.get('/webhooks/whatsapp', async (req, reply) => {
@@ -88,12 +89,13 @@ export async function handleWhatsappPayload(payload: any): Promise<void> {
 }
 
 export async function handleInboundText(storeId: string, phone: string, text: string): Promise<void> {
+  const trimmed = text.slice(0, MAX_TEXT_LENGTH);
   const customerId = await customerRepo.upsert(storeId, { phone });
   const conversationId = await conversationRepo.ensureOpen(storeId, customerId ?? undefined, 'whatsapp');
   const history = toChatHistory(await conversationRepo.history(storeId, conversationId, 10));
-  await conversationRepo.addMessage({ storeId, conversationId, role: 'user', content: text });
+  await conversationRepo.addMessage({ storeId, conversationId, role: 'user', content: trimmed });
 
-  const reply = await answerWithTools(storeId, text, history);
+  const reply = await answerWithTools(storeId, trimmed, history);
   await conversationRepo.addMessage({ storeId, conversationId, role: 'assistant', content: reply });
 
   const channel = await whatsappRepo.byStore(storeId);

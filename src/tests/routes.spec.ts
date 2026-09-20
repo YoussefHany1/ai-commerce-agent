@@ -21,6 +21,7 @@ beforeAll(() => {
     RATE_LIMIT_PER_MIN: '10',
     RATE_LIMIT_CHAT_PER_MIN: '1',
     SESSION_TTL_SECONDS: '3600',
+    WEBHOOK_BODY_LIMIT: '1024',
   });
 });
 
@@ -97,15 +98,16 @@ const services = vi.hoisted(() => {
 
 const infra = vi.hoisted(() => {
   const store = new Map<string, { value: string; ex?: number }>();
+  const sets = new Map<string, Set<string>>();
   const redis = {
     set: async (k: string, v: string, opts?: { EX?: number }) => {
       store.set(k, { value: v, ex: opts?.EX });
       return 'OK';
     },
     get: async (k: string) => store.get(k)?.value ?? null,
-    del: async (k: string) => {
-      store.delete(k);
-      return 1;
+    del: async (...keys: string[]) => {
+      for (const k of keys) store.delete(k);
+      return keys.length;
     },
     incr: async (k: string) => {
       const prev = store.get(k);
@@ -119,6 +121,12 @@ const infra = vi.hoisted(() => {
       return 1;
     },
     ping: async () => 'PONG' as const,
+    sAdd: async (k: string, member: string) => {
+      if (!sets.has(k)) sets.set(k, new Set());
+      sets.get(k)!.add(member);
+      return 1;
+    },
+    sMembers: async (k: string) => [...(sets.get(k) ?? new Set<string>())],
   };
   return { store, redis };
 });
@@ -316,6 +324,18 @@ describe('routes: chat + sessions', () => {
     expect(res.json()).toMatchObject({ error: 'validation_error' });
   });
 
+  it('rejects a chat message longer than 2000 characters', async () => {
+    const token = await mintSession(app);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/chat',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      payload: JSON.stringify({ message: 'x'.repeat(2001) }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ error: 'validation_error' });
+  });
+
   it('persists the turn and returns a reply for a valid session', async () => {
     mocks.conversationRepo.history.mockResolvedValue([]);
     mocks.conversationRepo.addMessage.mockResolvedValue(undefined);
@@ -403,6 +423,23 @@ describe('routes: platform webhooks', () => {
     expect(res.statusCode).toBe(400);
   });
 
+  it('rejects a payload larger than the configured body limit with 413', async () => {
+    const body = JSON.stringify({ id: 'oversize-' + 'x'.repeat(2048) });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/shopify',
+      headers: {
+        'content-type': 'application/json',
+        'x-shopify-hmac-sha256': shopifyHmac(body),
+        'x-shopify-topic': 'products/create',
+        'x-shopify-shop-domain': 'demo.myshopify.com',
+      },
+      payload: body,
+    });
+    expect(res.statusCode).toBe(413);
+    expect(res.json()).toMatchObject({ error: 'payload_too_large' });
+  });
+
   it('rejects a valid payload for an unknown store', async () => {
     mocks.storeRepo.byRef.mockResolvedValue(null);
     const body = JSON.stringify({ id: 'prod-9' });
@@ -442,6 +479,25 @@ describe('routes: platform webhooks', () => {
       expect.objectContaining({ storeId: 's-web', type: 'products/create', dedupKey: 'prod-42' }),
     );
     expect(services.webhookApply.applyWebhook).toHaveBeenCalledOnce();
+  });
+
+  it('routes an app/uninstalled event to the apply layer', async () => {
+    mocks.storeRepo.byRef.mockImplementation(async () => ({ id: 's-web' }));
+    mocks.eventRepo.record.mockResolvedValue(true);
+    const body = JSON.stringify({ id: 42 });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/shopify',
+      headers: {
+        'content-type': 'application/json',
+        'x-shopify-hmac-sha256': shopifyHmac(body),
+        'x-shopify-topic': 'app/uninstalled',
+        'x-shopify-shop-domain': 'demo.myshopify.com',
+      },
+      payload: body,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(services.webhookApply.applyWebhook).toHaveBeenCalledWith('shopify', expect.objectContaining({ type: 'app/uninstalled' }), 's-web');
   });
 
   it('returns duplicate for an already-recorded event with no side effects', async () => {

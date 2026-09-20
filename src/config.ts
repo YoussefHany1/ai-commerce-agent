@@ -39,6 +39,7 @@ const schema = z.object({
   RATE_LIMIT_PER_MIN: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_CHAT_PER_MIN: z.coerce.number().int().positive().default(20),
   SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+  WEBHOOK_BODY_LIMIT: z.coerce.number().int().positive().default(5 * 1024 * 1024),
   RETENTION_CONVERSATIONS_DAYS: z.coerce.number().int().positive().default(365),
   RETENTION_ATTRIBUTIONS_DAYS: z.coerce.number().int().positive().default(365),
   RETENTION_EVENTS_DAYS: z.coerce.number().int().positive().default(90),

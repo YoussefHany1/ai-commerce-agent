@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 const store = new Map<string, string>();
+const sets = new Map<string, Set<string>>();
 
 vi.mock('./redis.js', () => ({
   getRedis: vi.fn(async () => ({
@@ -8,7 +9,17 @@ vi.mock('./redis.js', () => ({
       store.set(_k, v);
     },
     get: async (k: string) => store.get(k) ?? null,
-    del: async (k: string) => store.delete(k),
+del: async (...keys: (string | string[])[]) => {
+      for (const k of keys.flat()) store.delete(k);
+      return keys.flat().length;
+    },
+    expire: async () => 1,
+    sAdd: async (k: string, member: string) => {
+      if (!sets.has(k)) sets.set(k, new Set());
+      sets.get(k)!.add(member);
+      return 1;
+    },
+    sMembers: async (k: string) => [...(sets.get(k) ?? new Set<string>())],
   })),
 }));
 
@@ -27,6 +38,7 @@ async function loadSession(env: Record<string, string>) {
 describe('customer sessions', () => {
   beforeEach(() => {
     store.clear();
+    sets.clear();
     vi.resetModules();
   });
   afterEach(() => vi.resetModules());
@@ -57,5 +69,22 @@ describe('customer sessions', () => {
     expect(await g(token)).not.toBeNull();
     await r(token);
     await expect(g(token)).resolves.toBeNull();
+  });
+
+  it('indexes sessions per customer and revokes all of them on erasure', async () => {
+    const { createSession: c, getSession: g, revokeSessionsForCustomers: revoke } = await loadSession({});
+    const t1 = await c({ storeId: 's1', customerId: 'cust-1', conversationId: 'c1' });
+    const t2 = await c({ storeId: 's1', customerId: 'cust-1', conversationId: 'c1' });
+    const other = await c({ storeId: 's1', customerId: 'cust-2', conversationId: 'c2' });
+    await revoke('s1', ['cust-1']);
+    await expect(g(t1)).resolves.toBeNull();
+    await expect(g(t2)).resolves.toBeNull();
+    expect(await g(other)).not.toBeNull();
+  });
+
+  it('does not index sessions without a customer id', async () => {
+    const { createSession: c, revokeSessionsForCustomers: revoke } = await loadSession({});
+    await c({ storeId: 's1', customerId: null, conversationId: 'c1' });
+    await revoke('s1', ['cust-1']);
   });
 });
