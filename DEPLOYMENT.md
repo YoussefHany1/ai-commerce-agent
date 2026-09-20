@@ -55,5 +55,10 @@ your-app.example.com {
 
 ## Health checks
 
-`GET /api/health` returns `200` when the DB is reachable and `503` when it is not, so a
-load balancer or orchestrator drops the instance automatically.
+`GET /api/health` returns `200` when Postgres and Redis are both reachable and `503` when
+either is not, so a load balancer or orchestrator drops the instance automatically.
+
+## Backups
+
+The Postgres data lives in the `pgdata` volume. Schedule a periodic dump to off-site
+storage (e.g. a cron job running `docker compose exec -T postgres pg_dump -U postgres ai_commerce_agent | gzip > backup-$(date +%F).sql.gz`). Redis is ephemeral cache/session state; a Redis restart drops sessions and rate-limit counters, so no separate backup is needed.

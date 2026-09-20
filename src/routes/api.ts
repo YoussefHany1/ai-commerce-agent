@@ -21,20 +21,24 @@ const chatWindow = { limit: config.RATE_LIMIT_CHAT_PER_MIN, windowSec: 60 };
 export async function api(app: FastifyInstance) {
   app.get('/api/health', async (_req, reply) => {
     const [dbOk, redisOk, rlsOk] = await Promise.all([dbPing(), redisPing(), rlsPing()]);
-    if (!dbOk) {
-      return reply.code(503).send({ status: 'error', db: 'disconnected', time: new Date().toISOString() });
+    const deps = { db: dbOk, redis: redisOk, rls: rlsOk };
+    if (!dbOk || !redisOk) {
+      return reply.code(503).send({ status: 'error', ...deps, time: new Date().toISOString() });
     }
     return {
       status: 'ok',
       db: 'connected',
-      ok: dbOk && redisOk,
-      deps: { db: dbOk, redis: redisOk, rls: rlsOk },
+      ok: true,
+      deps,
       uptime: process.uptime(),
       time: new Date().toISOString(),
     };
   });
 
-  app.get('/api/stores', { preHandler: [requireApiKey] }, async () => {
+  app.get(
+    '/api/stores',
+    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    async () => {
     const rows = await storeRepo.list();
     return rows.map(storeToPublic);
   });
@@ -59,7 +63,7 @@ export async function api(app: FastifyInstance) {
     '/api/stores/:storeId',
     { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
-      const { storeId } = req.params as { storeId: string };
+      const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
       const store = await storeRepo.get(storeId);
       if (!store) return rep.code(404).send({ error: 'store_not_found' });
       await storeRepo.remove(storeId);
@@ -71,7 +75,7 @@ export async function api(app: FastifyInstance) {
     '/api/products/:storeId',
     { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
-      const { storeId } = req.params as { storeId: string };
+      const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
       const store = await storeRepo.get(storeId);
       if (!store) return rep.code(404).send({ error: 'store_not_found' });
       let list = await catalogRepo.list(storeId);

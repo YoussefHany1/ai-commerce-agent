@@ -19,6 +19,8 @@ const gate = async (req: any, reply: any) => {
   }
 };
 
+const storeIdParam = z.object({ storeId: z.string().min(1) });
+
 export async function analytics(app: FastifyInstance) {
   app.post(
     '/api/attributions/click',
@@ -36,9 +38,8 @@ export async function analytics(app: FastifyInstance) {
     '/api/metrics/:storeId',
     { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
     async (req, reply) => {
-    const { storeId } = req.params as { storeId: string };
-    const q = req.query as { days?: string };
-    const days = Math.min(Math.max(Number(q.days ?? 14) || 14, 1), 90);
+    const { storeId } = storeIdParam.parse(req.params);
+    const days = Math.min(Math.max(Number((req.query as { days?: string }).days ?? 14) || 14, 1), 90);
     const store = await storeRepo.get(storeId);
     if (!store) return reply.code(404).send({ error: 'store_not_found' });
     if (!allowsAnalytics(store.planStatus)) {
@@ -66,9 +67,10 @@ export async function analytics(app: FastifyInstance) {
     '/api/analytics/:storeId/attributions',
     { preHandler: [requireApiKey, gate, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
-      const { storeId } = req.params as { storeId: string };
-      const q = req.query as { status?: string };
-      const status = q.status === 'clicked' || q.status === 'converted' ? q.status : undefined;
+      const { storeId } = storeIdParam.parse(req.params);
+      const status = z
+        .object({ status: z.enum(['recommended', 'clicked', 'converted']).optional() })
+        .parse(req.query).status;
       const rows = await attributionRows(storeId, status);
       return { storeId, count: rows.length, attributions: rows };
     },
@@ -78,7 +80,7 @@ export async function analytics(app: FastifyInstance) {
     '/api/analytics/:storeId/sources',
     { preHandler: [requireApiKey, gate, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
-      const { storeId } = req.params as { storeId: string };
+      const { storeId } = storeIdParam.parse(req.params);
       const channels = await funnelByChannel(storeId);
       return { storeId, channels };
     },
@@ -88,9 +90,8 @@ export async function analytics(app: FastifyInstance) {
     '/api/analytics/:storeId/top-products',
     { preHandler: [requireApiKey, gate, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
-      const { storeId } = req.params as { storeId: string };
-      const q = req.query as { limit?: string };
-      const limit = Math.min(Math.max(Number(q.limit ?? 10) || 10, 1), 50);
+      const { storeId } = storeIdParam.parse(req.params);
+      const limit = Math.min(Math.max(Number((req.query as { limit?: string }).limit ?? 10) || 10, 1), 50);
       const products = await topProducts(storeId, limit);
       return { storeId, products };
     },
@@ -100,9 +101,8 @@ export async function analytics(app: FastifyInstance) {
     '/api/analytics/:storeId/conversion-lag',
     { preHandler: [requireApiKey, gate, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
-      const { storeId } = req.params as { storeId: string };
-      const q = req.query as { days?: string };
-      const days = Math.min(Math.max(Number(q.days ?? 14) || 14, 1), 90);
+      const { storeId } = storeIdParam.parse(req.params);
+      const days = Math.min(Math.max(Number((req.query as { days?: string }).days ?? 14) || 14, 1), 90);
       const lag = await conversionLag(storeId, days);
       return lag;
     },

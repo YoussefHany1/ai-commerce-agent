@@ -29,8 +29,8 @@ export async function automation(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/automation/rules/:storeId', { preHandler: [requireApiKey] }, async (req) => {
-    const { storeId } = req.params as { storeId: string };
+  app.get('/api/automation/rules/:storeId', { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] }, async (req) => {
+    const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
     return { storeId, rules: await automationRepo.list(storeId) };
   });
 
@@ -38,7 +38,7 @@ export async function automation(app: FastifyInstance) {
     '/api/automation/rules/:ruleId',
     { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
-      const { ruleId } = req.params as { ruleId: string };
+      const { ruleId } = z.object({ ruleId: z.string().min(1) }).parse(req.params);
       const body = updateSchema.parse(req.body);
       const ok = await automationRepo.update(body.storeId, ruleId, body);
       if (!ok) throw Object.assign(new Error('rule_not_found'), { statusCode: 404 });
@@ -50,7 +50,7 @@ export async function automation(app: FastifyInstance) {
     '/api/automation/rules/:ruleId',
     { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
-      const { ruleId } = req.params as { ruleId: string };
+      const { ruleId } = z.object({ ruleId: z.string().min(1) }).parse(req.params);
       const body = z.object({ storeId: z.string() }).parse(req.body);
       const ok = await automationRepo.remove(body.storeId, ruleId);
       if (!ok) throw Object.assign(new Error('rule_not_found'), { statusCode: 404 });

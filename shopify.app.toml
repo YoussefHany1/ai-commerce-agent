@@ -2,18 +2,19 @@
 
 client_id = "93e7dddd6e932630943e5870bed5107e"
 name = "ai-commerce-agent"
-application_url = "https://valued-believe-stud-cigarette.trycloudflare.com"
+# Set to the real production app URL. Do not commit local tunnel URLs.
+application_url = "https://YOUR-APP-DOMAIN.example.com"
 embedded = true
 
 [build]
 automatically_update_urls_on_dev = true
 
 [webhooks]
-api_version = "2026-10"
+api_version = "2026-07"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_products,write_products,read_orders,read_inventory"
 
 [auth]
-redirect_urls = [ "https://valued-believe-stud-cigarette.trycloudflare.com/api/oauth/shopify/callback" ]
+redirect_urls = [ "https://YOUR-APP-DOMAIN.example.com/api/oauth/shopify/callback" ]

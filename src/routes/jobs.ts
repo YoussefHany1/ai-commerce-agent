@@ -27,9 +27,9 @@ export async function jobs(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/jobs/:storeId', { preHandler: [requireApiKey] }, async (req) => {
-    const { storeId } = req.params as { storeId: string };
-    const q = req.query as { status?: string };
+  app.get('/api/jobs/:storeId', { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] }, async (req) => {
+    const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
+    const q = z.object({ status: z.string().optional() }).parse(req.query);
     return { storeId, jobs: await jobsRepo.list(storeId, q.status) };
   });
 
@@ -37,7 +37,7 @@ export async function jobs(app: FastifyInstance) {
     '/api/jobs/:jobId/retry',
     { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
-      const { jobId } = req.params as { jobId: string };
+      const { jobId } = z.object({ jobId: z.string().min(1) }).parse(req.params);
       const body = z.object({ storeId: z.string() }).parse(req.body);
       const ok = await jobsRepo.retry(body.storeId, jobId);
       if (!ok) throw Object.assign(new Error('job_not_found'), { statusCode: 404 });

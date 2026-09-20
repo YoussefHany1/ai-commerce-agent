@@ -45,7 +45,7 @@ await app.register(cors, {
 });
 await app.register(formbody);
 
-app.get('/', async () => ({ name: 'AI Commerce Agent', version: '0.1.0' }));
+app.get('/', async () => ({ name: 'AI Commerce Agent', version: '0.2.0' }));
 
 await registerRawBody(app);
 await api(app);

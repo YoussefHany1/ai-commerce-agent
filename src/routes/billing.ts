@@ -54,8 +54,8 @@ export async function billing(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/billing/status/:storeId', { preHandler: [requireApiKey] }, async (req, reply) => {
-    const { storeId } = req.params as { storeId: string };
+  app.get('/api/billing/status/:storeId', { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] }, async (req, reply) => {
+    const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
     const store = await storeRepo.get(storeId);
     if (!store) return reply.code(404).send({ error: 'store_not_found' });
     const sub = await billingRepo.byStore(storeId);

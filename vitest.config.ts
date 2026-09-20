@@ -12,7 +12,6 @@ export default defineConfig({
         'src/**/*.spec.ts',
         'src/db/schema.ts',
         'src/db/client.ts',
-        'src/routes/**',
         'src/server.ts',
         'src/index.ts',
         'src/types.ts',

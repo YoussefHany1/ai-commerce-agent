@@ -56,7 +56,7 @@ export async function whatsapp(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/whatsapp/channels', { preHandler: [requireApiKey] }, async () => whatsappRepo.listChannels());
+  app.get('/api/whatsapp/channels', { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] }, async () => whatsappRepo.listChannels());
 }
 
 type WhatsappChange = {

@@ -3,10 +3,11 @@ import { z } from 'zod';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '../config.js';
 import { getRedis } from '../lib/redis.js';
-import { reqIp } from '../lib/rateLimit.js';
+import { storeRateLimitWindow, reqIp } from '../lib/rateLimit.js';
 import { storeRepo, connectionRepo } from '../db/repos.js';
 
 const STATE_TTL = 600;
+const oauthWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
 const SCOPES = ['read_products', 'write_products', 'read_orders', 'read_inventory'];
 const SALLA_SCOPES_DEFAULT = 'offline_access';
 const ZID_SCOPES_DEFAULT = '';
@@ -132,7 +133,7 @@ export async function oauth(app: FastifyInstance) {
     return rep.redirect(url);
   });
 
-  app.get('/api/oauth/shopify/callback', async (req, rep) => {
+  app.get('/api/oauth/shopify/callback', { preHandler: [storeRateLimitWindow('api', oauthWindow)] }, async (req, rep) => {
     const q = req.query as Record<string, string>;
     const { code, state, shop, hmac } = q;
     if (!code || !state || !shop || !hmac) return rep.code(400).send({ error: 'missing_oauth_params' });
@@ -195,7 +196,7 @@ export async function oauth(app: FastifyInstance) {
     return rep.redirect(url);
   });
 
-  app.get('/api/oauth/salla/callback', async (req, rep) => {
+  app.get('/api/oauth/salla/callback', { preHandler: [storeRateLimitWindow('api', oauthWindow)] }, async (req, rep) => {
     const q = req.query as Record<string, string>;
     const { code, state } = q;
     if (!code || !state) return rep.code(400).send({ error: 'missing_oauth_params' });
@@ -283,7 +284,7 @@ export async function oauth(app: FastifyInstance) {
     return rep.redirect(url);
   });
 
-  app.get('/api/oauth/zid/callback', async (req, rep) => {
+  app.get('/api/oauth/zid/callback', { preHandler: [storeRateLimitWindow('api', oauthWindow)] }, async (req, rep) => {
     const q = req.query as Record<string, string>;
     const { code, state } = q;
     if (!code || !state) return rep.code(400).send({ error: 'missing_oauth_params' });
