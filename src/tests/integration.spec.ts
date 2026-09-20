@@ -46,13 +46,16 @@ async function loadModules() {
 }
 
 const TABLE = {
-  products: 'products',
-  stores: 'stores',
-  conversations: 'conversations',
+  products: { name: 'products', idCol: 'store_id' },
+  stores: { name: 'stores', idCol: 'id' },
+  conversations: { name: 'conversations', idCol: 'store_id' },
 } as const;
 
 async function adminCount(table: keyof typeof TABLE, storeId: string): Promise<number> {
-  const [row] = await admin!.unsafe(`select count(*)::int as c from "${TABLE[table]}" where store_id = $1`, [storeId]);
+  const [row] = await admin!.unsafe(
+    `select count(*)::int as c from "${TABLE[table].name}" where "${TABLE[table].idCol}" = $1`,
+    [storeId],
+  );
   return Number(row.c);
 }
 

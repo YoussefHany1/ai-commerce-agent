@@ -28,52 +28,5 @@ await sql.unsafe(`grant usage on schema public to ${APP_USER}`);
 await sql.unsafe(`grant all privileges on all tables in schema public to ${APP_USER}`);
 await sql.unsafe(`grant all privileges on all sequences in schema public to ${APP_USER}`);
 
-const tables = [
-  'stores',
-  'platform_connections',
-  'products',
-  'variants',
-  'customers',
-  'orders',
-  'conversations',
-  'messages',
-  'events',
-  'automation_rules',
-  'automation_logs',
-  'jobs',
-  'attributions',
-  'whatsapp_channels',
-  'billing_subscriptions',
-  'daily_metrics',
-];
-
-const operatorExempt = new Set(['stores', 'whatsapp_channels', 'billing_subscriptions', 'jobs', 'automation_rules', 'automation_logs']);
-
-for (const t of tables) {
-  await sql.unsafe(`alter table "${t}" enable row level security`);
-  const policyName = `tenant_isolation_${t}`;
-  await sql.unsafe(`drop policy if exists "${policyName}" on "${t}"`);
-  if (t === 'stores') {
-    await sql.unsafe(
-      `create policy "${policyName}" on "${t}"
-       using (current_setting('app.operator', true) = 'true') with check (current_setting('app.operator', true) = 'true')`,
-    );
-  } else {
-    await sql.unsafe(
-      `create policy "${policyName}" on "${t}"
-       using (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
-       with check (store_id = nullif(current_setting('app.store_id', true), '')::uuid)`,
-    );
-  }
-  if (operatorExempt.has(t)) {
-    await sql.unsafe(`drop policy if exists "tenant_operator_${t}" on "${t}"`);
-    await sql.unsafe(
-      `create policy "tenant_operator_${t}" on "${t}"
-       using (current_setting('app.operator', true) = 'true')
-       with check (current_setting('app.operator', true) = 'true')`,
-    );
-  }
-}
-
 await sql.end();
-console.log('RLS policies applied');
+console.log('RLS role and grants applied; policies come from drizzle/0004_security_rls.sql');

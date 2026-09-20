@@ -14,7 +14,7 @@
     "eval": "node --env-file-if-exists=.env --import tsx src/evals/run.ts",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
-    "db:migrate": "drizzle-kit migrate",
+    "db:migrate": "tsx --env-file-if-exists=.env scripts/migrate.ts",
     "db:apply-rls": "tsx --env-file-if-exists=.env scripts/apply-rls.ts",
     "db:rotate-key": "tsx --env-file-if-exists=.env scripts/rotate-key.ts",
     "db:setup": "docker compose up -d postgres redis",

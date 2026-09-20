@@ -90,34 +90,70 @@ CREATE POLICY "tenant_isolation_products" ON "products"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
 --> statement-breakpoint
+CREATE POLICY "tenant_operator_products" ON "products"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
+--> statement-breakpoint
 CREATE POLICY "tenant_isolation_variants" ON "variants"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
+--> statement-breakpoint
+CREATE POLICY "tenant_operator_variants" ON "variants"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
 --> statement-breakpoint
 CREATE POLICY "tenant_isolation_customers" ON "customers"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
 --> statement-breakpoint
+CREATE POLICY "tenant_operator_customers" ON "customers"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
+--> statement-breakpoint
 CREATE POLICY "tenant_isolation_orders" ON "orders"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
+--> statement-breakpoint
+CREATE POLICY "tenant_operator_orders" ON "orders"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
 --> statement-breakpoint
 CREATE POLICY "tenant_isolation_conversations" ON "conversations"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
 --> statement-breakpoint
+CREATE POLICY "tenant_operator_conversations" ON "conversations"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
+--> statement-breakpoint
 CREATE POLICY "tenant_isolation_messages" ON "messages"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
+--> statement-breakpoint
+CREATE POLICY "tenant_operator_messages" ON "messages"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
 --> statement-breakpoint
 CREATE POLICY "tenant_isolation_events" ON "events"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
 --> statement-breakpoint
+CREATE POLICY "tenant_operator_events" ON "events"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
+--> statement-breakpoint
 CREATE POLICY "tenant_isolation_attributions" ON "attributions"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
 --> statement-breakpoint
+CREATE POLICY "tenant_operator_attributions" ON "attributions"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
+--> statement-breakpoint
 CREATE POLICY "tenant_isolation_daily_metrics" ON "daily_metrics"
 USING (store_id = nullif(current_setting('app.store_id', true), '')::uuid)
 WITH CHECK (store_id = nullif(current_setting('app.store_id', true), '')::uuid);
+--> statement-breakpoint
+CREATE POLICY "tenant_operator_daily_metrics" ON "daily_metrics"
+USING (current_setting('app.operator', true) = 'true')
+WITH CHECK (current_setting('app.operator', true) = 'true');
