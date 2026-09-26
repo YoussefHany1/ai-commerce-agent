@@ -1,4 +1,5 @@
 import { CommerceAdapter, Product, Order } from '../types.js';
+import { fetchWithTimeout, LONG_TIMEOUT_MS } from '../lib/http.js';
 
 export class ShopifyAdapter implements CommerceAdapter {
   platform = 'shopify' as const;
@@ -10,14 +11,18 @@ export class ShopifyAdapter implements CommerceAdapter {
   ) {}
 
   private async gql(query: string, variables = {}) {
-    const r = await fetch(`https://${this.shop}/admin/api/${this.version}/graphql.json`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': this.token,
+    const r = await fetchWithTimeout(
+      `https://${this.shop}/admin/api/${this.version}/graphql.json`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': this.token,
+        },
+        body: JSON.stringify({ query, variables }),
       },
-      body: JSON.stringify({ query, variables }),
-    });
+      LONG_TIMEOUT_MS,
+    );
     if (!r.ok) throw new Error(`Shopify ${r.status}`);
     const j = (await r.json()) as any;
     if (j.errors) throw new Error(JSON.stringify(j.errors));

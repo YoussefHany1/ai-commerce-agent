@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { fetchWithTimeout } from '../lib/http.js';
 
 const BATCH = 64;
 
@@ -10,7 +11,7 @@ function sortByIndex(data: Array<{ index: number; embedding: number[] }>): numbe
 
 async function embedOpenAI(batch: string[], model: string): Promise<number[][] | null> {
   try {
-    const res = await fetch('https://api.openai.com/v1/embeddings', {
+    const res = await fetchWithTimeout('https://api.openai.com/v1/embeddings', {
       method: 'POST',
       headers: {
         authorization: `Bearer ${config.OPENAI_API_KEY}`,
@@ -29,7 +30,7 @@ async function embedOpenAI(batch: string[], model: string): Promise<number[][] |
 async function embedOpenRouter(batch: string[], model: string): Promise<number[][] | null> {
   try {
     const base = (config.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
-    const res = await fetch(`${base}/embeddings`, {
+    const res = await fetchWithTimeout(`${base}/embeddings`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${config.OPENROUTER_API_KEY}`,

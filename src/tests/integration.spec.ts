@@ -4,11 +4,13 @@ import postgres from 'postgres';
 const TEST_DB_URL = process.env.TEST_APP_DB_URL;
 const TEST_ADMIN_URL = process.env.TEST_PGADMIN_URL;
 const TEST_REDIS_URL = process.env.TEST_REDIS_URL;
+const TEST_ENCRYPTION_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 
 const enabled = Boolean(TEST_DB_URL && TEST_ADMIN_URL && TEST_REDIS_URL);
 
 let storeRepo: typeof import('../db/repos.js').storeRepo;
 let catalogRepo: typeof import('../db/repos.js').catalogRepo;
+let connectionRepo: typeof import('../db/repos.js').connectionRepo;
 let withTenant: typeof import('../db/client.js').withTenant;
 let products: typeof import('../db/schema.js').products;
 let createSession: typeof import('../lib/session.js').createSession;
@@ -16,12 +18,16 @@ let getSession: typeof import('../lib/session.js').getSession;
 let revokeSession: typeof import('../lib/session.js').revokeSession;
 let admin: ReturnType<typeof postgres> | undefined;
 
+const INJECTED = ['DATABASE_URL', 'REDIS_URL', 'ENCRYPTION_KEY', 'ENCRYPTION_KEY_VERSION'] as const;
+
 async function loadModules() {
   vi.resetModules();
   const saved = { ...process.env };
   Object.assign(process.env, {
     DATABASE_URL: TEST_DB_URL!,
     REDIS_URL: TEST_REDIS_URL!,
+    ENCRYPTION_KEY: TEST_ENCRYPTION_KEY,
+    ENCRYPTION_KEY_VERSION: 'v1',
   });
   try {
     const client = await import('../db/client.js');
@@ -31,16 +37,17 @@ async function loadModules() {
     withTenant = client.withTenant;
     storeRepo = repos.storeRepo;
     catalogRepo = repos.catalogRepo;
+    connectionRepo = repos.connectionRepo;
     products = schema.products;
     createSession = session.createSession;
     getSession = session.getSession;
     revokeSession = session.revokeSession;
   } finally {
     for (const k of Object.keys(process.env)) {
-      if (k !== 'DATABASE_URL' && k !== 'REDIS_URL') continue;
+      if (!INJECTED.includes(k as (typeof INJECTED)[number])) continue;
       delete process.env[k];
-      if (k === 'DATABASE_URL' && saved[k]) process.env.DATABASE_URL = saved[k];
-      if (k === 'REDIS_URL' && saved[k]) process.env.REDIS_URL = saved[k];
+      const prior = saved[k];
+      if (prior) process.env[k] = prior;
     }
   }
 }
@@ -49,6 +56,7 @@ const TABLE = {
   products: { name: 'products', idCol: 'store_id' },
   stores: { name: 'stores', idCol: 'id' },
   conversations: { name: 'conversations', idCol: 'store_id' },
+  platform_connections: { name: 'platform_connections', idCol: 'store_id' },
 } as const;
 
 async function adminCount(table: keyof typeof TABLE, storeId: string): Promise<number> {
@@ -138,6 +146,43 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
     expect(await storeRepo.remove(b)).toBe(false);
   });
 
+  it('scopes platform_connections reads to the operator, not just the tenant', async () => {
+    // Regression: platform_connections originally shipped with only the
+    // app.store_id isolation policy and no tenant_operator_* counterpart, so
+    // withOperator() saw zero rows. That silently disabled the catalog-sync
+    // scheduler (connectionRepo.listDue) and made storeRepo.remove skip the
+    // table, orphaning access_token_enc / refresh_token_enc on uninstall.
+    const a = await storeRepo.create({
+      name: 'CONN A',
+      platform: 'shopify',
+      shopDomain: 'conn-a.myshopify.com',
+      accessToken: 'shpat_secret_token_a',
+    });
+    createdStores.push(a);
+    await expect(adminCount('platform_connections', a)).resolves.toBe(1);
+
+    // Operator context must see the row, otherwise listDue enqueues nothing.
+    const due = await connectionRepo.listDue(new Date());
+    expect(due.map((d) => d.storeId)).toContain(a);
+    expect(due.find((d) => d.storeId === a)?.platform).toBe('shopify');
+  });
+
+  it('removes platform_connections on uninstall so credentials are not orphaned', async () => {
+    const a = await storeRepo.create({
+      name: 'CONN DEL',
+      platform: 'shopify',
+      shopDomain: 'conn-del.myshopify.com',
+      accessToken: 'shpat_secret_token_del',
+      refreshToken: 'shpss_secret_refresh_del',
+    });
+    createdStores.push(a);
+    await expect(adminCount('platform_connections', a)).resolves.toBe(1);
+
+    expect(await storeRepo.remove(a)).toBe(true);
+    await expect(adminCount('platform_connections', a)).resolves.toBe(0);
+    await expect(adminCount('stores', a)).resolves.toBe(0);
+  });
+
   it('round-trips customer sessions through redis', async () => {
     const s = await storeRepo.create({ name: 'SESS', platform: 'shopify', shopDomain: 'sess.myshopify.com' });
     createdStores.push(s);
@@ -146,5 +191,59 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
     await revokeSession(token);
     await expect(getSession(token)).resolves.toBeNull();
     await expect(getSession('no-such-token')).resolves.toBeNull();
+  });
+
+  it('grants a worker lease to only one replica at a time', async () => {
+    const { acquireLock } = await import('../lib/lock.js');
+    const name = 'test:worker-lease';
+
+    // Two independent acquisitions, as two API replicas would attempt.
+    const first = await acquireLock(name, 30_000);
+    expect(first).not.toBeNull();
+    expect(await acquireLock(name, 30_000)).toBeNull();
+
+    // The Lua release script must be token-scoped: a non-holder cannot free it.
+    const stray = await acquireLock('test:other-lease', 30_000);
+    expect(stray).not.toBeNull();
+    await first!.release();
+    expect(await acquireLock(name, 30_000)).not.toBeNull();
+  });
+
+  it('keeps a lease held across work longer than the ttl, then releases it', async () => {
+    const { acquireLock, withLock } = await import('../lib/lock.js');
+    const name = 'test:worker-lease-renew';
+
+    const rival = await withLock(name, 400, async () => {
+      await new Promise((r) => setTimeout(r, 1_200));
+      return acquireLock(name, 400);
+    });
+
+    // Renewal held it against a TTL the work outlasted several times over.
+    expect(rival).toBeNull();
+    expect(await acquireLock(name, 400)).not.toBeNull();
+  });
+
+  it('seeds a fresh operator session epoch and survives concurrent creation', async () => {
+    const { ensureOperatorSessionEpoch, bumpOperatorSessionEpoch, OPERATOR_EPOCH_KEY } = await import(
+      '../lib/operatorSession.js'
+    );
+    const { getRedis } = await import('../lib/redis.js');
+    const redis = await getRedis();
+    await redis.del(OPERATOR_EPOCH_KEY);
+
+    const first = await ensureOperatorSessionEpoch();
+    expect(first).toMatch(/^[0-9a-f]{32}$/);
+
+    // Concurrent callers must converge on one value, not each seeding their own.
+    const concurrent = await Promise.all([
+      ensureOperatorSessionEpoch(),
+      ensureOperatorSessionEpoch(),
+      ensureOperatorSessionEpoch(),
+    ]);
+    expect(new Set([first, ...concurrent]).size).toBe(1);
+
+    const bumped = await bumpOperatorSessionEpoch();
+    expect(bumped).not.toBe(first);
+    await expect(ensureOperatorSessionEpoch()).resolves.toBe(bumped);
   });
 });

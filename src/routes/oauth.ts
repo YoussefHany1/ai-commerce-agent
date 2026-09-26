@@ -4,6 +4,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '../config.js';
 import { getRedis } from '../lib/redis.js';
 import { storeRateLimitWindow, reqIp } from '../lib/rateLimit.js';
+import { fetchWithTimeout } from '../lib/http.js';
 import { storeRepo, connectionRepo } from '../db/repos.js';
 
 const STATE_TTL = 600;
@@ -150,7 +151,7 @@ export async function oauth(app: FastifyInstance) {
     const stored = JSON.parse(storedRaw) as OAuthState & { shop: string };
     if (stored.shop !== normalizeShop(shop)) return rep.code(401).send({ error: 'state_shop_mismatch' });
 
-    const tokenRes = await fetch(`https://${stored.shop}/admin/oauth/access_token`, {
+    const tokenRes = await fetchWithTimeout(`https://${stored.shop}/admin/oauth/access_token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -210,7 +211,7 @@ export async function oauth(app: FastifyInstance) {
     const stored = JSON.parse(storedRaw) as OAuthState;
     if (stored.platform !== 'salla') return rep.code(401).send({ error: 'state_platform_mismatch' });
 
-    const tokenRes = await fetch('https://accounts.salla.sa/oauth2/token', {
+    const tokenRes = await fetchWithTimeout('https://accounts.salla.sa/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -234,7 +235,7 @@ export async function oauth(app: FastifyInstance) {
     let name = 'Salla store';
     let shopDomain: string | undefined;
     try {
-      const infoRes = await fetch('https://accounts.salla.sa/oauth2/user/info', {
+      const infoRes = await fetchWithTimeout('https://accounts.salla.sa/oauth2/user/info', {
         headers: { Authorization: `Bearer ${token.access_token}` },
       });
       const info = (await infoRes.json()) as {
@@ -298,7 +299,7 @@ export async function oauth(app: FastifyInstance) {
     const stored = JSON.parse(storedRaw) as OAuthState;
     if (stored.platform !== 'zid') return rep.code(401).send({ error: 'state_platform_mismatch' });
 
-    const tokenRes = await fetch('https://oauth.zid.sa/oauth/token', {
+    const tokenRes = await fetchWithTimeout('https://oauth.zid.sa/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -321,7 +322,7 @@ export async function oauth(app: FastifyInstance) {
     let name = 'Zid store';
     let shopDomain = `zid-${randomBytes(6).toString('hex')}`;
     try {
-      const profileRes = await fetch('https://api.zid.sa/v1/managers/account/profile', {
+      const profileRes = await fetchWithTimeout('https://api.zid.sa/v1/managers/account/profile', {
         headers: {
           Authorization: `Bearer ${token.authorization}`,
           'X-Manager-Token': token.access_token,

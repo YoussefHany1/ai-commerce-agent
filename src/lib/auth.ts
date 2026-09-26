@@ -25,6 +25,17 @@ export async function resetApiKeyBruteCounter(ip: string): Promise<void> {
   }
 }
 
+/**
+ * Matches the configured admin key, plus the previous generation while a rotation
+ * is in flight. `safeEqual` short-circuits on length, so it is not a candidate for
+ * a timing oracle here — the secret is not recoverable by measuring.
+ */
+function matchesAdminKey(provided: string): boolean {
+  if (config.ADMIN_API_KEY && safeEqual(provided, config.ADMIN_API_KEY)) return true;
+  if (config.ADMIN_API_KEY_PREVIOUS && safeEqual(provided, config.ADMIN_API_KEY_PREVIOUS)) return true;
+  return false;
+}
+
 export async function requireApiKey(req: FastifyRequest, reply: FastifyReply): Promise<void> {
   if (!config.ADMIN_API_KEY) {
     reply.code(503).send({ error: 'auth_not_configured' });
@@ -32,7 +43,7 @@ export async function requireApiKey(req: FastifyRequest, reply: FastifyReply): P
   }
   const header = req.headers['x-api-key'];
   const provided = Array.isArray(header) ? header[0] : header;
-  const valid = typeof provided === 'string' && safeEqual(provided, config.ADMIN_API_KEY);
+  const valid = typeof provided === 'string' && matchesAdminKey(provided);
   if (valid) {
     await resetApiKeyBruteCounter(reqIp(req));
     return;
@@ -90,7 +101,7 @@ export function requireStoreOrOperator(storeIdRef: StoreIdRef) {
     }
 
     if (!token) return reply.code(401).send({ error: 'unauthorized' });
-    if (safeEqual(token, config.ADMIN_API_KEY)) {
+    if (matchesAdminKey(token)) {
       await resetApiKeyBruteCounter(reqIp(req));
       return;
     }

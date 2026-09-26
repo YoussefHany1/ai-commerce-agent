@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { fetchWithTimeout } from '../lib/http.js';
 
 function stripeApi(): string {
   if (!config.STRIPE_SECRET_KEY) throw Object.assign(new Error('stripe_not_configured'), { statusCode: 503 });
@@ -13,7 +14,7 @@ export async function createCheckoutSession(
 ): Promise<StripeSession> {
   const priceId = plan === 'pro' ? config.STRIPE_PRICE_PRO : config.STRIPE_PRICE_ENTERPRISE;
   if (!priceId) throw Object.assign(new Error('stripe_price_not_configured'), { statusCode: 503 });
-  const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+  const res = await fetchWithTimeout('https://api.stripe.com/v1/checkout/sessions', {
     method: 'POST',
     headers: {
       authorization: `Bearer ${stripeApi()}`,
@@ -35,7 +36,7 @@ export async function createCheckoutSession(
 }
 
 export async function createPortalSession(stripeCustomerId: string): Promise<StripeSession> {
-  const res = await fetch('https://api.stripe.com/v1/billing_portal/sessions', {
+  const res = await fetchWithTimeout('https://api.stripe.com/v1/billing_portal/sessions', {
     method: 'POST',
     headers: {
       authorization: `Bearer ${stripeApi()}`,

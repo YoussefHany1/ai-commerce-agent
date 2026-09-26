@@ -2,13 +2,14 @@ import { config } from '../config.js';
 import { decryptKey } from '../lib/encryption.js';
 import type { WhatsappChannel } from '../db/schema.js';
 import { logger } from '../lib/logger.js';
+import { fetchWithTimeout } from '../lib/http.js';
 
 export async function sendText(to: string, body: string, channel: WhatsappChannel): Promise<boolean> {
   const token = decryptChannelToken(channel);
   if (!token) return false;
   const url = `https://graph.facebook.com/${config.WHATSAPP_GRAPH_VERSION}/${channel.phoneNumberId}/messages`;
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { body } }),

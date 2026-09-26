@@ -20,7 +20,11 @@
     "db:setup": "docker compose up -d postgres redis",
     "db:bootstrap": "npm run db:migrate && npm run db:apply-rls",
     "db:backup": "bash scripts/pg-backup.sh",
-    "build": "tsc",
+    "hash-operator-password": "tsx scripts/hash-operator-password.ts",
+    "revoke-operator-sessions": "tsx --env-file-if-exists=.env scripts/revoke-operator-sessions.ts",
+    "check:render": "node scripts/check-render.mjs",
+    "smoke:bff": "npm --prefix web run build && node scripts/smoke-bff.mjs",
+    "build": "tsc -p tsconfig.build.json",
     "start:prod": "node --env-file-if-exists=.env dist/server.js"
   },
   "dependencies": {
@@ -33,13 +37,15 @@
     "pino": "10.3.1",
     "postgres": "3.4.9",
     "redis": "6.2.1",
+    "tsx": "4.23.13",
     "zod": "4.5.4"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "26.4.1",
     "@vitest/coverage-v8": "^5.0.0",
     "drizzle-kit": "0.31.10",
-    "tsx": "4.23.13",
+    "js-yaml": "^5.4.2",
     "typescript": "7.0.2",
     "vitest": "5.0.0"
   }

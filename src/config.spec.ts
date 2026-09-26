@@ -1,4 +1,5 @@
 import { test, expect, describe, vi } from 'vitest';
+import { loadConfig } from './config.js';
 
 vi.mock('../integrations/shopify.js', () => ({
   ShopifyAdapter: class {},
@@ -11,6 +12,15 @@ vi.mock('../lib/health.js', () => ({
 }));
 
 describe('config', () => {
+  const HEX = 'a'.repeat(64);
+
+  // loadConfig takes the env explicitly, so these cases need no module reset.
+  const base = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+    ENCRYPTION_KEY: HEX,
+    ENCRYPTION_KEY_VERSION: 'v1',
+    ...over,
+  });
+
   test('provides defaults', async () => {
     vi.resetModules();
     process.env.ENCRYPTION_KEY_VERSION = 'v1';
@@ -18,6 +28,44 @@ describe('config', () => {
     const { config } = await import('./config.js');
     expect(config.PORT).toBe(3000);
     expect(config.ENCRYPTION_KEY_VERSION).toBe('v1');
+  });
+
+  test('rejects a non-hex ENCRYPTION_KEY at boot', () => {
+    expect(() => loadConfig(base({ ENCRYPTION_KEY: 'z'.repeat(64) }))).toThrow(/64 hex characters/);
+  });
+
+  test('rejects a wrong-length ENCRYPTION_KEY at boot', () => {
+    expect(() => loadConfig(base({ ENCRYPTION_KEY: 'a'.repeat(32) }))).toThrow(/64 hex characters/);
+  });
+
+  test('rejects a non-hex rotation key too', () => {
+    expect(() =>
+      loadConfig(base({ ENCRYPTION_KEY_VERSION: 'v2', ENCRYPTION_KEY_v2: 'x'.repeat(64) })),
+    ).toThrow(/version v2/);
+  });
+
+  test('accepts uppercase hex and a valid rotation set', () => {
+    // ENCRYPTION_KEY is always filed under the active version, so it and
+    // ENCRYPTION_KEY_v2 both land in keys.v2 — the latter wins.
+    const cfg = loadConfig(
+      base({ ENCRYPTION_KEY: HEX.toUpperCase(), ENCRYPTION_KEY_VERSION: 'v2', ENCRYPTION_KEY_v2: HEX }),
+    );
+    expect(cfg.encryption.version).toBe('v2');
+    expect(cfg.encryption.keys.v2).toBe(HEX);
+  });
+
+  test('keeps the superseded key readable so rotation can decrypt old rows', () => {
+    const cfg = loadConfig(
+      base({ ENCRYPTION_KEY: HEX, ENCRYPTION_KEY_VERSION: 'v2', ENCRYPTION_KEY_v1: 'b'.repeat(64) }),
+    );
+    expect(cfg.encryption.version).toBe('v2');
+    expect(cfg.encryption.keys.v1).toBe('b'.repeat(64));
+  });
+
+  test('production still requires a key to be present at all', () => {
+    expect(() =>
+      loadConfig({ ...base(), ENCRYPTION_KEY: '', NODE_ENV: 'production', ADMIN_API_KEY: 'k'.repeat(32) }),
+    ).toThrow(/ENCRYPTION_KEY is required in production/);
   });
 });
 

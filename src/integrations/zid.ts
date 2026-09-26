@@ -1,4 +1,5 @@
 import type { CommerceAdapter, Product, Order } from '../types.js';
+import { fetchWithTimeout } from '../lib/http.js';
 
 const DEFAULT_BASE_URL = 'https://api.zid.sa/v1';
 
@@ -120,7 +121,7 @@ export class ZidAdapter implements CommerceAdapter {
   private async api<T>(path: string, params: Record<string, string | number | boolean> = {}): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
-    const r = await fetch(url.toString(), { headers: this.headers() });
+    const r = await fetchWithTimeout(url.toString(), { headers: this.headers() });
     if (!r.ok) throw new Error(`Zid ${r.status}`);
     const j = (await r.json()) as T | ZidApiResponse<T>;
     const body = j as ZidApiResponse<T>;

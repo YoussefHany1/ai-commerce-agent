@@ -1,4 +1,5 @@
 import type { CommerceAdapter, Product, Order } from '../types.js';
+import { fetchWithTimeout } from '../lib/http.js';
 
 const DEFAULT_BASE_URL = 'https://api.salla.sa/admin/v2';
 
@@ -86,7 +87,7 @@ export class SallaAdapter implements CommerceAdapter {
   private async api<T>(path: string, params: Record<string, string | number> = {}): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
-    const r = await fetch(url.toString(), {
+    const r = await fetchWithTimeout(url.toString(), {
       headers: { Authorization: `Bearer ${this.token}` },
     });
     if (!r.ok) throw new Error(`Salla ${r.status}`);

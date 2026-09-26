@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isOperatorHashFormat } from './lib/passwordHash.js';
 
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
@@ -6,8 +7,11 @@ const schema = z.object({
   OAUTH_REDIRECT_ALLOWLIST: z.string().optional(),
   CORS_ORIGINS: z.string().optional(),
   ADMIN_API_KEY: z.string().min(32).optional(),
+  ADMIN_API_KEY_PREVIOUS: z.string().min(32).optional(),
+  OPERATOR_PASSWORD_HASH: z.string().optional(),
+  OPERATOR_PASSWORD_HASH_PREVIOUS: z.string().optional(),
   SENTRY_DSN: z.string().optional(),
-  TRUST_PROXY: z.enum(['1', '0', 'true', 'false']).default('false'),
+  TRUST_PROXY: z.enum(['1', '0', 'true', 'false', 'none']).default('false'),
   DATABASE_URL: z
     .string()
     .default('postgres://postgres:postgres@localhost:5432/ai_commerce_agent'),
@@ -46,7 +50,14 @@ const schema = z.object({
   RETENTION_EVENTS_DAYS: z.coerce.number().int().positive().default(90),
   RETENTION_CUSTOMER_ORPHAN_DAYS: z.coerce.number().int().positive().default(730),
   RETENTION_ENABLED: z.enum(['1', '0', 'true', 'false']).default('true'),
+  WORKERS_ENABLED: z.enum(['1', '0', 'true', 'false']).default('true'),
 });
+
+// aes-256-gcm needs exactly 32 bytes. Buffer.from(key, 'hex') silently drops
+// non-hex characters rather than erroring, so a malformed key produces a
+// wrong-length buffer and only fails later, at the first encryptKey(), as an
+// opaque "Invalid key length" from createCipheriv.
+const ENCRYPTION_KEY_HEX = /^[0-9a-f]{64}$/i;
 
 function collectKeys(raw: NodeJS.ProcessEnv): Record<string, string> {
   const keys: Record<string, string> = {};
@@ -58,6 +69,18 @@ function collectKeys(raw: NodeJS.ProcessEnv): Record<string, string> {
   return keys;
 }
 
+function assertKeyShape(keys: Record<string, string>): void {
+  for (const [version, key] of Object.entries(keys)) {
+    if (ENCRYPTION_KEY_HEX.test(key)) continue;
+    throw new Error(
+      `ENCRYPTION_KEY (version ${version}) must be 64 hex characters (32 bytes) — generate one ` +
+        `with \`openssl rand -hex 32\`. Hosting platforms that auto-generate secrets produce ` +
+        `alphanumeric strings, not hex, and the mismatch would otherwise only surface on the ` +
+        `first token write.`,
+    );
+  }
+}
+
 export function loadConfig(raw: NodeJS.ProcessEnv = process.env) {
   const parsed = schema.parse(raw);
   const keys = collectKeys(raw);
@@ -66,15 +89,30 @@ export function loadConfig(raw: NodeJS.ProcessEnv = process.env) {
   if (isProd && !raw.ENCRYPTION_KEY) {
     throw new Error('ENCRYPTION_KEY is required in production');
   }
+  assertKeyShape(keys);
   if (isProd && !parsed.ADMIN_API_KEY) {
     throw new Error('ADMIN_API_KEY is required in production — set a key of at least 32 characters');
   }
-  if (isProd && !(raw.TRUST_PROXY === '1' || raw.TRUST_PROXY?.toLowerCase() === 'true')) {
-    console.warn('TRUST_PROXY not set — ensure HTTPS is terminated upstream (Nginx/Caddy/Load Balancer)');
+  if (isProd && !isOperatorHashFormat(raw.OPERATOR_PASSWORD_HASH)) {
+    throw new Error(
+      'OPERATOR_PASSWORD_HASH must be a scrypt hash in production (scrypt$N$r$p$salt$hash) — ' +
+        'generate one with `npm run hash-operator-password` rather than storing a plaintext password',
+    );
+  }
+  if (isProd) {
+    const tp = (raw.TRUST_PROXY ?? '').toLowerCase();
+    if (tp !== '1' && tp !== 'true' && tp !== 'none') {
+      throw new Error(
+        'TRUST_PROXY must be set explicitly in production: "1"/"true" when TLS terminates upstream ' +
+          '(the edge must overwrite X-Forwarded-For), or "none" when the app is directly internet-exposed. ' +
+          'Unset makes per-IP rate limits key off the wrong address.',
+      );
+    }
   }
   return {
     ...parsed,
     retentionEnabled: parsed.RETENTION_ENABLED === '1' || parsed.RETENTION_ENABLED === 'true',
+    workersEnabled: parsed.WORKERS_ENABLED === '1' || parsed.WORKERS_ENABLED === 'true',
     trustProxy: parsed.TRUST_PROXY === '1' || parsed.TRUST_PROXY === 'true',
     encryption: {
       version: activeVersion,

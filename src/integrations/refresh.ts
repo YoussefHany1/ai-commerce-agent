@@ -1,5 +1,6 @@
 import type { Platform } from '../types.js';
 import { config } from '../config.js';
+import { fetchWithTimeout } from '../lib/http.js';
 
 export type RefreshResult = {
   accessToken: string;
@@ -24,7 +25,7 @@ export async function refreshProviderToken(
 
 async function refreshSalla(refreshToken: string): Promise<RefreshResult | null> {
   if (!config.SALLA_CLIENT_ID || !config.SALLA_CLIENT_SECRET) return null;
-  const res = await fetch('https://accounts.salla.sa/oauth2/token', {
+  const res = await fetchWithTimeout('https://accounts.salla.sa/oauth2/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -51,7 +52,7 @@ async function refreshSalla(refreshToken: string): Promise<RefreshResult | null>
 async function refreshZid(refreshToken: string): Promise<RefreshResult | null> {
   if (!config.ZID_CLIENT_ID || !config.ZID_CLIENT_SECRET) return null;
   const redirectUri = `${config.APP_BASE_URL}/api/oauth/zid/callback`;
-  const res = await fetch('https://oauth.zid.sa/oauth/token', {
+  const res = await fetchWithTimeout('https://oauth.zid.sa/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
