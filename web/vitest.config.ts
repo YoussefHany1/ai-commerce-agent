@@ -13,10 +13,10 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['lib/**/*.spec.ts', 'app/**/*.spec.ts'],
+    include: ['lib/**/*.spec.ts', 'app/**/*.spec.ts', 'proxy.spec.ts'],
     coverage: {
       provider: 'v8',
-      include: ['lib/server/**/*.ts'],
+      include: ['lib/server/**/*.ts', 'proxy.ts'],
       reporter: ['text-summary'],
     },
   },

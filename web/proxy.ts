@@ -9,9 +9,19 @@ import { verifySessionCookieShape } from '@/lib/server/session-edge';
  * scripts. A nonce lets both run while keeping `script-src` free of
  * 'unsafe-inline', so an injected inline script still cannot execute.
  *
- * Next picks the nonce up from the `x-nonce` request header and stamps it on
- * every script it emits, which is why the nonce has to be minted here and
- * threaded through the request rather than only added to the response header.
+ * Two headers have to carry this, and they serve different consumers:
+ *
+ *  - `content-security-policy` is what Next itself parses. It reads the nonce
+ *    out of the request's CSP header and stamps it on every script it emits.
+ *  - `x-nonce` is our own convention, read by `app/layout.tsx` so the theme
+ *    and locale bootstrap script can carry the same nonce. Next never looks at
+ *    it.
+ *
+ * Setting only the response CSP looks correct and silently breaks hydration:
+ * Next emits scripts with no nonce while the browser enforces a script-src
+ * containing a nonce source, and under CSP3 the presence of a nonce source
+ * makes 'self' be ignored. Every script is then blocked - the HTML paints and
+ * nothing executes.
  */
 function mintNonce(): string {
   // Web Crypto, not node:crypto: this file runs in the Edge runtime, where the
@@ -46,6 +56,11 @@ function csp(nonce: string): string {
   ].join('; ');
 }
 
+/** The nonce embedded in a policy built by `csp`, for handing to app/layout.tsx. */
+function nonceIn(policy: string): string {
+  return /'nonce-([A-Za-z0-9+/_-]+={0,2})'/.exec(policy)?.[1] ?? '';
+}
+
 const SECURITY_HEADERS: Record<string, string> = {
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
@@ -66,11 +81,11 @@ function hsts(request: NextRequest): string | null {
   return proto === 'https' ? 'max-age=63072000; includeSubDomains' : null;
 }
 
-function applyHeaders(res: NextResponse, request: NextRequest, nonce: string): NextResponse {
+function applyHeaders(res: NextResponse, request: NextRequest, policy: string): NextResponse {
   for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
   const strict = hsts(request);
   if (strict) res.headers.set('Strict-Transport-Security', strict);
-  res.headers.set('Content-Security-Policy', csp(nonce));
+  res.headers.set('Content-Security-Policy', policy);
   return res;
 }
 
@@ -86,9 +101,14 @@ function applyHeaders(res: NextResponse, request: NextRequest, nonce: string): N
  * and nothing is served on the strength of this check.
  */
 export async function proxy(request: NextRequest): Promise<NextResponse> {
-  const nonce = mintNonce();
+  const policy = csp(mintNonce());
   const requestHeaders = new Headers(request.headers);
-  requestHeaders.set('x-nonce', nonce);
+  // The request-side CSP is what Next parses to nonce its own scripts; the
+  // response-side copy in applyHeaders is what the browser enforces. Both must
+  // carry the same policy, or the browser enforces a nonce no script holds.
+  requestHeaders.set('content-security-policy', policy);
+  // Read by app/layout.tsx for our own bootstrap script, which Next does not tag.
+  requestHeaders.set('x-nonce', nonceIn(policy));
 
   const isDashboard = request.nextUrl.pathname.startsWith('/dashboard');
   const token = request.cookies.get('aca_session')?.value;
@@ -96,7 +116,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     return applyHeaders(
       NextResponse.next({ request: { headers: requestHeaders } }),
       request,
-      nonce,
+      policy,
     );
   }
 
@@ -105,7 +125,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   url.search = '';
   // Preserved so the login page can return the operator to where they were headed.
   if (request.nextUrl.pathname !== '/') url.searchParams.set('next', request.nextUrl.pathname);
-  return applyHeaders(NextResponse.redirect(url), request, nonce);
+  return applyHeaders(NextResponse.redirect(url), request, policy);
 }
 
 export const config = {
