@@ -122,11 +122,13 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
   - `daily`: zero-filled per-day conversions + avg lag
   - `distribution`: non-overlapping time bands (`<1h`, `1–6h`, `6–12h`, `12–24h`, `1–7d`, `>7d`) with count + share (`lagDistribution`)
 - Pure aggregation helpers exported for tests; plan-gated + rate-limited like the other analytics endpoints
-- `GET /dashboard` — dependency-free single-file dashboard (`public/dashboard.html`, served by `src/routes/dashboard.ts`):
-  - API-key input + store ID + date range selector (7/14/30/90)
-  - KPI cards (orders, revenue, **attributed revenue**, funnel counts, CTR, CVR)
-  - per-channel funnel table, top-products table, conversion-lag stats + daily bars, and a filterable attributions table
-  - reads the same analytics endpoints with the `X-Api-Key` header (the page shell is public; every data call requires the admin key)
+- The operator dashboard is the separate `web/` service (Next.js), not a file served by this API. It reads the same analytics endpoints through its own authenticated proxy, so no page served here ever holds the admin key. See `web/README.md`.
+
+## Operator access (added in the production-readiness pass)
+- `POST /api/auth/operator/verify` — exchanges the shared operator password for a session epoch. The dashboard calls this server-to-server; the browser never sees the password hash or the admin key.
+- Password stored as a scrypt hash (`OPERATOR_PASSWORD_HASH`), generated with `npm run hash-operator-password`; the previous hash is accepted during a rotation.
+- Lockout after 5 failed attempts: 30s, doubling to 15m, keyed per IP in Redis so it survives restarts and applies across replicas. Fails closed with `503` if Redis is unreachable.
+- `npm run revoke-operator-sessions` bumps the epoch in Redis, immediately invalidating every issued session cookie.
 
 ## Phase 9e (Agent retrieval evaluation harness)
 - `npm run eval` — scores the retrieval pipeline against a curated dataset (`eval/queries.json`)
@@ -213,7 +215,7 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
 - **Webhook signatures per platform** (`src/lib/webhooks.ts`): Shopify `x-shopify-hmac-sha256`, Salla `x-salla-signature`, Zid `x-zid-signature`, plus the shared `x-hub-signature-256` fallback — all verified from the raw body, fail closed when the secret is unset
 - **Zid secret at rest**: the `authorization` JWT is stored in `store.settings` via `updateSettingsEncrypted` (AES-256-GCM) and read back decrypted by the adapter (`storeRepo.getSecret`); never plaintext
 - **Admin endpoints on the admin key**: `GET/POST /api/stores`, `DELETE /api/stores/:storeId` (cascading delete of all tenant rows), `POST /api/session`, plus every analytics/metrics/automation/pdpl/jobs route
-- **Dev-only dashboard**: `GET /dashboard` serves the shell unauthenticated; the X-Api-Key input gates every analytics request
+- **No credential in the browser**: the dashboard authenticates with an `HttpOnly` session cookie and calls its own server-side proxy, which attaches `ADMIN_API_KEY`. The `X-Api-Key` input page that used to live at `GET /dashboard` is gone, along with the localStorage credential path. `NEXT_PUBLIC_ADMIN_API_KEY` no longer exists; CI fails the build if any privileged identifier reaches the client bundle.
 - **Infra**: Postgres/Redis bound to `127.0.0.1` with required `REDIS_PASSWORD` (`redis-server --requirepass`), pinned image digests, `restart: unless-stopped`, memory limits, and a separate `migrate` image that runs `db:migrate` + `db:apply-rls`
 
 ## Production next steps already defined in docs/ARCHITECTURE.md

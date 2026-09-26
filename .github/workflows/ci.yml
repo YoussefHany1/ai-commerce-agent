@@ -34,10 +34,48 @@ jobs:
           APP_DB_PASSWORD: ci-agent-app
           REDIS_PASSWORD: ci-redis
           NEXT_PUBLIC_API_URL: http://localhost:3000
+          # Compose interpolation validates these for every service, so the web
+          # image's runtime contract has to be satisfied even though only the build
+          # runs here. These are throwaway values, never used to serve traffic.
+          ADMIN_API_KEY: ci-admin-key-0123456789abcdef0123456789
+          SESSION_SECRET: ci-session-secret-0123456789abcdef0123456789
         run: |
           docker compose build migrate
           docker compose build app
           docker compose build web
+      # Building an image proves nothing about whether it runs. This is the step
+      # that would have caught the dashboard binding to loopback only: Docker
+      # injects HOSTNAME at container start, so the server bound an address the
+      # network could not reach, and the image built cleanly every time.
+      - name: Boot the web image and check it is reachable off-loopback
+        env:
+          ADMIN_API_KEY: ci-admin-key-0123456789abcdef0123456789
+          SESSION_SECRET: ci-session-secret-0123456789abcdef0123456789
+          API_URL: http://api.invalid:3000
+          REDIS_URL: redis://redis:6379
+        run: |
+          set -euo pipefail
+          # Resolved from compose so this does not depend on the project-name prefix
+          # docker compose happens to apply.
+          WEB_IMAGE="$(docker compose images -q web)"
+          if [ -z "$WEB_IMAGE" ]; then echo "could not resolve the web image"; exit 1; fi
+          # Deliberately no -e HOSTNAME: this must exercise whatever the image
+          # and the Docker daemon supply on their own, which is the production case.
+          docker run -d --name web-reachability -p 18081:3001 \
+            -e ADMIN_API_KEY -e SESSION_SECRET -e API_URL -e REDIS_URL \
+            "$WEB_IMAGE"
+          trap 'docker logs web-reachability; docker rm -f web-reachability' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:18081/login; then
+              echo "web image served /login on the published port"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "web image never became reachable on the published port"
+          exit 1
 
   web:
     runs-on: ubuntu-latest
@@ -51,14 +89,37 @@ jobs:
       - name: Install (web)
         run: npm ci
         working-directory: web
-      - name: Lint + typecheck + build (web)
+      - name: Lint + typecheck + test + build (web)
         working-directory: web
         env:
           NEXT_PUBLIC_API_URL: http://localhost:3000
         run: |
           npm run lint
           npm run typecheck
+          npm run test
           npm run build
+
+      # The unit tests cover the allowlist, path normalization, and cookie signing in
+      # isolation. What they cannot see is the route's real runtime params — a mismatch
+      # there 404s every request while every helper test still passes. This boots the
+      # built server against stub Redis/upstream and drives it over HTTP.
+      - name: Smoke the BFF end to end
+        run: node scripts/smoke-bff.mjs
+
+      # The bundle is the artifact that matters: the dashboard used to hold the admin
+      # key in the browser, so a leak here is a full compromise, not a lint nit.
+      - name: Audit the client bundle for leaked credentials
+        working-directory: web
+        run: |
+          if grep -rlE 'ADMIN_API_KEY|SESSION_SECRET|OPERATOR_PASSWORD_HASH|REDIS_URL|redis://' .next/static; then
+            echo "::error::a privileged identifier reached the client bundle"
+            exit 1
+          fi
+          echo "client bundle clean"
+
+      - name: Dependency vulnerability scan (web)
+        working-directory: web
+        run: npm audit --audit-level=high
 
   coverage:
     runs-on: ubuntu-latest
@@ -70,6 +131,20 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:cov
+
+  deploy-plan:
+    # render.yaml is only as good as its references: a secret that resolves to
+    # nothing, or a value duplicated as both a build arg and a runtime var, deploys
+    # green and then fails at runtime.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:render
 
   migrations:
     runs-on: ubuntu-latest
@@ -101,6 +176,12 @@ jobs:
       APP_DB_PASSWORD: ci-agent-app
       ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       ADMIN_API_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef
+      # Production mode refuses to boot without a well-formed operator hash; the
+      # throwaway value below is scrypt-shaped so config validation is genuinely
+      # exercised rather than skipped.
+      OPERATOR_PASSWORD_HASH: scrypt$16384$8$1$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000
+      TRUST_PROXY: "none"
+      WORKERS_ENABLED: "false"
       NODE_ENV: production
     steps:
       - uses: actions/checkout@v4

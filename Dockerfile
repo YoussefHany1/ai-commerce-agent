@@ -14,11 +14,13 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist/ dist/
 COPY drizzle/ drizzle/
 COPY scripts/ scripts/
-COPY public/ public/
 ENV NODE_ENV=production
+ENV PORT=3000
 EXPOSE 3000
+# Reads PORT rather than assuming 3000, so the same image works behind any port
+# mapping (docker-compose, Render, or a local override).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "const p=process.env.PORT||3000;fetch('http://127.0.0.1:'+p+'/api/health').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"
 USER node
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "--env-file-if-exists=.env", "dist/server.js"]

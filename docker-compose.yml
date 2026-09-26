@@ -70,14 +70,34 @@ services:
       context: .
       dockerfile: web/Dockerfile
       args:
+        # The only build-time input. Privileged variables are runtime-only, so a
+        # rebuilt image cannot silently carry a stale secret.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3000}
     ports:
       - "127.0.0.1:3001:3001"
     environment:
+      # Public origin, inlined into the client bundle at build time. Used only for
+      # the OAuth install link and the webhook base URL shown to the operator.
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3000}
+      # Server-only: the proxy's upstream target and the credential it attaches.
+      API_URL: http://app:3000
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set in .env}
+      # Shared with the app so dashboard cookies can be revoked via the session epoch.
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379
+      # The dashboard is served over plain http in compose, where a browser would
+      # refuse to store a Secure cookie. Production keeps it on.
+      SESSION_COOKIE_SECURE: "false"
+      # Docker populates HOSTNAME with the container's own hostname at start, which
+      # would make the Next standalone server bind loopback only. The image's CMD
+      # already forces this for the node process; setting it here too keeps the
+      # compose contract explicit rather than relying on that.
+      HOSTNAME: "0.0.0.0"
     depends_on:
       app:
         condition: service_started
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 512m
 

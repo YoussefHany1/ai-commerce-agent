@@ -1,0 +1,171 @@
+# Render blueprint for the API and the merchant dashboard.
+#
+# Before the first deploy
+# -----------------------
+# 1. The database MUST have pgvector. Render's managed PostgreSQL does not ship the
+#    `vector` extension, and the first migration runs
+#    `CREATE EXTENSION vector` (drizzle/0001_tiresome_gladiator.sql) with a
+#    `vector(1536)` column. Create the database at a provider that does (Neon,
+#    Supabase, Timescale) and set DATABASE_URL / PGADMIN_URL to it.
+# 2. Generate the secrets marked `generateValue: true`, or replace them with your own:
+#      openssl rand -hex 32     # ADMIN_API_KEY, SESSION_SECRET
+#      npm run hash-operator-password   # OPERATOR_PASSWORD_HASH
+# 3. Set API_URL on the web service to the API's private origin (http://agent-api:10000)
+#    and OAUTH_REDIRECT_ALLOWLIST to the dashboard's public URL, otherwise the Shopify
+#    install dead-ends on a raw JSON response.
+# 4. Confirm pgvector is available:  psql $DATABASE_URL -c 'CREATE EXTENSION IF NOT EXISTS vector'
+
+# No `databases:` block on purpose. The database must come from a provider that
+# ships pgvector, which Render's managed PostgreSQL does not, so it cannot be
+# provisioned here — see note 1. If you later switch to a Render Postgres named
+# `agent-db`, uncomment the block below and change DATABASE_URL/PGADMIN_URL back to
+# `fromDatabase`.
+#
+#   databases:
+#     - name: agent-db
+#       databaseName: ai_commerce_agent
+#       user: agent
+#       plan: 1c-2g
+#       postgresMajorVersion: "17"
+
+services:
+  # Redis holds the operator session epoch, per-tenant rate limits, customer
+  # sessions, OAuth nonces, and the worker leases. Losing it signs operators out
+  # and lets two replicas run the same worker until it is restored.
+  - type: redis
+    name: agent-redis
+    ipAllowList: []
+    plan: 1c-2g
+    region: oregon
+
+  - type: web
+    name: agent-api
+    runtime: docker
+    dockerfile: ./Dockerfile
+    dockerContext: .
+    plan: 1c-2g
+    region: oregon
+    # /api/health answers 200 without a credential, which is what the health
+    # check needs; the worker and rate-limit subsystems report their own state.
+    healthCheckPath: /api/health
+    # Migrations and RLS run here, in the same image as the service, immediately
+    # before the new version starts serving. `tsx` is a runtime dependency
+    # precisely so this works in the production image.
+    preDeployCommand: npm run db:bootstrap
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Render terminates TLS and sets X-Forwarded-For, so req.ip must honor it.
+      # Leave this as 'none' only if you also disable the edge in front of the API.
+      - key: TRUST_PROXY
+        value: "1"
+      # Every replica schedules the workers; each tick takes a Redis lease, so
+      # scale out freely. Set false on a web-only replica.
+      - key: WORKERS_ENABLED
+        value: "true"
+      # External pgvector-capable Postgres, set by hand: see note 1. DATABASE_URL is
+      # the RLS-restricted role the app connects as; PGADMIN_URL is the owner role the
+      # migration and RLS scripts use to alter policies. They must not be the same
+      # account, or RLS protects nothing.
+      - key: DATABASE_URL
+        sync: false # postgres://agent_app:...@host/db?sslmode=require
+      - key: PGADMIN_URL
+        sync: false # postgres://agent_owner:...@host/db?sslmode=require
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: agent-redis
+          property: connectionString
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: OPERATOR_PASSWORD_HASH
+        sync: false # set to the output of `npm run hash-operator-password`
+      - key: ENCRYPTION_KEY
+        # NOT generateValue: true. Render generates an alphanumeric string, but
+        # aes-256-gcm needs 32 bytes of hex — Buffer.from(key, 'hex') silently
+        # drops non-hex characters, so the app would boot and then fail on the
+        # first token write. Set this to the output of `openssl rand -hex 32`.
+        sync: false
+      # Its own public origin, used to build webhook and OAuth callback URLs. This
+      # must be a real URL: src/config.ts validates APP_BASE_URL with z.string().url(),
+      # so a bare hostname here would stop the API from booting. Render's `host`
+      # property is the private-network hostname with no scheme, which is why this
+      # uses the documented self-reference to RENDER_EXTERNAL_URL instead.
+      - key: APP_BASE_URL
+        fromService:
+          type: web
+          name: agent-api
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: OAUTH_REDIRECT_ALLOWLIST
+        sync: false # e.g. https://agent-web.onrender.com
+      - key: LOG_LEVEL
+        value: info
+      # Platform credentials — set these from the Render dashboard.
+      - key: SHOPIFY_API_VERSION
+        sync: false
+      - key: SHOPIFY_CLIENT_ID
+        sync: false
+      - key: SHOPIFY_CLIENT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+      - key: WHATSAPP_WEBHOOK_VERIFY_TOKEN
+        sync: false
+
+  - type: web
+    name: agent-web
+    runtime: docker
+    dockerfile: ./web/Dockerfile
+    dockerContext: .
+    plan: 1c-2g
+    region: oregon
+    healthCheckPath: /login
+    envVars:
+      # Public origin of the API, inlined into the client bundle at build time and
+      # used only for the OAuth link and the webhook display shown in settings.
+      # Referenced through RENDER_EXTERNAL_URL because `property: host` is a bare
+      # private-network hostname - a browser cannot navigate to it.
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          type: web
+          name: agent-api
+          envVarKey: RENDER_EXTERNAL_URL
+      # Server-side proxy target. Use the private-network origin so proxied calls
+      # skip the public edge and never carry the admin key over the internet:
+      #     http://agent-api:10000
+      # 10000 is Render's default PORT, which src/server.ts binds to. A Blueprint
+      # cannot compose `host` and `port` into one value, so this one is set by hand.
+      - key: API_URL
+        sync: false
+      - key: ADMIN_API_KEY
+        fromService:
+          type: web
+          name: agent-api
+          envVarKey: ADMIN_API_KEY
+      - key: SESSION_SECRET
+        generateValue: true
+      # Must be the same Redis the API uses, or a revoked session keeps working.
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: agent-redis
+          property: connectionString
+    # No SESSION_SECRET build arg on purpose. Next inlines process.env references from
+    # Edge code at build time, so a build arg here would bake in a *second*, different
+    # key from the runtime one and lock every operator out. The Edge middleware is
+    # therefore structural-only and reads no secret; the Node proxy verifies the HMAC.
+    buildArgs:
+      # The public API origin is inlined into the client bundle at build time and is
+      # the one value that must exist before the image is built. Same value as the
+      # runtime var above; if the API's hostname changes, both must be redeployed.
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          type: web
+          name: agent-api
+          envVarKey: RENDER_EXTERNAL_URL
