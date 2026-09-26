@@ -15,7 +15,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { useSelectedStore, useCreateStore, STORES_KEY } from '@/hooks/useStores';
-import { API_BASE_URL, ApiError } from '@/lib/api';
+import { API_BASE_URL, api, ApiError } from '@/lib/api';
 import type { Store } from '@/lib/types';
 
 const PLATFORM_OPTIONS = [
@@ -34,7 +34,7 @@ interface FormState {
 const emptyForm: FormState = { name: '', platform: 'shopify', shopDomain: '', accessToken: '' };
 
 export default function StoresPage() {
-  const { stores, isLoading, isError, storeId, setActiveStoreId } = useSelectedStore();
+  const { stores, isLoading, isError, error, storeId, setActiveStoreId } = useSelectedStore();
   const createStore = useCreateStore();
   const queryClient = useQueryClient();
 
@@ -44,27 +44,7 @@ export default function StoresPage() {
   const [toDisconnect, setToDisconnect] = useState<Store | null>(null);
 
   const disconnect = useMutation({
-    mutationFn: async (store: Store) => {
-      const res = await fetch(`${API_BASE_URL}/api/stores/${store.id}`, {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(process.env.NEXT_PUBLIC_ADMIN_API_KEY
-            ? { 'X-Api-Key': process.env.NEXT_PUBLIC_ADMIN_API_KEY }
-            : {}),
-        },
-      });
-      if (!res.ok) {
-        let payload: unknown = null;
-        try {
-          payload = await res.json();
-        } catch {
-          /* ignore */
-        }
-        throw new ApiError(res.status, payload);
-      }
-      return res.json();
-    },
+    mutationFn: (store: Store) => api.deleteStore(store.id),
     onSuccess: (_data, store) => {
       queryClient.setQueryData<Store[]>(STORES_KEY, (old) => old?.filter((s) => s.id !== store.id) ?? []);
       if (storeId === store.id) setActiveStoreId(null);
@@ -109,9 +89,20 @@ export default function StoresPage() {
     }
   };
 
-  const oauthUrl = form.shopDomain.trim()
-    ? `${API_BASE_URL}/api/oauth/shopify/start?shop=${encodeURIComponent(form.shopDomain.trim())}`
-    : null;
+  /**
+   * Starts the Shopify install. `redirectAfter` sends the merchant back to this
+   * dashboard once the callback completes — without it the API answers with raw
+   * JSON, which is a dead end for the person installing. The API only honours it
+   * for origins listed in OAUTH_REDIRECT_ALLOWLIST.
+   */
+  const startShopifyOAuth = (shopDomain: string) => {
+    const url = new URL(`${API_BASE_URL}/api/oauth/shopify/start`);
+    url.searchParams.set('shop', shopDomain);
+    if (typeof window !== 'undefined') {
+      url.searchParams.set('redirectAfter', `${window.location.origin}/dashboard/stores`);
+    }
+    window.location.href = url.toString();
+  };
 
   return (
     <div>
@@ -170,7 +161,11 @@ export default function StoresPage() {
       )}
 
       {isError && (
-        <p className="mt-4 text-sm text-red-500">Couldn’t load stores. Check that the API is running.</p>
+        <p className="mt-4 text-sm text-red-500">
+          {error instanceof ApiError && error.status === 401
+            ? 'Your session has expired. Please sign in again.'
+            : 'Couldn’t load stores. Check that the API is running.'}
+        </p>
       )}
 
       {/* Add store modal */}
@@ -230,10 +225,14 @@ export default function StoresPage() {
               <p className="text-xs font-medium text-slate-500 dark:text-slate-400">
                 Prefer one-click setup?
               </p>
-              {oauthUrl ? (
-                <a href={oauthUrl} className="btn-primary w-full">
+              {form.shopDomain.trim() ? (
+                <Button
+                  variant="secondary"
+                  className="w-full"
+                  onClick={() => startShopifyOAuth(form.shopDomain.trim())}
+                >
                   Connect with Shopify OAuth
-                </a>
+                </Button>
               ) : (
                 <p className="text-xs text-slate-400">Enter your shop domain to enable OAuth.</p>
               )}

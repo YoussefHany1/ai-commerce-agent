@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Bell,
@@ -14,11 +14,13 @@ import {
   LogOut,
 } from 'lucide-react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useHealth } from '@/hooks/useMetrics';
 import { useTheme } from '@/lib/theme';
 import { useLocale } from '@/lib/locale';
 import { initials } from '@/lib/utils';
 import { useSelectedStore } from '@/hooks/useStores';
+import { api } from '@/lib/api';
 
 function useClickOutside(onClose: () => void) {
   const ref = useRef<HTMLDivElement>(null);
@@ -130,12 +132,29 @@ export function NotificationBell() {
 
 export function UserMenu() {
   const [open, setOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
   const ref = useClickOutside(() => setOpen(false));
   const { theme, toggleTheme } = useTheme();
   const { toggleLocale } = useLocale();
   const { activeStore } = useSelectedStore();
+  const router = useRouter();
   const name = activeStore?.name ?? 'Store Owner';
   const email = activeStore?.shopDomain ?? 'owner@store.com';
+
+  const signOut = useCallback(async () => {
+    setSigningOut(true);
+    setOpen(false);
+    try {
+      await api.signOut();
+    } catch {
+      // Still leave: a cookie we failed to clear is replaced by the next login,
+      // whereas a dashboard the operator is locked out of is not recoverable.
+    } finally {
+      setSigningOut(false);
+      router.replace('/login');
+      router.refresh();
+    }
+  }, [router]);
 
   return (
     <div ref={ref} className="relative">
@@ -176,8 +195,9 @@ export function UserMenu() {
                 {theme === 'dark' ? 'Light mode' : 'Dark mode'}
               </button>
               <button
-                onClick={() => setOpen(false)}
-                className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-red-500 transition hover:bg-red-50 dark:hover:bg-red-500/10"
+                onClick={signOut}
+                disabled={signingOut}
+                className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-red-500 transition hover:bg-red-50 disabled:opacity-50 dark:hover:bg-red-500/10"
               >
                 <LogOut className="h-5 w-5" />
                 Sign out

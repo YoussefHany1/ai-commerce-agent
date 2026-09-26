@@ -79,12 +79,16 @@ export default function BillingPage() {
   const data = billing.data;
   const planId: string = data?.plan ?? 'free';
   const planStatus: string = data?.planStatus ?? 'trial';
+  // Hoisted so the memo's dependency is the value the callback actually reads.
+  // Depending on `data?.currentPeriodEnd` while reading `data.currentPeriodEnd`
+  // inside lets the compiler infer a different key and skip the optimization.
+  const periodEnd = data?.currentPeriodEnd ?? null;
 
   const daysRemaining = useMemo(() => {
-    if (!data?.currentPeriodEnd || planStatus !== 'trial') return null;
-    const diff = differenceInDays(new Date(data.currentPeriodEnd), new Date());
+    if (!periodEnd || planStatus !== 'trial') return null;
+    const diff = differenceInDays(new Date(periodEnd), new Date());
     return Math.max(0, diff);
-  }, [data?.currentPeriodEnd, planStatus]);
+  }, [periodEnd, planStatus]);
 
   const onAction = async (plan: PlanDef) => {
     if (!storeId) {

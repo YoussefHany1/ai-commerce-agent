@@ -14,24 +14,19 @@ import type {
   TopProductsResponse,
 } from '@/lib/types';
 
+/**
+ * Public origin of the API, used only where the browser must navigate to or read
+ * it: the OAuth install link and the webhook base URL shown to the operator.
+ *
+ * Data calls do NOT go here. They are same-origin requests to this app's own
+ * `/api/*` proxy, which attaches the operator credential server-side. Nothing in
+ * this file may read a privileged secret — anything referenced by a `'use client'`
+ * module is inlined into the public bundle.
+ */
 export const API_BASE_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000').replace(
   /\/$/,
   '',
 );
-
-const ADMIN_API_KEY = process.env.NEXT_PUBLIC_ADMIN_API_KEY ?? '';
-
-interface StoreCredentials {
-  storeId: string;
-  apiKey: string;
-}
-
-function storedCredentials(): StoreCredentials | null {
-  const storeId = localStorage.getItem('store_id');
-  const apiKey = localStorage.getItem('store_api_key');
-  if (!storeId || !apiKey) return null;
-  return { storeId, apiKey };
-}
 
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
@@ -68,23 +63,21 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
           .map(([k, v]) => [k, String(v)]),
       ).toString()
     : '';
-  const url = `${API_BASE_URL}${path}${qs ? `?${qs}` : ''}`;
+  // Call sites spell the path with or without the `/api` prefix, and the prefix is
+  // what the proxy route is mounted under. Normalize to exactly one so neither
+  // spelling can produce `/api/api/...`.
+  const suffix = path === '/api' || path.startsWith('/api/') ? path.slice('/api'.length) : path;
+  const url = `/api${suffix}${qs ? `?${qs}` : ''}`;
 
   const reqHeaders: Record<string, string> = { ...(headers ?? {}) };
   if (body !== undefined) reqHeaders['Content-Type'] = 'application/json';
-  if (ADMIN_API_KEY) reqHeaders['X-Api-Key'] = ADMIN_API_KEY;
-  else if (typeof window !== 'undefined') {
-    const cred = storedCredentials();
-    if (cred) {
-      reqHeaders['X-Store-Id'] = cred.storeId;
-      reqHeaders['X-Api-Key'] = cred.apiKey;
-    }
-  }
 
   const res = await fetch(url, {
     method,
     headers: reqHeaders,
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    // Same-origin, so the HTTP-only session cookie rides along.
+    credentials: 'same-origin',
     cache: 'no-store',
   });
 
@@ -108,14 +101,17 @@ function safeParse(text: string): unknown {
 export const api = {
   health: () => request<HealthResponse>('/api/health'),
 
-  listStores: () => request<Store[]>('/api/stores'),
+  listStores: () => request<Store[]>('/stores'),
+
+  deleteStore: (storeId: string) => request<{ ok: true }>(`/stores/${storeId}`, { method: 'DELETE' }),
+
   createStore: (input: {
     name: string;
     platform: string;
     shopDomain?: string;
     accessToken?: string;
   }) =>
-    request<{ id: string }>('/api/stores', {
+    request<{ id: string }>('/stores', {
       method: 'POST',
       body: input,
     }),
@@ -227,8 +223,31 @@ export const api = {
       headers: { Authorization: `Bearer ${token}` },
       body: { productId },
     }),
+
+  /**
+   * Clears the operator session cookie server-side.
+   *
+   * Not routed through the catch-all proxy: `/api/auth/logout` is a dedicated
+   * route handler that only has to expire its own cookie, so proxying it would
+   * add an upstream round-trip that can fail when the very thing being signed
+   * out of is already broken. A failure here still redirects, because leaving
+   * the operator on a page they cannot load is worse than a stale cookie that
+   * the next successful login overwrites.
+   */
+  signOut: async (): Promise<void> => {
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+  },
 };
 
 export function isPaymentRequired(err: unknown): boolean {
   return err instanceof ApiError && err.status === 402;
+}
+
+/** True when the failure means the operator session is gone or expired. */
+export function isUnauthorized(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 401;
 }

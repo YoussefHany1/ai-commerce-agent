@@ -1,6 +1,6 @@
 'use client';
 
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { api, isPaymentRequired } from '@/lib/api';
 
 export function useAttributions(storeId: string | null) {

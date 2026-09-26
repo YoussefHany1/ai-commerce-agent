@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from 'next';
+import { headers } from 'next/headers';
 import { Providers } from '@/app/providers';
 import '@/app/globals.css';
 
@@ -36,14 +37,28 @@ const INIT_SCRIPT = `(function () {
   } catch (e) {}
 })();`;
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+/**
+ * Reads the CSP nonce minted in `proxy.ts`.
+ *
+ * Next stamps it on the scripts it emits automatically; this bootstrap script is
+ * ours, so it has to carry the same nonce or `script-src` blocks it. Reading
+ * `headers()` here is what makes the layout dynamic, which is the correct
+ * rendering mode for an operator-only surface that must never serve a cached
+ * shell to a signed-out visitor.
+ */
+async function nonce(): Promise<string> {
+  return (await headers()).get('x-nonce') ?? '';
+}
+
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const cspNonce = await nonce();
   return (
     <html lang="en" dir="ltr" suppressHydrationWarning>
       <head>
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
         <link href={INTER_FONT} rel="stylesheet" />
-        <script dangerouslySetInnerHTML={{ __html: INIT_SCRIPT }} />
+        <script nonce={cspNonce} dangerouslySetInnerHTML={{ __html: INIT_SCRIPT }} />
       </head>
       <body className="font-sans">
         <Providers>{children}</Providers>

@@ -7,7 +7,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { format } from 'date-fns';
 import { useSelectedStore, STORES_KEY } from '@/hooks/useStores';
 import { useHealth } from '@/hooks/useMetrics';
-import { api, API_BASE_URL, ApiError } from '@/lib/api';
+import { api, API_BASE_URL } from '@/lib/api';
 import { PageHeader } from '@/components/dashboard/PageHeader';
 import { Card } from '@/components/ui/Card';
 import { Input } from '@/components/ui/Input';
@@ -39,27 +39,7 @@ export default function SettingsPage() {
   });
 
   const disconnect = useMutation({
-    mutationFn: async (store: Store) => {
-      const res = await fetch(`${API_BASE_URL}/api/stores/${store.id}`, {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(process.env.NEXT_PUBLIC_ADMIN_API_KEY
-            ? { 'X-Api-Key': process.env.NEXT_PUBLIC_ADMIN_API_KEY }
-            : {}),
-        },
-      });
-      if (!res.ok) {
-        let payload: unknown = null;
-        try {
-          payload = await res.json();
-        } catch {
-          /* ignore */
-        }
-        throw new ApiError(res.status, payload);
-      }
-      return res.json();
-    },
+    mutationFn: (store: Store) => api.deleteStore(store.id),
     onSuccess: (_data, store) => {
       queryClient.setQueryData<Store[]>(STORES_KEY, (old) => old?.filter((s) => s.id !== store.id) ?? []);
       if (storeId === store.id) setActiveStoreId(null);
