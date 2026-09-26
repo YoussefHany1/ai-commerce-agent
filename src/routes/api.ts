@@ -24,7 +24,11 @@ export async function api(app: FastifyInstance) {
   app.get('/api/health', async (_req, reply) => {
     const [dbOk, redisOk, rlsOk] = await Promise.all([dbPing(), redisPing(), rlsPing()]);
     const deps = { db: dbOk, redis: redisOk, rls: rlsOk };
-    if (!dbOk || !redisOk) {
+    // A degraded RLS layer is a 503, not a footnote in the body. Reporting it
+    // alongside a 200 status is what let an owner connection that ignored every
+    // tenant policy look healthy; Dockerfile's HEALTHCHECK keys off this status,
+    // so failing here takes the container out of rotation instead.
+    if (!dbOk || !redisOk || !rlsOk) {
       return reply.code(503).send({ status: 'error', ...deps, time: new Date().toISOString() });
     }
     return {

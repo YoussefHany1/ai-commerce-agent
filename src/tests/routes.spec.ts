@@ -270,6 +270,20 @@ describe('routes: health', () => {
     expect(res.statusCode).toBe(503);
     expect(res.json()).toMatchObject({ status: 'error', db: false });
   });
+
+  it('fails closed with 503 when RLS is not actually enforced', async () => {
+    // An owner or superuser connection passes the old catalog check while
+    // ignoring every tenant policy, so reporting 200 here is what let a
+    // cross-tenant read look healthy. Dockerfile's HEALTHCHECK keys off this
+    // status, so it has to fail.
+    services.health.dbPing.mockResolvedValue(true);
+    services.health.redisPing.mockResolvedValue(true);
+    services.health.rlsPing.mockResolvedValue(false);
+    const res = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(res.statusCode).toBe(503);
+    // The 503 body spreads deps flat, unlike the 200 body which nests it.
+    expect(res.json()).toMatchObject({ status: 'error', db: true, redis: true, rls: false });
+  });
 });
 
 describe('routes: admin key auth', () => {

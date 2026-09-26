@@ -7,6 +7,13 @@ const admin = postgres(process.env.PGADMIN_URL?.trim() || 'postgres://postgres:p
   onnotice: () => {},
 });
 
+// 0007_force_rls subjects the table owner to RLS, so DML run over PGADMIN_URL
+// only takes effect if the tenant_operator_* policies are satisfied. Harmless
+// when PGADMIN_URL is a superuser (which bypasses RLS regardless) and required
+// when it is a non-superuser owner - without this the updates below would
+// silently match zero rows, the same failure mode as commit ac0a2de.
+await admin`select set_config('app.operator', 'true', false)`;
+
 const target = config.encryption.version;
 if (!config.encryption.keys[target]) {
   throw new Error(`no encryption key registered for active version ${target}`);

@@ -89,6 +89,15 @@ export function loadConfig(raw: NodeJS.ProcessEnv = process.env) {
   if (isProd && !raw.ENCRYPTION_KEY) {
     throw new Error('ENCRYPTION_KEY is required in production');
   }
+  // The default is a superuser connection, which is both the table owner and a
+  // BYPASSRLS role, so it ignores every tenant policy while looking perfectly
+  // healthy. Failing at boot is the only place this can still be caught.
+  if (isProd && !raw.DATABASE_URL?.trim()) {
+    throw new Error(
+      'DATABASE_URL is required in production — point it at the RLS-restricted runtime role, not the ' +
+        'owner/superuser connection (see the DATABASE_URL and PGADMIN_URL notes in DEPLOYMENT.md)',
+    );
+  }
   assertKeyShape(keys);
   if (isProd && !parsed.ADMIN_API_KEY) {
     throw new Error('ADMIN_API_KEY is required in production — set a key of at least 32 characters');

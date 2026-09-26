@@ -1,4 +1,4 @@
-import { test, expect, describe, vi } from 'vitest';
+import { test, expect, describe, vi, beforeAll } from 'vitest';
 import { loadConfig } from './config.js';
 
 vi.mock('../integrations/shopify.js', () => ({
@@ -66,6 +66,48 @@ describe('config', () => {
     expect(() =>
       loadConfig({ ...base(), ENCRYPTION_KEY: '', NODE_ENV: 'production', ADMIN_API_KEY: 'k'.repeat(32) }),
     ).toThrow(/ENCRYPTION_KEY is required in production/);
+  });
+
+  describe('production DATABASE_URL', () => {
+    // Satisfies the other three production gates so each case below fails (or
+    // passes) on DATABASE_URL alone.
+    let OPERATOR_HASH = '';
+    beforeAll(async () => {
+      const { hashOperatorPassword } = await import('./lib/passwordHash.js');
+      OPERATOR_HASH = await hashOperatorPassword('correct horse battery staple');
+    });
+
+    const prod = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+      ...base(),
+      NODE_ENV: 'production',
+      ADMIN_API_KEY: 'k'.repeat(32),
+      OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
+      TRUST_PROXY: '1',
+      ...over,
+    });
+
+    // The default is a superuser, which owns the tables and so ignores every
+    // tenant policy while still passing a naive health check.
+    test('refuses to boot on the default superuser connection', () => {
+      expect(() => loadConfig(prod({ DATABASE_URL: '' }))).toThrow(
+        /DATABASE_URL is required in production/,
+      );
+    });
+
+    test('refuses to boot when DATABASE_URL is unset entirely', () => {
+      expect(() => loadConfig(prod({ DATABASE_URL: undefined }))).toThrow(
+        /DATABASE_URL is required in production/,
+      );
+    });
+
+    test('accepts an explicitly configured runtime role', () => {
+      const cfg = loadConfig(prod({ DATABASE_URL: 'postgres://agent_app:pw@db:5432/app' }));
+      expect(cfg.DATABASE_URL).toBe('postgres://agent_app:pw@db:5432/app');
+    });
+
+    test('stays optional outside production so local compose and CI are unaffected', () => {
+      expect(loadConfig(base()).DATABASE_URL).toBeTruthy();
+    });
   });
 });
 
