@@ -72,10 +72,7 @@ services:
       - key: PGADMIN_URL
         sync: false # postgres://agent_owner:...@host/db?sslmode=require
       - key: REDIS_URL
-        fromService:
-          type: redis
-          name: agent-redis
-          property: connectionString
+        sync: false
       - key: ADMIN_API_KEY
         generateValue: true
       - key: OPERATOR_PASSWORD_HASH
@@ -129,10 +126,7 @@ services:
       # Referenced through RENDER_EXTERNAL_URL because `property: host` is a bare
       # private-network hostname - a browser cannot navigate to it.
       - key: NEXT_PUBLIC_API_URL
-        fromService:
-          type: web
-          name: agent-api
-          envVarKey: RENDER_EXTERNAL_URL
+        sync: false
       # Server-side proxy target. Use the private-network origin so proxied calls
       # skip the public edge and never carry the admin key over the internet:
       #     http://agent-api:10000
@@ -141,15 +135,9 @@ services:
       - key: API_URL
         sync: false
       - key: ADMIN_API_KEY
-        fromService:
-          type: web
-          name: agent-api
-          envVarKey: ADMIN_API_KEY
+        sync: false
       - key: SESSION_SECRET
         generateValue: true
       # Must be the same Redis the API uses, or a revoked session keeps working.
       - key: REDIS_URL
-        fromService:
-          type: redis
-          name: agent-redis
-          property: connectionString
+        sync: false
