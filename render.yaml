@@ -40,8 +40,8 @@ services:
 
   - type: web
     name: agent-api
-    runtime: docker
-    dockerfile: ./Dockerfile
+    env: docker
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
     region: oregon
@@ -120,8 +120,8 @@ services:
 
   - type: web
     name: agent-web
-    runtime: docker
-    dockerfile: ./web/Dockerfile
+    env: docker
+    dockerfilePath: ./web/Dockerfile
     dockerContext: .
     plan: free
     region: oregon
