@@ -42,6 +42,9 @@ export function LoginForm() {
       if (res.ok) {
         // Only same-origin paths, so `next` cannot become an open redirect.
         const target = next && next.startsWith('/') && !next.startsWith('//') ? next : '/dashboard';
+        // Small delay to ensure the browser has stored the session cookie
+        // from the login response before the next request fires.
+        await new Promise((resolve) => setTimeout(resolve, 100));
         router.replace(target);
         router.refresh();
         return;
