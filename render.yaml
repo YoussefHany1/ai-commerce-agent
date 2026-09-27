@@ -40,7 +40,7 @@ services:
 
   - type: web
     name: agent-api
-    env: docker
+    runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
@@ -120,7 +120,7 @@ services:
 
   - type: web
     name: agent-web
-    env: docker
+    runtime: docker
     dockerfilePath: ./web/Dockerfile
     dockerContext: .
     plan: free
