@@ -51,7 +51,7 @@ services:
     # Migrations and RLS run here, in the same image as the service, immediately
     # before the new version starts serving. `tsx` is a runtime dependency
     # precisely so this works in the production image.
-    preDeployCommand: npm run db:bootstrap
+    # preDeployCommand: npm run db:bootstrap
     envVars:
       - key: NODE_ENV
         value: production
