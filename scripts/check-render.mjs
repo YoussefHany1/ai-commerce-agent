@@ -224,6 +224,24 @@ for (const service of services) {
         problems.push(
           `${label} pulls env var '${ref.envVarKey}' from an unfilled (sync: false) placeholder`,
         );
+      } else if (source.generateValue) {
+        // A `generateValue: true` source is re-rolled every time the Blueprint is
+        // applied, but a `fromService` copy only refreshes when the *consuming*
+        // service is redeployed. Nothing ties the two together, so re-applying the
+        // Blueprint can leave the consumer holding the previous value with no error
+        // reported anywhere.
+        //
+        // ADMIN_API_KEY hit exactly this and is worth spelling out: the BFF attaches
+        // the key to every proxied call and the API validates it, so a stale copy
+        // makes every operator-guarded route 401. The dashboard reads any 401 as an
+        // expired session and bounces the operator back to /login in a loop, even
+        // though the password was right and the session cookie was never the problem.
+        problems.push(
+          `${label} copies '${ref.envVarKey}' from ${ref.name}, which uses generateValue; ` +
+            'Render re-rolls that on every Blueprint apply but refreshes this copy only when ' +
+            `${label.split(' ')[0]} is redeployed, so the two can silently drift. Set ` +
+            '`sync: false` on both sides and give them the same literal value',
+        );
       } else if (URL_VARS.has(entry.key) && ref.envVarKey !== 'RENDER_EXTERNAL_URL') {
         problems.push(
           `${label} copies '${ref.envVarKey}' from ${ref.name}; a URL must come from ` +
@@ -245,6 +263,23 @@ if (web) {
   if ((web.envVars ?? []).every((e) => e.key !== 'SESSION_SECRET')) {
     problems.push('agent-web: SESSION_SECRET is required; without it every request is unauthenticated');
   }
+  // The proxy attaches this server-side on every upstream call, so a missing value
+  // fails each request inside requireApiKey() rather than at boot.
+  if ((web.envVars ?? []).every((e) => e.key !== 'ADMIN_API_KEY')) {
+    problems.push(
+      'agent-web: ADMIN_API_KEY is required; the proxy attaches it to every upstream call, ' +
+        'so without it every data request fails',
+    );
+  }
+}
+
+// The other end of that same credential: the API validates the key the BFF sends.
+const api = services.find((s) => s.name === 'agent-api');
+if (api && (api.envVars ?? []).every((e) => e.key !== 'ADMIN_API_KEY')) {
+  problems.push(
+    'agent-api: ADMIN_API_KEY is required; src/lib/auth.ts answers 503 auth_not_configured ' +
+      'without it, so every operator-guarded route fails',
+  );
 }
 
 if (problems.length > 0) {

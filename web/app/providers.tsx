@@ -6,7 +6,7 @@ import { Toaster } from 'sonner';
 import { ThemeProvider } from '@/lib/theme';
 import { LocaleProvider } from '@/lib/locale';
 import { StoreProvider } from '@/lib/store-context';
-import { isPaymentRequired, isUnauthorized } from '@/lib/api';
+import { isPaymentRequired, isSessionExpired, isUnauthorized } from '@/lib/api';
 
 /**
  * Sends the operator to /login when the session cookie is gone or expired.
@@ -15,6 +15,11 @@ import { isPaymentRequired, isUnauthorized } from '@/lib/api';
  * and renders "Couldn't load metrics" for a reason that has nothing to do with
  * metrics. A 401 is not retryable either, so without this the default `retry: 2`
  * would burn three attempts per query before surfacing anything.
+ *
+ * Keyed on `isSessionExpired`, not on the status code: a 401 relayed from the API
+ * means the server rejected the request, not that the operator signed out, and
+ * bouncing those to /login just loops the operator through a password prompt that
+ * cannot possibly fix it.
  */
 function redirectToLogin(): void {
   if (typeof window === 'undefined') return;
@@ -30,7 +35,7 @@ export function Providers({ children }: { children: ReactNode }) {
       new QueryClient({
         queryCache: new QueryCache({
           onError: (error) => {
-            if (isUnauthorized(error)) redirectToLogin();
+            if (isSessionExpired(error)) redirectToLogin();
           },
         }),
         defaultOptions: {
@@ -39,9 +44,11 @@ export function Providers({ children }: { children: ReactNode }) {
             gcTime: 5 * 60_000,
             refetchOnWindowFocus: false,
             retry: (failureCount, error) => {
-              // Neither is worth retrying: a 401 needs a new login and a 402
-              // needs a payment. Retrying only delays the message the operator
-              // needs to see.
+              // Neither is worth retrying: a 401 is a rejected credential and a
+              // 402 needs a payment. Retrying only delays the message the
+              // operator needs to see. This stays on the broad `isUnauthorized`
+              // rather than `isSessionExpired` — a request the server refused is
+              // not retryable whichever kind of 401 it was.
               if (isUnauthorized(error) || isPaymentRequired(error)) return false;
               return failureCount < 2;
             },

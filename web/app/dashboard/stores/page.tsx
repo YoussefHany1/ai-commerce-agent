@@ -15,7 +15,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { useSelectedStore, useCreateStore, STORES_KEY } from '@/hooks/useStores';
-import { API_BASE_URL, api, ApiError } from '@/lib/api';
+import { API_BASE_URL, api, isSessionExpired } from '@/lib/api';
 import type { Store } from '@/lib/types';
 
 const PLATFORM_OPTIONS = [
@@ -162,7 +162,7 @@ export default function StoresPage() {
 
       {isError && (
         <p className="mt-4 text-sm text-red-500">
-          {error instanceof ApiError && error.status === 401
+          {isSessionExpired(error)
             ? 'Your session has expired. Please sign in again.'
             : 'Couldn’t load stores. Check that the API is running.'}
         </p>

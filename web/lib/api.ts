@@ -247,7 +247,21 @@ export function isPaymentRequired(err: unknown): boolean {
   return err instanceof ApiError && err.status === 402;
 }
 
-/** True when the failure means the operator session is gone or expired. */
+/** True when the failure is any 401, from this proxy or a relayed upstream one. */
 export function isUnauthorized(err: unknown): boolean {
   return err instanceof ApiError && err.status === 401;
+}
+
+/**
+ * True only when the operator session itself is gone or expired.
+ *
+ * Narrower than {@link isUnauthorized} on purpose. A 401 can also arrive
+ * *relayed* from the API — a store credential rejection, or an admin key that no
+ * longer matches between the two services — and none of those are fixed by
+ * signing in again. Only the proxy's own `session_expired` code means the cookie
+ * is dead, so only that may redirect to /login; treating every 401 as an expired
+ * session turned a backend misconfiguration into an endless sign-in loop.
+ */
+export function isSessionExpired(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 401 && err.code === 'session_expired';
 }

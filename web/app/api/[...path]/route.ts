@@ -84,7 +84,12 @@ async function handler(request: Request, ctx: { params: Promise<{ path?: string[
   const session = await verifySession(token);
   if (!session.ok) {
     if (session.reason === 'unavailable') return json({ error: 'auth_unavailable' }, 503);
-    return json({ error: 'unauthorized' }, 401);
+    // `session_expired`, not `unauthorized`: the upstream's own key rejection uses
+    // the same `unauthorized` body (src/lib/auth.ts), and a relayed upstream 401
+    // would otherwise be indistinguishable from a dead session. The client reads
+    // this code to decide whether to send the operator back to /login, so a
+    // misconfigured proxy surfaces as a server error instead of a login loop.
+    return json({ error: 'session_expired' }, 401);
   }
 
   const { path } = await ctx.params;
