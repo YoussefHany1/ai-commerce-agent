@@ -156,16 +156,3 @@ services:
           type: redis
           name: agent-redis
           property: connectionString
-    # No SESSION_SECRET build arg on purpose. Next inlines process.env references from
-    # Edge code at build time, so a build arg here would bake in a *second*, different
-    # key from the runtime one and lock every operator out. The Edge middleware is
-    # therefore structural-only and reads no secret; the Node proxy verifies the HMAC.
-    buildArgs:
-      # The public API origin is inlined into the client bundle at build time and is
-      # the one value that must exist before the image is built. Same value as the
-      # runtime var above; if the API's hostname changes, both must be redeployed.
-      - key: NEXT_PUBLIC_API_URL
-        fromService:
-          type: web
-          name: agent-api
-          envVarKey: RENDER_EXTERNAL_URL
