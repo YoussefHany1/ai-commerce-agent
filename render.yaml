@@ -92,10 +92,7 @@ services:
       # property is the private-network hostname with no scheme, which is why this
       # uses the documented self-reference to RENDER_EXTERNAL_URL instead.
       - key: APP_BASE_URL
-        fromService:
-          type: web
-          name: agent-api
-          envVarKey: RENDER_EXTERNAL_URL
+        sync: false
       - key: OAUTH_REDIRECT_ALLOWLIST
         sync: false # e.g. https://agent-web.onrender.com
       - key: LOG_LEVEL
