@@ -14,6 +14,7 @@ import { pdpl as pdplRoutes } from './routes/pdpl.js';
 import { favicon } from './routes/favicon.js';
 import { operatorAuth } from './routes/operatorAuth.js';
 import { startCatalogSync } from './workers/catalogSync.js';
+import { startOrderSync } from './workers/orderSync.js';
 import { startMetricsRollup } from './workers/metricsRollup.js';
 import { startJobsWorker } from './workers/jobs.js';
 import { startAutomationWorker } from './workers/automation.js';
@@ -72,7 +73,14 @@ app.log.info(`listening on port ${config.PORT}`);
 // one replica runs a given worker at a time. Set WORKERS_ENABLED=false to run a
 // web-only replica that serves traffic without scheduling background work.
 const workers = config.workersEnabled
-  ? [startCatalogSync(), startMetricsRollup(), startJobsWorker(), startAutomationWorker(), startRetentionWorker()]
+  ? [
+      startCatalogSync(),
+      startOrderSync(),
+      startMetricsRollup(),
+      startJobsWorker(),
+      startAutomationWorker(),
+      startRetentionWorker(),
+    ]
   : [];
 if (!config.workersEnabled) {
   app.log.warn('background workers disabled via WORKERS_ENABLED — this replica serves traffic only');

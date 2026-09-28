@@ -5,7 +5,8 @@ import { config } from '../config.js';
 import { getRedis } from '../lib/redis.js';
 import { storeRateLimitWindow, reqIp } from '../lib/rateLimit.js';
 import { fetchWithTimeout } from '../lib/http.js';
-import { storeRepo, connectionRepo } from '../db/repos.js';
+import { storeRepo, connectionRepo, jobsRepo } from '../db/repos.js';
+import { logger } from '../lib/logger.js';
 
 const STATE_TTL = 600;
 const oauthWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -68,7 +69,7 @@ function verifyShopifyHmac(url: string, secret: string): boolean {
 
 type OAuthState = { platform: string; ref?: string; redirectAfter?: string | null };
 
-async function saveInstall(input: {
+type SaveInstallInput = {
   platform: 'shopify' | 'salla' | 'zid';
   name: string;
   shopDomain?: string | null;
@@ -77,7 +78,9 @@ async function saveInstall(input: {
   expiresAt?: Date;
   scopes?: string[];
   metadata?: Record<string, unknown>;
-}): Promise<string> {
+};
+
+export async function saveInstall(input: SaveInstallInput): Promise<string> {
   const existing = input.shopDomain ? await storeRepo.byRef(input.shopDomain, input.platform) : null;
   let storeId: string;
   if (existing) {
@@ -100,7 +103,99 @@ async function saveInstall(input: {
     });
   }
   if (input.metadata) await storeRepo.updateSettings(storeId, input.metadata);
+
+  // Re-installing gets a fresh access token, so the webhooks have to be
+  // (re-)registered against it. Best-effort: a failure here must not fail the
+  // install, because order.sync backfill still populates metrics on its own.
+  if (input.platform === 'shopify' && input.shopDomain) {
+    try {
+      await registerShopifyWebhooks(input.shopDomain, input.accessToken);
+    } catch (err) {
+      logger.warn(
+        { err, shop: input.shopDomain },
+        'shopify: webhook registration failed at install — orders will backfill but not update live',
+      );
+    }
+  }
+
+  // Kick an order backfill straight away so a newly connected store shows revenue
+  // without waiting for the 15-minute orderSync tick.
+  try {
+    await jobsRepo.enqueue(storeId, 'order.sync', {}, { runAt: new Date() });
+  } catch (err) {
+    logger.warn({ err, storeId }, 'order.sync enqueue at install failed');
+  }
+
   return storeId;
+}
+
+/**
+ * Subscribes the app to the topics the analytics pipeline needs. Without this the
+ * app receives no webhooks at all: nothing in the codebase registered them, so a
+ * store installed purely through OAuth never delivered an orders/create event and
+ * revenue stayed at zero forever.
+ *
+ * Re-running this is safe: Shopify rejects a duplicate (topic, uri) pair with a
+ * userError, which is counted as already-registered rather than as a failure.
+ */
+const SHOPIFY_WEBHOOK_TOPICS = [
+  'ORDERS_CREATE',
+  'ORDERS_UPDATED',
+  'ORDERS_CANCELLED',
+  'PRODUCTS_CREATE',
+  'PRODUCTS_UPDATE',
+  'APP_UNINSTALLED',
+] as const;
+
+const WEBHOOK_CREATE_MUTATION = `mutation($topic:WebhookSubscriptionTopic!,$sub:WebhookSubscriptionInput!){
+  webhookSubscriptionCreate(topic:$topic,webhookSubscription:$sub){
+    userErrors{field message}
+    webhookSubscription{id topic}
+  }
+}`;
+
+/** Shopify reports a duplicate subscription through userErrors rather than an error. */
+function isDuplicateSubscriptionError(messages: string[]): boolean {
+  return messages.some((m) => /already|exist|duplicate/i.test(m));
+}
+
+export async function registerShopifyWebhooks(shop: string, accessToken: string): Promise<number> {
+  const apiVersion = config.SHOPIFY_API_VERSION;
+  const uri = `${config.APP_BASE_URL}/webhooks/shopify`;
+  let registered = 0;
+  for (const topic of SHOPIFY_WEBHOOK_TOPICS) {
+    const r = await fetchWithTimeout(
+      `https://${shop}/admin/api/${apiVersion}/graphql.json`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': accessToken,
+        },
+        body: JSON.stringify({
+          query: WEBHOOK_CREATE_MUTATION,
+          // `uri` is the current field on WebhookSubscriptionInput; `callbackUrl` is
+          // deprecated. `format` is JSON so the handler can parse the body directly.
+          variables: { topic, sub: { uri, format: 'JSON' } },
+        }),
+      },
+    );
+    if (!r.ok) throw new Error(`Shopify webhook registration ${r.status}`);
+    const j = (await r.json()) as {
+      data?: { webhookSubscriptionCreate?: { userErrors?: Array<{ field?: string[]; message: string }> } };
+      errors?: unknown;
+    };
+    if (j.errors) throw new Error(`Shopify webhook registration failed: ${JSON.stringify(j.errors)}`);
+    const userErrors = j.data?.webhookSubscriptionCreate?.userErrors ?? [];
+    if (userErrors.length) {
+      const messages = userErrors.map((e) => e.message);
+      if (!isDuplicateSubscriptionError(messages)) {
+        throw new Error(`Shopify webhook ${topic}: ${messages.join('; ')}`);
+      }
+    }
+    registered++;
+  }
+  return registered;
 }
 
 function parseExpiry(payload: { expires_in?: number; expires?: string | number }): Date | undefined {

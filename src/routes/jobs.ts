@@ -10,7 +10,7 @@ const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
 const storeIdRef = (req: any) =>
   ((req as any).params as { storeId?: string })?.storeId ?? ((req as any).body as { storeId?: string })?.storeId;
 
-const TYPES = ['catalog.sync', 'embedding.backfill', 'metrics.rollup', 'retention.purge'] as const;
+const TYPES = ['catalog.sync', 'order.sync', 'embedding.backfill', 'metrics.rollup', 'retention.purge'] as const;
 
 export async function jobs(app: FastifyInstance) {
   app.post(

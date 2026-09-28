@@ -187,11 +187,16 @@ order by converted_at`,
 export async function rollupDailyMetrics(storeId: string, days: number): Promise<DailyMetricRow[]> {
   const { from, to } = window(days);
   return withTenant(storeId, async (tx) => {
-    const dayCol = sql<string>`(date_trunc('day', "createdAt")::date)::text`;
+    const orderDayCol = sql<string>`coalesce(placed_at, "createdAt")`;
+    const dayCol = sql<string>`(date_trunc('day', ${orderDayCol})::date)::text`;
     const fromIso = from.toISOString();
     const toIso = to.toISOString();
+    // Bucket on placed_at, not createdAt. A backfilled order is written long after
+    // it happened, so createdAt would pile all of a store's history onto the day
+    // the backfill ran. The window filter must use the same expression, or orders
+    // backfilled for older days would be counted into whichever day they landed.
     const o = await tx.execute(
-      sql`select ${dayCol} as day, count(*)::int as orders, coalesce(sum(total), 0) as revenue from orders where store_id = ${storeId} and "createdAt" >= ${fromIso} and "createdAt" < ${toIso} group by 1`,
+      sql`select ${dayCol} as day, count(*)::int as orders, coalesce(sum(total), 0) as revenue from orders where store_id = ${storeId} and coalesce(placed_at, "createdAt") >= ${fromIso} and coalesce(placed_at, "createdAt") < ${toIso} group by 1`,
     );
     const c = await tx.execute(
       sql`select ${dayCol} as day, count(*)::int as conversations from conversations where store_id = ${storeId} and "createdAt" >= ${fromIso} and "createdAt" < ${toIso} group by 1`,

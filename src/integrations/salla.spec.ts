@@ -44,14 +44,13 @@ describe('salla mapping', () => {
     const o = mapSallaOrder({
       id: 9001,
       status: { name: 'مكتمل', slug: 'completed' },
-      payment_method: { name: 'مدى' },
-      amounts: { total: { amount: '250', currency: 'SAR' } },
-      currency: 'SAR',
+      payment_method: 'mada',
+      total: { amount: '250', currency: 'SAR' },
       customer: { first_name: 'محمد', last_name: 'العتيبي', mobile: '0501234567', email: 'm@example.com' },
     });
     expect(o.id).toBe('9001');
     expect(o.status).toBe('مكتمل');
-    expect(o.paymentStatus).toBe('مدى');
+    expect(o.paymentStatus).toBe('mada');
     expect(o.total).toBe(250);
     expect(o.currency).toBe('SAR');
     expect(o.customer?.name).toBe('محمد العتيبي');

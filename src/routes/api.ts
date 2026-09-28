@@ -6,6 +6,7 @@ import {
   catalogRepo,
   conversationRepo,
   storeToPublic,
+  jobsRepo,
 } from '../db/repos.js';
 import { getCommerceAdapter } from '../integrations/factory.js';
 import { answerWithTools, toChatHistory } from '../services/agent.js';
@@ -62,6 +63,17 @@ export async function api(app: FastifyInstance) {
       })
       .parse(req.body);
     const id = await storeRepo.create(body);
+
+    // Manually added stores never went through saveInstall, so they miss the
+    // install-time kick. Enqueue the order backfill here too, otherwise a store
+    // added from the dashboard sits on zero revenue until the next 15-minute
+    // orderSync tick notices its null cursor.
+    try {
+      await jobsRepo.enqueue(id, 'order.sync', {}, { runAt: new Date() });
+    } catch (err) {
+      app.log.warn({ err, storeId: id }, 'order.sync enqueue failed for new store');
+    }
+
     return { id };
   });
 

@@ -1,7 +1,13 @@
 import type { CommerceAdapter, Product, Order } from '../types.js';
 import { fetchWithTimeout } from '../lib/http.js';
+import { parsePlatformDate, toPlatformDateParam } from '../lib/platformDate.js';
 
 const DEFAULT_BASE_URL = 'https://api.salla.sa/admin/v2';
+
+/** Ceiling on order pages per sync, so a store with a huge history cannot spin. */
+const MAX_ORDER_PAGES = 200;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 type SallaApiResponse<T> = {
   status: number;
@@ -9,9 +15,12 @@ type SallaApiResponse<T> = {
   data: T | null;
   message?: string;
   pagination?: {
-    currentPage: number;
-    totalPages: number;
-    totalItems: number;
+    count?: number;
+    total?: number;
+    perPage?: number;
+    currentPage?: number;
+    totalPages?: number;
+    links?: { next?: string | null };
   };
 };
 
@@ -28,18 +37,32 @@ type SallaRawProduct = {
   url?: string;
 };
 
+/**
+ * `ListOrders` as documented at https://docs.salla.dev/api-5394146. The placement
+ * date lives under `date` (a `{date, timezone}` object) and the total under
+ * `total`; an order-level `created_at` and an `amounts` wrapper appear in older
+ * hand-written fixtures but not in the API, and reading them alone left every
+ * imported Salla order valued at zero.
+ */
 type SallaRawOrder = {
   id: number;
-  status?: { name?: string; slug?: string };
-  payment_method?: { id?: number; name?: string };
-  currency?: string;
-  amounts?: {
-    total?: { amount: string | number; currency?: string };
+  date?: { date?: string; timezone?: string; timezone_type?: number };
+  created_at?: string;
+  status?: {
+    id?: number;
+    name?: string;
+    slug?: string;
+    customized?: { id?: number; name?: string } | null;
   };
+  payment_method?: string;
+  payment_methods?: { payment_method?: string; amount?: string | number }[];
+  total?: { amount?: string | number; currency?: string };
   customer?: {
+    id?: number;
+    full_name?: string;
     first_name?: string;
     last_name?: string;
-    mobile?: string;
+    mobile?: string | number;
     email?: string;
   };
 };
@@ -62,17 +85,29 @@ export function mapSallaProduct(p: SallaRawProduct): Product {
 }
 
 export function mapSallaOrder(o: SallaRawOrder): Order {
+  const placedAt =
+    parsePlatformDate(o.date?.date, o.date?.timezone) ?? parsePlatformDate(o.created_at);
+
+  // `total.amount` is a string on the wire ("16.39"); Number() of a non-numeric
+  // string is NaN, and a NaN total silently poisons every revenue rollup it
+  // reaches, so it is resolved to 0 instead.
+  const total = Number(o.total?.amount ?? 0);
+
   return {
     id: String(o.id),
-    status: o.status?.name ?? o.status?.slug ?? 'unknown',
-    paymentStatus: o.payment_method?.name,
-    total: Number(o.amounts?.total?.amount ?? 0),
-    currency: o.amounts?.total?.currency ?? o.currency ?? 'SAR',
+    status: o.status?.name ?? o.status?.slug ?? o.status?.customized?.name ?? 'unknown',
+    paymentStatus: o.payment_method ?? o.payment_methods?.[0]?.payment_method,
+    total: Number.isFinite(total) ? total : 0,
+    currency: o.total?.currency ?? 'SAR',
     customer: {
-      name: [o.customer?.first_name, o.customer?.last_name].filter(Boolean).join(' ') || undefined,
-      phone: o.customer?.mobile,
+      name:
+        o.customer?.full_name ||
+        [o.customer?.first_name, o.customer?.last_name].filter(Boolean).join(' ') ||
+        undefined,
+      phone: o.customer?.mobile == null ? undefined : String(o.customer.mobile),
       email: o.customer?.email,
     },
+    placedAt,
   };
 }
 
@@ -138,5 +173,47 @@ export class SallaAdapter implements CommerceAdapter {
     const d = await this.api<SallaRawOrder>(`/orders/${encodeURIComponent(id)}`);
     if (!d?.id) return null;
     return mapSallaOrder(d);
+  }
+
+  /**
+   * Salla's orders collection supports server-side `from_date` / `to_date`
+   * filters (https://docs.salla.dev/api-5394146), and those are what bound the
+   * scan here. Both are calendar dates, so `since` is widened by a day and the
+   * exact timestamp boundary is re-applied client-side below.
+   *
+   * The collection's default sort is not documented, so paging deliberately does
+   * not assume newest-first: the scan runs to the end of the filtered window and
+   * stops only on a short page. Guessing the order wrong loses history silently
+   * — on an oldest-first collection, "stop once past `since`" exits after page 1
+   * and imports nothing.
+   */
+  async listOrders(opts: { since?: Date; until?: Date; limit?: number } = {}): Promise<Order[]> {
+    // Salla documents `per_page=30` as the maximum page size for orders. Asking
+    // for more yields a short page, which a size-agnostic loop reads as the end
+    // of the collection and silently caps a backfill at 30 orders.
+    const PER_PAGE = 30;
+    const limit = Math.max(1, opts.limit ?? PER_PAGE * MAX_ORDER_PAGES);
+    const params: Record<string, string | number> = { per_page: PER_PAGE };
+    if (opts.since) params.from_date = toPlatformDateParam(new Date(opts.since.getTime() - DAY_MS));
+    if (opts.until) params.to_date = toPlatformDateParam(opts.until);
+
+    const all: Order[] = [];
+    for (let page = 1; all.length < limit; page++) {
+      const d = await this.api<{ orders?: SallaRawOrder[] } | SallaRawOrder[]>(`/orders`, {
+        ...params,
+        page,
+      });
+      const items = Array.isArray(d) ? (d as SallaRawOrder[]) : (d as { orders?: SallaRawOrder[] }).orders;
+      if (!items?.length) break;
+      for (const raw of items) {
+        const o = mapSallaOrder(raw);
+        if (o.placedAt && opts.since && o.placedAt < opts.since) continue;
+        if (o.placedAt && opts.until && o.placedAt >= opts.until) continue;
+        all.push(o);
+        if (all.length >= limit) break;
+      }
+      if (items.length < PER_PAGE) break;
+    }
+    return all;
   }
 }

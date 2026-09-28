@@ -4,4 +4,5 @@ export class MockAdapter implements CommerceAdapter {
   async listProducts(){return this.items}
   async searchProducts(q:string){const x=q.toLowerCase();return this.items.filter(p=>(p.title+' '+(p.description||'')).toLowerCase().includes(x)).slice(0,8)}
   async getOrder(_id: string):Promise<Order|null>{return null}
+  async listOrders(_opts?:{since?:Date;until?:Date;limit?:number}):Promise<Order[]>{return []}
 }

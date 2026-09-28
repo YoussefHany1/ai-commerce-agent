@@ -49,9 +49,15 @@ export const platformConnections = pgTable(
     expiresAt: timestamp('expires_at', { withTimezone: true }),
     scopes: jsonb('scopes').$type<string[]>(),
     lastSyncedAt: timestamp('last_synced_at', { withTimezone: true }),
+    // High-water mark for order backfill. Each order.sync run resumes from here
+    // instead of re-walking the store's whole order history every time.
+    ordersSyncedAt: timestamp('orders_synced_at', { withTimezone: true }),
     createdAt: ts(),
   },
-  (t) => [{ name: 'platform_connections_store_id_idx', columns: [t.storeId] }],
+  (t) => [
+    { name: 'platform_connections_store_id_idx', columns: [t.storeId] },
+    { name: 'platform_connections_orders_due_idx', columns: [t.ordersSyncedAt] },
+  ],
 );
 
 export const products = pgTable(
@@ -135,11 +141,17 @@ export const orders = pgTable(
     customerName: text('customer_name'),
     customerPhone: text('customer_phone'),
     customerEmail: text('customer_email'),
+    // When the order was placed on the platform, not when we ingested it. Backfilled
+    // orders arrive long after the fact, so the rollup buckets on this column to keep
+    // historical revenue on the day it actually happened. Null on webhook-only rows
+    // predating the column, where createdAt is the correct proxy.
+    placedAt: timestamp('placed_at', { withTimezone: true }),
     createdAt: ts(),
   },
   (t) => [
     uniqueIndex('orders_store_platform_uidx').on(t.storeId, t.platformOrderId),
     index('orders_store_id_idx').on(t.storeId),
+    index('orders_store_placed_at_idx').on(t.storeId, t.placedAt),
   ],
 );
 

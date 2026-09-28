@@ -1,6 +1,32 @@
 import { CommerceAdapter, Product, Order } from '../types.js';
 import { fetchWithTimeout, LONG_TIMEOUT_MS } from '../lib/http.js';
 
+/**
+ * Shared by getOrder and the listOrders backfill so both produce an identical
+ * Order shape. `currentTotalPriceSet.shopMoney` is authoritative and already
+ * carries the currency, so a separate currencyCode is not needed.
+ *
+ * Note the field is `currencyCode`: MoneyV2 exposes `amount` and `currencyCode`,
+ * and an unknown field makes the whole query fail to validate rather than
+ * returning a null.
+ */
+export function mapShopifyOrderNode(o: Record<string, any>): Order {
+  const placedAt = o.createdAt ? new Date(o.createdAt) : undefined;
+  return {
+    id: String(o.id),
+    status: o.displayFulfillmentStatus,
+    paymentStatus: o.displayFinancialStatus,
+    total: Number(o.currentTotalPriceSet?.shopMoney?.amount ?? 0),
+    currency: o.currentTotalPriceSet?.shopMoney?.currencyCode ?? 'SAR',
+    customer: {
+      name: o.customer?.displayName,
+      email: o.customer?.email,
+      phone: o.customer?.phone,
+    },
+    placedAt: placedAt && !Number.isNaN(placedAt.getTime()) ? placedAt : undefined,
+  };
+}
+
 export class ShopifyAdapter implements CommerceAdapter {
   platform = 'shopify' as const;
 
@@ -60,6 +86,40 @@ export class ShopifyAdapter implements CommerceAdapter {
     return all;
   }
 
+  /**
+   * Backfill window. Shopify's search syntax takes an inclusive `created_at:>=`
+   * bound and is passed as the `query:` argument (not `search:`), which is why
+   * this is a GraphQL variable rather than string-interpolated. `until` is
+   * filtered client-side because the search operator has no open upper bound we
+   * can rely on, and a half-open window is what the resume cursor assumes.
+   */
+  async listOrders(opts: { since?: Date; until?: Date; limit?: number } = {}): Promise<Order[]> {
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 50;
+    const limit = Math.max(1, Math.min(opts.limit ?? PAGE_SIZE * MAX_PAGES, PAGE_SIZE * MAX_PAGES));
+    const search = opts.since ? `created_at:>=${opts.since.toISOString()}` : null;
+    const all: Order[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < MAX_PAGES && all.length < limit; page++) {
+      const d = await this.gql(
+        `query($first:Int!,$after:String,$query:String){orders(first:$first,after:$after,sortKey:CREATED_AT,query:$query){pageInfo{hasNextPage endCursor}nodes{id createdAt displayFinancialStatus currentTotalPriceSet{shopMoney{amount currencyCode}} customer{displayName email phone} displayFulfillmentStatus}}}`,
+        {
+          first: Math.min(PAGE_SIZE, limit - all.length),
+          after: cursor,
+          query: search,
+        },
+      );
+      for (const o of d.orders.nodes as any[]) {
+        const placedAt = o.createdAt ? new Date(o.createdAt) : undefined;
+        if (placedAt && !Number.isNaN(placedAt.getTime()) && opts.until && placedAt >= opts.until) continue;
+        all.push(mapShopifyOrderNode(o));
+      }
+      if (!d.orders.pageInfo.hasNextPage) break;
+      cursor = d.orders.pageInfo.endCursor;
+    }
+    return all;
+  }
+
   async searchProducts(q: string): Promise<Product[]> {
     return (await this.listProducts())
       .filter(
@@ -72,22 +132,11 @@ export class ShopifyAdapter implements CommerceAdapter {
 
   async getOrder(id: string): Promise<Order | null> {
     const d = await this.gql(
-      `query($id:ID!){order(id:$id){id displayFinancialStatus currentTotalPriceSet{shopMoney{amount currency}} customer{displayName email phone} displayFulfillmentStatus}}`,
+      `query($id:ID!){order(id:$id){id createdAt displayFinancialStatus currentTotalPriceSet{shopMoney{amount currencyCode}} customer{displayName email phone} displayFulfillmentStatus}}`,
       { id },
     );
     const o = d.order;
     if (!o) return null;
-    return {
-      id: o.id,
-      status: o.displayFulfillmentStatus,
-      paymentStatus: o.displayFinancialStatus,
-      total: Number(o.currentTotalPriceSet.shopMoney.amount),
-      currency: o.currentTotalPriceSet.shopMoney.currency,
-      customer: {
-        name: o.customer?.displayName,
-        email: o.customer?.email,
-        phone: o.customer?.phone,
-      },
-    };
+    return mapShopifyOrderNode(o);
   }
 }

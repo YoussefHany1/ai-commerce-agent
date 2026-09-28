@@ -398,6 +398,7 @@ function mapOrderRow(r: {
   customerName: string | null;
   customerPhone: string | null;
   customerEmail: string | null;
+  placedAt: Date | null;
 }): Order {
   return {
     id: r.platformOrderId,
@@ -410,6 +411,7 @@ function mapOrderRow(r: {
       phone: r.customerPhone ?? undefined,
       email: r.customerEmail ?? undefined,
     },
+    placedAt: r.placedAt ?? undefined,
   };
 }
 
@@ -454,6 +456,7 @@ export const orderRepo = {
           customerName: o.customer?.name,
           customerPhone: o.customer?.phone,
           customerEmail: o.customer?.email,
+          placedAt: o.placedAt,
         })
         .onConflictDoUpdate({
           target: [orders.storeId, orders.platformOrderId],
@@ -465,6 +468,10 @@ export const orderRepo = {
             customerName: o.customer?.name,
             customerPhone: o.customer?.phone,
             customerEmail: o.customer?.email,
+            // A webhook that carried no timestamp must not blank a placed_at that an
+            // earlier backfill already recorded, or the rollup would move the order
+            // off its real day and back onto the ingestion date.
+            ...(o.placedAt ? { placedAt: o.placedAt } : {}),
           },
         });
     });
@@ -901,5 +908,52 @@ export const connectionRepo = {
         .where(or(isNull(platformConnections.lastSyncedAt), sql`${platformConnections.lastSyncedAt} < ${dueBefore.toISOString()}`)),
     );
     return conns;
+  },
+
+  /**
+   * Connections due for an order.sync tick. Like the catalog path this matches
+   * IS NULL, so a freshly installed store is picked up on the first tick and its
+   * whole order history backfills without any operator action.
+   */
+  async listOrdersDue(dueBefore: Date): Promise<{ storeId: string; platform: string }[]> {
+    return withOperator((tx) =>
+      tx
+        .select({ storeId: platformConnections.storeId, platform: platformConnections.platform })
+        .from(platformConnections)
+        .where(
+          or(
+            isNull(platformConnections.ordersSyncedAt),
+            sql`${platformConnections.ordersSyncedAt} < ${dueBefore.toISOString()}`,
+          ),
+        ),
+    );
+  },
+
+  async getOrdersCursor(storeId: string): Promise<Date | null> {
+    // Scoped to the one column on purpose: connectionRepo.get() would pull the
+    // encrypted access token into memory to read a nullable timestamp.
+    return withTenant(storeId, (tx) =>
+      tx
+        .select({ ordersSyncedAt: platformConnections.ordersSyncedAt })
+        .from(platformConnections)
+        .where(eq(platformConnections.storeId, storeId))
+        .limit(1)
+        .then((r) => r[0]?.ordersSyncedAt ?? null),
+    );
+  },
+
+  /**
+   * Stores the high-water mark for order.sync. Callers pass a cursor, not the wall
+   * clock: a truncated run passes the newest order it actually read, so the unread
+   * remainder stays reachable instead of being skipped. A complete run passes the
+   * wall clock, which is what lets an idle store stop being re-synced forever.
+   */
+  async markOrdersSynced(storeId: string, at: Date): Promise<void> {
+    await withTenant(storeId, async (tx) => {
+      await tx
+        .update(platformConnections)
+        .set({ ordersSyncedAt: at })
+        .where(eq(platformConnections.storeId, storeId));
+    });
   },
 };

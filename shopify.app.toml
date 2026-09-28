@@ -2,8 +2,8 @@
 
 client_id = "93e7dddd6e932630943e5870bed5107e"
 name = "ai-commerce-agent"
-# Set to the real production app URL. Do not commit local tunnel URLs.
-application_url = "https://YOUR-APP-DOMAIN.example.com"
+application_url = "https://agent-web-pi8k.onrender.com"
+
 embedded = true
 
 [build]
@@ -14,7 +14,9 @@ api_version = "2026-07"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_products,write_products,read_orders,read_inventory"
+scopes = "read_inventory,read_orders,read_products,write_products"
 
 [auth]
-redirect_urls = [ "https://YOUR-APP-DOMAIN.example.com/api/oauth/shopify/callback" ]
+redirect_urls = [
+  "https://agent-api-84tq.onrender.com/api/oauth/shopify/callback"
+]
