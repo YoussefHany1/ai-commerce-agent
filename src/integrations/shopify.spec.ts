@@ -194,3 +194,111 @@ describe('shopify listOrders backfill', () => {
     await expect(adapter.listOrders()).rejects.toThrow(/Access denied/);
   });
 });
+
+/**
+ * `orders.nodes.customer` is gated behind the `read_customers` access scope, and
+ * a token without it gets ACCESS_DENIED for the whole query rather than a null
+ * field. Left unhandled that kills every order sync, which is what left the
+ * dashboard at zero.
+ */
+const CUSTOMER_DENIED = [
+  {
+    message: 'Access denied for customer field. Required access: `read_customers` access scope.',
+    extensions: { code: 'ACCESS_DENIED', requiredAccess: '`read_customers` access scope.' },
+    path: ['orders', 'nodes', 0, 'customer'],
+  },
+];
+
+describe('shopify customer scope fallback', () => {
+  test('retries without the customer selection and still imports the orders', async () => {
+    const queries: string[] = [];
+    let call = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as { query: string };
+        queries.push(body.query);
+        call++;
+        if (body.query.includes('customer{')) {
+          return { ok: true, async json() { return { errors: CUSTOMER_DENIED }; } } as Response;
+        }
+        return {
+          ok: true,
+          async json() {
+            return {
+              data: {
+                orders: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [{ ...orderNode({ id: 'kept' }), customer: undefined }],
+                },
+              },
+            };
+          },
+        } as Response;
+      }),
+    );
+
+    const orders = await new ShopifyAdapter('demo.myshopify.com', 'tok').listOrders();
+    expect(orders.map((o) => o.id)).toEqual(['kept']);
+    // Revenue and the placement date survive; only the customer is lost.
+    expect(orders[0]?.total).toBe(199);
+    expect(orders[0]?.placedAt?.toISOString()).toBe('2026-03-04T10:00:00.000Z');
+    expect(orders[0]?.customer?.phone).toBeUndefined();
+    expect(queries).toHaveLength(2);
+    expect(queries[1]).not.toContain('customer{');
+  });
+
+  test('drops the field for the rest of the process once the scope is known missing', async () => {
+    const queries: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as { query: string };
+        queries.push(body.query);
+        if (body.query.includes('customer{')) {
+          return { ok: true, async json() { return { errors: CUSTOMER_DENIED }; } } as Response;
+        }
+        return {
+          ok: true,
+          async json() {
+            return { data: { orders: { pageInfo: { hasNextPage: false }, nodes: [] } } };
+          },
+        } as Response;
+      }),
+    );
+
+    const adapter = new ShopifyAdapter('demo.myshopify.com', 'tok');
+    await adapter.listOrders();
+    await adapter.listOrders();
+    // The second sync must not re-spend a failed request re-probing the scope.
+    expect(queries.filter((q) => q.includes('customer{'))).toHaveLength(1);
+  });
+
+  test('getOrder degrades the same way', async () => {
+    let call = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        call++;
+        if (call === 1) return { ok: true, async json() { return { errors: CUSTOMER_DENIED }; } } as Response;
+        return { ok: true, async json() { return { data: { order: { ...orderNode({ id: 'o1' }), customer: undefined } } }; } } as Response;
+      }),
+    );
+    const o = await new ShopifyAdapter('demo.myshopify.com', 'tok').getOrder('gid://shopify/Order/1');
+    expect(o?.id).toBe('o1');
+    expect(o?.total).toBe(199);
+  });
+
+  test('still fails loudly on an error that is not a customer scope problem', async () => {
+    let call = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        call++;
+        return { ok: true, async json() { return { errors: [{ message: 'Throttled', extensions: { code: 'THROTTLED' } }] }; } } as Response;
+      }),
+    );
+    await expect(new ShopifyAdapter('demo.myshopify.com', 'tok').listOrders()).rejects.toThrow(/Throttled/);
+    expect(call).toBe(1);
+  });
+});

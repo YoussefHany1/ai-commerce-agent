@@ -27,8 +27,27 @@ export function mapShopifyOrderNode(o: Record<string, any>): Order {
   };
 }
 
+/**
+ * Detects Shopify's per-field scope error for `customer`.
+ *
+ * `orders.nodes.customer` is gated behind the `read_customers` access scope, and
+ * a token without it does not get a null field back — the whole query comes back
+ * ACCESS_DENIED. That fails every order sync for the store, and once the retries
+ * are spent the job is dead with no order history imported at all.
+ */
+function deniesCustomerField(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /customer/i.test(msg) && /ACCESS_DENIED|read_customers/.test(msg);
+}
+
 export class ShopifyAdapter implements CommerceAdapter {
   platform = 'shopify' as const;
+
+  /**
+   * Set once this token is known to be unable to read customers, so the retry
+   * costs one failed request per process rather than one per page.
+   */
+  private customerScopeDenied = false;
 
   constructor(
     private shop: string,
@@ -53,6 +72,34 @@ export class ShopifyAdapter implements CommerceAdapter {
     const j = (await r.json()) as any;
     if (j.errors) throw new Error(JSON.stringify(j.errors));
     return j.data;
+  }
+
+  private orderNodeFields(withCustomer: boolean): string {
+    const customer = withCustomer ? ' customer{displayName email phone}' : '';
+    return `id createdAt displayFinancialStatus displayFulfillmentStatus currentTotalPriceSet{shopMoney{amount currencyCode}}${customer}`;
+  }
+
+  /**
+   * Runs an order query, dropping the `customer` selection and retrying once if
+   * the token turns out not to be allowed to read it.
+   *
+   * The fallback keeps revenue and order counts intact and only drops phone and
+   * email, which `markConversationsForOrder` uses to attribute a sale to a
+   * conversation. Trading conversion attribution for the entire order history is
+   * a good deal, and a merchant who re-authorises with the wider scope gets the
+   * customer fields back automatically.
+   */
+  private async gqlOrderQuery(
+    build: (withCustomer: boolean) => string,
+    variables: Record<string, unknown> = {},
+  ): Promise<any> {
+    try {
+      return await this.gql(build(!this.customerScopeDenied), variables);
+    } catch (err) {
+      if (this.customerScopeDenied || !deniesCustomerField(err)) throw err;
+      this.customerScopeDenied = true;
+      return await this.gql(build(false), variables);
+    }
   }
 
   async listProducts(): Promise<Product[]> {
@@ -101,8 +148,9 @@ export class ShopifyAdapter implements CommerceAdapter {
     const all: Order[] = [];
     let cursor: string | null = null;
     for (let page = 0; page < MAX_PAGES && all.length < limit; page++) {
-      const d = await this.gql(
-        `query($first:Int!,$after:String,$query:String){orders(first:$first,after:$after,sortKey:CREATED_AT,query:$query){pageInfo{hasNextPage endCursor}nodes{id createdAt displayFinancialStatus currentTotalPriceSet{shopMoney{amount currencyCode}} customer{displayName email phone} displayFulfillmentStatus}}}`,
+      const d = await this.gqlOrderQuery(
+        (withCustomer) =>
+          `query($first:Int!,$after:String,$query:String){orders(first:$first,after:$after,sortKey:CREATED_AT,query:$query){pageInfo{hasNextPage endCursor}nodes{${this.orderNodeFields(withCustomer)}}}}`,
         {
           first: Math.min(PAGE_SIZE, limit - all.length),
           after: cursor,
@@ -131,8 +179,8 @@ export class ShopifyAdapter implements CommerceAdapter {
   }
 
   async getOrder(id: string): Promise<Order | null> {
-    const d = await this.gql(
-      `query($id:ID!){order(id:$id){id createdAt displayFinancialStatus currentTotalPriceSet{shopMoney{amount currencyCode}} customer{displayName email phone} displayFulfillmentStatus}}`,
+    const d = await this.gqlOrderQuery(
+      (withCustomer) => `query($id:ID!){order(id:$id){${this.orderNodeFields(withCustomer)}}}`,
       { id },
     );
     const o = d.order;

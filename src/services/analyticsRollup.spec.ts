@@ -73,6 +73,17 @@ describe('rollupDailyMetrics order bucketing', () => {
     expect((orders.match(/coalesce\(placed_at/g) ?? []).length).toBeGreaterThanOrEqual(3);
   });
 
+  test('never references placed_at on tables that do not have the column', async () => {
+    await rollup();
+    // `placed_at` lives only on `orders`. Leaking the orders day expression into
+    // another table's query raises "column does not exist", which aborts the
+    // whole rollup and 500s /api/metrics for every store, not just this one.
+    const offenders = tx.execute.mock.calls
+      .map((c) => sqlText(c[0]))
+      .filter((text) => text.includes('placed_at') && !text.includes('from orders'));
+    expect(offenders).toEqual([]);
+  });
+
   test('emits one row per day in the window, defaulting missing days to zero', async () => {
     tx.execute.mockImplementation(async (q: unknown) => {
       if (isOrdersQuery(q)) return [{ day: firstDayKey(7), orders: 3, revenue: 150 }];

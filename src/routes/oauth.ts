@@ -10,7 +10,10 @@ import { logger } from '../lib/logger.js';
 
 const STATE_TTL = 600;
 const oauthWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
-const SCOPES = ['read_products', 'write_products', 'read_orders', 'read_inventory'];
+// read_customers gates orders.nodes.customer. Without it the order queries come
+// back ACCESS_DENIED rather than null, so a token that predates this scope would
+// import no orders at all; the adapter also degrades gracefully in that case.
+const SCOPES = ['read_products', 'write_products', 'read_orders', 'read_inventory', 'read_customers'];
 const SALLA_SCOPES_DEFAULT = 'offline_access';
 const ZID_SCOPES_DEFAULT = '';
 

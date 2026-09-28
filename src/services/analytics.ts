@@ -187,8 +187,14 @@ order by converted_at`,
 export async function rollupDailyMetrics(storeId: string, days: number): Promise<DailyMetricRow[]> {
   const { from, to } = window(days);
   return withTenant(storeId, async (tx) => {
+    // `placed_at` exists only on `orders`, so the orders-specific day expression
+    // must not leak into the other tables' queries. conversations, messages and
+    // attributions have no such column, and referencing one that does not exist
+    // fails the whole rollup — which takes /api/metrics down for every store,
+    // not just the one being measured.
     const orderDayCol = sql<string>`coalesce(placed_at, "createdAt")`;
-    const dayCol = sql<string>`(date_trunc('day', ${orderDayCol})::date)::text`;
+    const orderDay = sql<string>`(date_trunc('day', ${orderDayCol})::date)::text`;
+    const createdDay = sql<string>`(date_trunc('day', "createdAt")::date)::text`;
     const fromIso = from.toISOString();
     const toIso = to.toISOString();
     // Bucket on placed_at, not createdAt. A backfilled order is written long after
@@ -196,16 +202,16 @@ export async function rollupDailyMetrics(storeId: string, days: number): Promise
     // the backfill ran. The window filter must use the same expression, or orders
     // backfilled for older days would be counted into whichever day they landed.
     const o = await tx.execute(
-      sql`select ${dayCol} as day, count(*)::int as orders, coalesce(sum(total), 0) as revenue from orders where store_id = ${storeId} and coalesce(placed_at, "createdAt") >= ${fromIso} and coalesce(placed_at, "createdAt") < ${toIso} group by 1`,
+      sql`select ${orderDay} as day, count(*)::int as orders, coalesce(sum(total), 0) as revenue from orders where store_id = ${storeId} and ${orderDayCol} >= ${fromIso} and ${orderDayCol} < ${toIso} group by 1`,
     );
     const c = await tx.execute(
-      sql`select ${dayCol} as day, count(*)::int as conversations from conversations where store_id = ${storeId} and "createdAt" >= ${fromIso} and "createdAt" < ${toIso} group by 1`,
+      sql`select ${createdDay} as day, count(*)::int as conversations from conversations where store_id = ${storeId} and "createdAt" >= ${fromIso} and "createdAt" < ${toIso} group by 1`,
     );
     const m = await tx.execute(
-      sql`select ${dayCol} as day, count(*)::int as messages from messages where store_id = ${storeId} and "createdAt" >= ${fromIso} and "createdAt" < ${toIso} group by 1`,
+      sql`select ${createdDay} as day, count(*)::int as messages from messages where store_id = ${storeId} and "createdAt" >= ${fromIso} and "createdAt" < ${toIso} group by 1`,
     );
     const r = await tx.execute(
-      sql`select ${dayCol} as day, count(*)::int as recommended from attributions where store_id = ${storeId} and "createdAt" >= ${fromIso} and "createdAt" < ${toIso} group by 1`,
+      sql`select ${createdDay} as day, count(*)::int as recommended from attributions where store_id = ${storeId} and "createdAt" >= ${fromIso} and "createdAt" < ${toIso} group by 1`,
     );
     const cl = await tx.execute(
       sql`select (date_trunc('day', "clickedAt")::date)::text as day, count(*)::int as clicked from attributions where store_id = ${storeId} and "clickedAt" is not null and "clickedAt" >= ${fromIso} and "clickedAt" < ${toIso} group by 1`,
