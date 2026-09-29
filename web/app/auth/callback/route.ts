@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
 import { createDashboardSupabaseClient } from '@/lib/server/supabase';
 import { callAuthApi, mintSessionCookie, safeNext } from '@/lib/server/authExchange';
 
@@ -49,13 +50,9 @@ export async function GET(request: Request): Promise<NextResponse> {
   if (!parsed) return login('auth_unavailable');
 
   const redirectTo = safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard';
-  const response = NextResponse.redirect(new URL(redirectTo, request.url));
   
-  response.cookies.set({
-    name: SESSION_COOKIE,
-    value: serializeSession(parsed.payload),
-    ...sessionCookieOptions(parsed.expiresIn)
-  });
+  const cookieStore = await cookies();
+  cookieStore.set(SESSION_COOKIE, serializeSession(parsed.payload), sessionCookieOptions(parsed.expiresIn));
 
-  return response;
+  return NextResponse.redirect(new URL(redirectTo, request.url));
 }
