@@ -15,6 +15,21 @@ vi.mock('./redis.js', () => ({
   })),
 }));
 
+const clientSession = vi.hoisted(() => ({
+  CLIENT_SESSION_HEADER: 'x-client-session',
+  resolveClientSession: vi.fn(),
+}));
+vi.mock('./clientSession.js', () => clientSession);
+
+const repos = vi.hoisted(() => ({
+  storeRepo: { belongsToClient: vi.fn() },
+}));
+vi.mock('../db/repos.js', () => repos);
+
+vi.mock('../db/client.js', () => ({
+  withTenant: async () => [{ hash: 'unused', hint: 'unused' }],
+}));
+
 const ADMIN_KEY = '0123456789abcdef0123456789abcdef';
 
 async function loadAuth(env: Record<string, string>, remove: string[] = []) {
@@ -105,5 +120,122 @@ describe('requireApiKey', () => {
     const r = reply();
     await requireApiKey(req('1.1.1.1', ADMIN_KEY), r);
     expect(r.out.code).toBe(503);
+  });
+});
+
+describe('requireDashboard', () => {
+  beforeEach(() => {
+    store.clear();
+    vi.resetModules();
+    clientSession.resolveClientSession.mockReset();
+    repos.storeRepo.belongsToClient.mockReset();
+  });
+  afterEach(() => vi.resetModules());
+
+  function adminReq(ip: string): FastifyRequest {
+    return { headers: { 'x-api-key': ADMIN_KEY }, socket: { remoteAddress: ip } } as any;
+  }
+
+  function clientReq(
+    sid = 'some-sid',
+    storeId = 's1',
+  ): FastifyRequest {
+    return {
+      headers: { 'x-client-session': sid, 'x-store-id': storeId, 'x-api-key': ADMIN_KEY },
+      socket: { remoteAddress: '1.1.1.1' },
+      params: { storeId },
+    } as any;
+  }
+
+  it('derives an operator principal from the admin key', async () => {
+    const { requireDashboard } = await loadAuth({ ADMIN_API_KEY: ADMIN_KEY });
+    const r = reply();
+    const req = adminReq('1.1.1.1');
+    await requireDashboard()(req, r);
+    expect((req as any).principal).toEqual({ kind: 'operator' });
+    expect(r.out.code).toBe(0);
+  });
+
+  it('derives a client principal for an owned store', async () => {
+    const { requireDashboard } = await loadAuth({ ADMIN_API_KEY: ADMIN_KEY });
+    clientSession.resolveClientSession.mockResolvedValue({
+      clientId: 'client-a',
+      name: 'Ace',
+      email: 'a@example.com',
+    });
+    repos.storeRepo.belongsToClient.mockResolvedValue(true);
+    const r = reply();
+    const req = clientReq();
+    await requireDashboard((x) => (x.params as any).storeId)(req, r);
+    expect((req as any).principal).toEqual({
+      kind: 'client',
+      clientId: 'client-a',
+      name: 'Ace',
+      email: 'a@example.com',
+    });
+    expect(repos.storeRepo.belongsToClient).toHaveBeenCalledWith('s1', 'client-a');
+    expect(r.out.code).toBe(0);
+  });
+
+  it('rejects a client reaching a store it does not own with 404', async () => {
+    const { requireDashboard } = await loadAuth({ ADMIN_API_KEY: ADMIN_KEY });
+    clientSession.resolveClientSession.mockResolvedValue({
+      clientId: 'client-a',
+      name: 'Ace',
+      email: 'a@example.com',
+    });
+    repos.storeRepo.belongsToClient.mockResolvedValue(false);
+    const r = reply();
+    await requireDashboard((x) => (x.params as any).storeId)(clientReq(), r);
+    expect(r.out.code).toBe(404);
+    expect(r.out.body).toMatchObject({ error: 'store_not_found' });
+  });
+
+  it('rejects a client request with no store id with 400', async () => {
+    const { requireDashboard } = await loadAuth({ ADMIN_API_KEY: ADMIN_KEY });
+    clientSession.resolveClientSession.mockResolvedValue({
+      clientId: 'client-a',
+      name: 'Ace',
+      email: 'a@example.com',
+    });
+    const r = reply();
+    await requireDashboard(() => undefined)(clientReq('sid', ''), r);
+    expect(r.out.code).toBe(400);
+    expect(r.out.body).toMatchObject({ error: 'store_required' });
+  });
+
+  it('resolves a client ahead of a valid admin key on the same request', async () => {
+    // Least privilege wins: a request carrying both credentials must act as the
+    // session, not silently upgrade to the operator scope.
+    const { requireDashboard } = await loadAuth({ ADMIN_API_KEY: ADMIN_KEY });
+    clientSession.resolveClientSession.mockResolvedValue({
+      clientId: 'client-a',
+      name: 'Ace',
+      email: 'a@example.com',
+    });
+    repos.storeRepo.belongsToClient.mockResolvedValue(true);
+    const r = reply();
+    const req = clientReq();
+    await requireDashboard((x) => (x.params as any).storeId)(req, r);
+    expect((req as any).principal.kind).toBe('client');
+  });
+
+  it('lets the resolver reply (401/503) and stops without a principal', async () => {
+    const { requireDashboard } = await loadAuth({ ADMIN_API_KEY: ADMIN_KEY });
+    // Simulate the resolver having already sent its 401 and returned null.
+    clientSession.resolveClientSession.mockResolvedValue(null);
+    const r = reply();
+    const req = clientReq();
+    await requireDashboard((x) => (x.params as any).storeId)(req, r);
+    expect((req as any).principal).toBeUndefined();
+  });
+
+  it('rejects a request with no credential with 401', async () => {
+    const { requireDashboard } = await loadAuth({ ADMIN_API_KEY: ADMIN_KEY });
+    const r = reply();
+    const req = { headers: {}, socket: { remoteAddress: '1.1.1.1' } } as any;
+    await requireDashboard()(req, r);
+    expect(r.out.code).toBe(401);
+    expect(r.out.body).toMatchObject({ error: 'unauthorized' });
   });
 });

@@ -23,17 +23,78 @@ const tsvectorType = customType<{ data: string; driverData: string }>({
   },
 });
 
-export const stores = pgTable('stores', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  name: text('name').notNull(),
-  platform: text('platform').notNull(),
-  shopDomain: text('shop_domain'),
-  planStatus: text('plan_status').notNull().default('trial'),
-  apiKeyHash: text('api_key_hash'),
-  apiKeyHint: text('api_key_hint'),
-  settings: jsonb('settings').$type<Record<string, unknown>>(),
-  createdAt: ts(),
-});
+/**
+ * A dashboard customer — the account a merchant or agency signs in with.
+ *
+ * Credentials are managed by Supabase Auth: clients self-register, confirm their
+ * email, reset via email links, and can sign in with Google there. The row below
+ * is the application-side account — the ownership link between the auth identity
+ * (`supabaseUid` = `auth.users.id`) and the merchant's stores.
+ *
+ * `passwordHash` is legacy: it holds the scrypt digest of invite-only accounts
+ * created before Supabase took over credential management. It is now nullable and
+ * NULL for every Supabase-managed account; linking `supabaseUid`
+ * (`setSupabaseUid`) withdraws it, and the only verifier that still reads it is
+ * the pre-migration login path. `clientToPublic` below is still the only shape
+ * that reaches an HTTP response, and it never exposes either credential field.
+ */
+export const clients = pgTable(
+  'clients',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    name: text('name').notNull(),
+    /**
+     * Login identifier, stored lowercased and trimmed so lookups and the unique
+     * index cannot be dodged by casing. Not an email domain-validated type: the
+     * operator enters it, and a strict zod validator at the boundary is the place
+     * for that judgement.
+     */
+    email: text('email').notNull(),
+    passwordHash: text('password_hash'),
+    /**
+     * The Supabase Auth user id backing this account, or NULL for operator-created
+     * accounts not yet migrated. Linked on import or on first Supabase sign-in;
+     * unique while present so one auth identity maps to at most one account.
+     */
+    supabaseUid: uuid('supabase_uid'),
+    /** 'active' | 'suspended'. A suspended client cannot log in and every live session stops verifying. */
+    status: text('status').notNull().default('active'),
+    settings: jsonb('settings').$type<Record<string, unknown>>(),
+    createdAt: ts(),
+    updatedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('clients_email_uidx').on(t.email),
+    index('clients_status_idx').on(t.status),
+    uniqueIndex('clients_supabase_uid_uidx').on(t.supabaseUid),
+  ],
+);
+
+export const stores = pgTable(
+  'stores',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    name: text('name').notNull(),
+    platform: text('platform').notNull(),
+    shopDomain: text('shop_domain'),
+    planStatus: text('plan_status').notNull().default('trial'),
+    apiKeyHash: text('api_key_hash'),
+    apiKeyHint: text('api_key_hint'),
+    /**
+     * Owning account, or null for an operator-owned store.
+     *
+     * Nullable on purpose: it keeps every existing row, and every store created
+     * through the operator's OAuth install path, visible to the operator exactly
+     * as before with no backfill. `ON DELETE SET NULL` for the same reason — there
+     * is no delete route for a client, but a suspended-then-removed account must
+     * never cascade away a tenant's data.
+     */
+    clientId: uuid('client_id').references(() => clients.id, { onDelete: 'set null' }),
+    settings: jsonb('settings').$type<Record<string, unknown>>(),
+    createdAt: ts(),
+  },
+  (t) => [index('stores_client_id_idx').on(t.clientId)],
+);
 
 export const platformConnections = pgTable(
   'platform_connections',
@@ -348,6 +409,8 @@ export const dailyMetrics = pgTable(
   ],
 );
 
+export type Client = typeof clients.$inferSelect;
+export type NewClient = typeof clients.$inferInsert;
 export type Store = typeof stores.$inferSelect;
 export type NewStore = typeof stores.$inferInsert;
 export type PlatformConnection = typeof platformConnections.$inferSelect;

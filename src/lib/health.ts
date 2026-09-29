@@ -25,6 +25,7 @@ export async function dbPing(): Promise<boolean> {
  * still fails the check instead of quietly shrinking the set being verified.
  */
 const RLS_TABLES = [
+  'clients',
   'stores',
   'platform_connections',
   'products',

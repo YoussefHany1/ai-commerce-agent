@@ -5,10 +5,13 @@ import type {
   BillingStatus,
   ChatResponse,
   CheckoutResponse,
+  ClientAccount,
+  ClientCreateResult,
   ConversionLagResponse,
   HealthResponse,
   JobsResponse,
   MetricsResponse,
+  SessionInfo,
   SourcesResponse,
   Store,
   TopProductsResponse,
@@ -29,7 +32,7 @@ export const API_BASE_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhos
 );
 
 interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   query?: Record<string, string | number | undefined>;
   headers?: Record<string, string>;
@@ -205,6 +208,28 @@ export const api = {
   jobs: (storeId: string, status?: string) =>
     request<JobsResponse>(`/api/jobs/${storeId}`, { query: { status } }),
 
+  /**
+   * Operator account admin. These are only meaningful to an operator session:
+   * a client's proxied call reaches the API without an admin key and gets a 401,
+   * so the dashboard gates the page in the UI as well.
+   */
+  listClients: () => request<ClientAccount[]>('/clients'),
+
+  createClient: (input: { name: string; email: string; password?: string }) =>
+    request<ClientCreateResult>('/clients', { method: 'POST', body: input }),
+
+  setClientStatus: (clientId: string, status: 'active' | 'suspended') =>
+    request<{ ok: true; status: 'active' | 'suspended' }>(`/clients/${clientId}/status`, {
+      method: 'PATCH',
+      body: { status },
+    }),
+
+  resetClientPassword: (clientId: string, password: string) =>
+    request<{ ok: true }>(`/clients/${clientId}/reset-password`, {
+      method: 'POST',
+      body: { password },
+    }),
+
   chat: async (storeId: string, message: string): Promise<ChatResponse> => {
     const sessionRes = await request<{ token: string; conversationId: string }>('/api/session', {
       method: 'POST',
@@ -240,6 +265,46 @@ export const api = {
       credentials: 'same-origin',
       cache: 'no-store',
     });
+  },
+
+  /**
+   * Public client auth flows. These hit dedicated BFF route handlers (never the
+   * catch-all proxy, which requires a session): exchanging a Supabase token for
+   * the `aca_session` cookie happens server-side on Google sign-in, password
+   * reset, and signup confirmation, while the forms below only kick those flows
+   * off or finish the parts that cannot be left to the server.
+   */
+  register: (input: { name: string; email: string; password: string }) =>
+    request<{ ok: true }>('/api/auth/register', { method: 'POST', body: input }),
+
+  forgot: (email: string) =>
+    request<{ ok: true }>('/api/auth/forgot', { method: 'POST', body: { email } }),
+
+  resetPassword: (input: { email: string; token: string; password: string }) =>
+    request<{ ok: true }>('/api/auth/reset', { method: 'POST', body: input }),
+
+  /**
+   * Reads the current session so the shell can branch on principal kind.
+   *
+   * Also served by a dedicated route handler, not the proxy — the session cookie
+   * is verified locally against Redis, so proxying it would add a needless
+   * upstream round-trip. A non-OK response always maps to "signed out": a caller
+   * only needs to know whether there is a live session and of which kind.
+   */
+  sessionInfo: async (): Promise<SessionInfo> => {
+    let res: Response;
+    try {
+      res = await fetch('/api/auth/session', { credentials: 'same-origin', cache: 'no-store' });
+    } catch {
+      return { authenticated: false };
+    }
+    if (!res.ok) return { authenticated: false };
+    try {
+      const body = (await res.json()) as SessionInfo;
+      return body && typeof body.authenticated === 'boolean' ? body : { authenticated: false };
+    } catch {
+      return { authenticated: false };
+    }
   },
 };
 

@@ -1,10 +1,15 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
-import { getRedis } from '../lib/redis.js';
 import { consumeRateLimit, reqIp } from '../lib/rateLimit.js';
 import { verifyOperatorPassword, MAX_OPERATOR_PASSWORD_LENGTH } from '../lib/passwordHash.js';
 import { ensureOperatorSessionEpoch } from '../lib/operatorSession.js';
+import {
+  clearFailures,
+  lockRemainingMs,
+  recordFailure,
+  retryAfter,
+} from '../lib/loginLockout.js';
 
 /**
  * Operator login for the merchant dashboard.
@@ -22,49 +27,10 @@ import { ensureOperatorSessionEpoch } from '../lib/operatorSession.js';
 
 const loginWindow = { limit: 20, windowSec: 60 };
 
-const FAIL_THRESHOLD = 5;
-const LOCK_BASE_MS = 30_000;
-const LOCK_MAX_MS = 15 * 60_000;
-/** How long consecutive-failure history is remembered after a lock lapses. */
-const FAIL_MEMORY_SEC = 3600;
-
 const FAIL_PREFIX = 'op:login:fail:';
 const LOCK_PREFIX = 'op:login:lock:';
 
 const body = z.object({ password: z.string().min(1).max(MAX_OPERATOR_PASSWORD_LENGTH) });
-
-function retryAfter(ms: number): number {
-  return Math.max(1, Math.ceil(ms / 1000));
-}
-
-async function lockRemainingMs(ip: string): Promise<number> {
-  const redis = await getRedis();
-  const ttl = await redis.pTTL(`${LOCK_PREFIX}${ip}`);
-  return ttl > 0 ? ttl : 0;
-}
-
-/**
- * Records a failed attempt and returns how long the caller is now locked out for.
- * Lockout doubles per failure past the threshold, so a spray costs an attacker
- * progressively more time while a mistyped password costs one lockout, not a
- * permanent ban.
- */
-async function recordFailure(ip: string): Promise<number> {
-  const redis = await getRedis();
-  const key = `${FAIL_PREFIX}${ip}`;
-  const fails = await redis.incr(key);
-  if (fails === 1) await redis.expire(key, FAIL_MEMORY_SEC);
-  if (fails < FAIL_THRESHOLD) return 0;
-  const over = fails - FAIL_THRESHOLD;
-  const ms = Math.min(LOCK_BASE_MS * 2 ** over, LOCK_MAX_MS);
-  await redis.set(`${LOCK_PREFIX}${ip}`, String(fails), { PX: ms });
-  return ms;
-}
-
-async function clearFailures(ip: string): Promise<void> {
-  const redis = await getRedis();
-  await redis.del([`${FAIL_PREFIX}${ip}`, `${LOCK_PREFIX}${ip}`]);
-}
 
 export async function operatorAuth(app: FastifyInstance) {
   app.post('/api/auth/operator/verify', async (req, rep) => {
@@ -93,7 +59,7 @@ export async function operatorAuth(app: FastifyInstance) {
 
     let locked: number;
     try {
-      locked = await lockRemainingMs(ip);
+      locked = await lockRemainingMs(`${LOCK_PREFIX}${ip}`);
     } catch {
       // Without Redis the attempt counter is unknowable. Refusing the attempt is
       // the only choice that does not turn a cache outage into unlimited login tries.
@@ -113,7 +79,7 @@ export async function operatorAuth(app: FastifyInstance) {
     if (!ok) {
       let ms = 0;
       try {
-        ms = await recordFailure(ip);
+        ms = await recordFailure(`${FAIL_PREFIX}${ip}`, `${LOCK_PREFIX}${ip}`);
       } catch {
         return rep.code(503).send({ error: 'auth_unavailable' });
       }
@@ -129,7 +95,7 @@ export async function operatorAuth(app: FastifyInstance) {
 
     let epoch: string;
     try {
-      await clearFailures(ip);
+      await clearFailures(`${FAIL_PREFIX}${ip}`, `${LOCK_PREFIX}${ip}`);
       epoch = await ensureOperatorSessionEpoch();
     } catch {
       return rep.code(503).send({ error: 'auth_unavailable' });

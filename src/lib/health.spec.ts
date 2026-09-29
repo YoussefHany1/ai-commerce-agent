@@ -10,11 +10,12 @@ import { test, expect, describe, vi, beforeEach } from 'vitest';
  * only `stores` was inspected, so the other 15 tables could be unprotected.
  */
 
-const TABLE_COUNT = 16;
+const TABLE_COUNT = 17;
 
 type Row = { name: string; relrowsecurity: boolean; relforcerowsecurity: boolean; owned: boolean };
 
 const ALL_TABLES = [
+  'clients',
   'stores',
   'platform_connections',
   'products',

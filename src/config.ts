@@ -6,6 +6,11 @@ const schema = z.object({
   APP_BASE_URL: z.string().url().default('http://localhost:3000'),
   OAUTH_REDIRECT_ALLOWLIST: z.string().optional(),
   CORS_ORIGINS: z.string().optional(),
+  // Supabase Auth + Postgres. Required once client credentials move to Supabase;
+  // optional until then so the API still boots in an all-local setup.
+  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_ANON_KEY: z.string().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   ADMIN_API_KEY: z.string().min(32).optional(),
   ADMIN_API_KEY_PREVIOUS: z.string().min(32).optional(),
   OPERATOR_PASSWORD_HASH: z.string().optional(),
@@ -44,6 +49,7 @@ const schema = z.object({
   RATE_LIMIT_PER_MIN: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_CHAT_PER_MIN: z.coerce.number().int().positive().default(20),
   SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+  CLIENT_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(8 * 60 * 60),
   WEBHOOK_BODY_LIMIT: z.coerce.number().int().positive().default(5 * 1024 * 1024),
   RETENTION_CONVERSATIONS_DAYS: z.coerce.number().int().positive().default(365),
   RETENTION_ATTRIBUTIONS_DAYS: z.coerce.number().int().positive().default(365),

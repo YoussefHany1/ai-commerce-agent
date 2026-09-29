@@ -263,8 +263,10 @@ function checkMatch(name, actual, pattern) {
 }
 
 function mintCookie(epoch, expSeconds) {
+  // v2 operator payload: `kind` and `v` were added when client sessions landed,
+  // and the v2 verifier rejects v1 cookies outright.
   const payload = Buffer.from(
-    JSON.stringify({ v: 1, iat: Math.floor(Date.now() / 1000), exp: expSeconds, epoch }),
+    JSON.stringify({ v: 2, kind: 'operator', iat: Math.floor(Date.now() / 1000), exp: expSeconds, epoch }),
   ).toString('base64url');
   return `${payload}.${createHmac('sha256', SECRET).update(payload).digest('base64url')}`;
 }
@@ -459,11 +461,12 @@ async function main() {
     {
       // The real path: password in, session cookie out, cookie then works. Everything
       // above used a cookie minted here, so nothing yet proved that the route which
-      // issues cookies produces one the proxy accepts.
+      // issues cookies produces one the proxy accepts. Operator login requires the
+      // `kind` discriminator, so it is sent explicitly.
       const res = await call(`${base}/api/auth/login`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ password: 'correct-horse-battery-staple' }),
+        body: JSON.stringify({ kind: 'operator', password: 'correct-horse-battery-staple' }),
       });
       const setCookie = res.headers.get('set-cookie') ?? '';
       check('correct password -> 200', res.status, 200);
@@ -482,7 +485,7 @@ async function main() {
       const res = await call(`${base}/api/auth/login`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ password: 'wrong' }),
+        body: JSON.stringify({ kind: 'operator', password: 'wrong' }),
       });
       check('wrong password -> 401', res.status, 401);
       check('no cookie issued on failure', res.headers.get('set-cookie'), null);
@@ -493,7 +496,7 @@ async function main() {
       const res = await call(`${base}/api/auth/login`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ password: 'locked-out' }),
+        body: JSON.stringify({ kind: 'operator', password: 'locked-out' }),
       });
       check('upstream lockout -> 429', res.status, 429);
       check('Retry-After preserved', res.headers.get('retry-after'), '42');
@@ -502,7 +505,7 @@ async function main() {
       const res = await call(`${base}/api/auth/login`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ password: 'x'.repeat(2000) }),
+        body: JSON.stringify({ kind: 'operator', password: 'x'.repeat(2000) }),
       });
       check('oversized password -> 400', res.status, 400);
     }

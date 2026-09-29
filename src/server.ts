@@ -13,6 +13,8 @@ import { automation as automationRoutes } from './routes/automation.js';
 import { pdpl as pdplRoutes } from './routes/pdpl.js';
 import { favicon } from './routes/favicon.js';
 import { operatorAuth } from './routes/operatorAuth.js';
+import { clientAuth } from './routes/clientAuth.js';
+import { clients as clientsRoutes } from './routes/clients.js';
 import { startCatalogSync } from './workers/catalogSync.js';
 import { startOrderSync } from './workers/orderSync.js';
 import { startMetricsRollup } from './workers/metricsRollup.js';
@@ -54,6 +56,8 @@ app.get('/', async () => ({ name: 'AI Commerce Agent', version: '0.2.0' }));
 
 await registerRawBody(app);
 await operatorAuth(app);
+await clientAuth(app);
+await clientsRoutes(app);
 await api(app);
 await oauth(app);
 await sessionRoutes(app);

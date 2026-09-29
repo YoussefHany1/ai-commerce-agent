@@ -9,6 +9,7 @@ const TEST_ENCRYPTION_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef012
 const enabled = Boolean(TEST_DB_URL && TEST_ADMIN_URL && TEST_REDIS_URL);
 
 let storeRepo: typeof import('../db/repos.js').storeRepo;
+let clientRepo: typeof import('../db/repos.js').clientRepo;
 let catalogRepo: typeof import('../db/repos.js').catalogRepo;
 let connectionRepo: typeof import('../db/repos.js').connectionRepo;
 let withTenant: typeof import('../db/client.js').withTenant;
@@ -36,6 +37,7 @@ async function loadModules() {
     const session = await import('../lib/session.js');
     withTenant = client.withTenant;
     storeRepo = repos.storeRepo;
+    clientRepo = repos.clientRepo;
     catalogRepo = repos.catalogRepo;
     connectionRepo = repos.connectionRepo;
     products = schema.products;
@@ -148,7 +150,7 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
 
   it('scopes platform_connections reads to the operator, not just the tenant', async () => {
     // Regression: platform_connections originally shipped with only the
-    // app.store_id isolation policy and no tenant_operator_* counterpart, so
+    // store_id isolation policy and no tenant_operator_* counterpart, so
     // withOperator() saw zero rows. That silently disabled the catalog-sync
     // scheduler (connectionRepo.listDue) and made storeRepo.remove skip the
     // table, orphaning access_token_enc / refresh_token_enc on uninstall.
@@ -181,6 +183,53 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
     expect(await storeRepo.remove(a)).toBe(true);
     await expect(adminCount('platform_connections', a)).resolves.toBe(0);
     await expect(adminCount('stores', a)).resolves.toBe(0);
+  });
+
+  it('scopes stores and the self row to a client under withClient', async () => {
+    const { hashPassword } = await import('../lib/passwordHash.js');
+    const hash = await hashPassword('correct horse battery staple');
+    const clientA = await clientRepo.create({ name: 'RLS Client A', email: 'rls-client-a@example.com', passwordHash: hash });
+    const clientB = await clientRepo.create({ name: 'RLS Client B', email: 'rls-client-b@example.com', passwordHash: hash });
+    try {
+      const storeA = await storeRepo.create({
+        name: 'RLS CLI SA',
+        platform: 'shopify',
+        shopDomain: 'rls-cli-a.myshopify.com',
+      });
+      const storeB = await storeRepo.create({
+        name: 'RLS CLI SB',
+        platform: 'salla',
+        shopDomain: 'rls-cli-b.sa',
+      });
+      createdStores.push(storeA, storeB);
+
+      expect(await storeRepo.assignClient(storeA, clientA)).toBe(true);
+      expect(await storeRepo.assignClient(storeB, clientB)).toBe(true);
+
+      // withClient sees only the stores the caller owns…
+      const forA = await storeRepo.listForClient(clientA);
+      expect(forA.map((s) => s.id)).toEqual([storeA]);
+      const forB = await storeRepo.listForClient(clientB);
+      expect(forB.map((s) => s.id)).toEqual([storeB]);
+
+      // …and only its own clients row, through the tenant_client_clients policy.
+      await expect(clientRepo.getForAuth(clientA)).resolves.toMatchObject({ id: clientA, email: 'rls-client-a@example.com' });
+      await expect(clientRepo.getForAuth(clientB)).resolves.toMatchObject({ id: clientB, email: 'rls-client-b@example.com' });
+
+      // The other tenant's store stays invisible even when addressed directly.
+      await expect(storeRepo.belongsToClient(storeB, clientA)).resolves.toBe(false);
+
+      // setSupabaseUid links an auth identity from operator scope and withdraws the
+      // legacy scrypt hash, so a linked account can only sign in through Supabase.
+      const authUid = crypto.randomUUID();
+      expect(await clientRepo.setSupabaseUid(clientA, authUid)).toBe(true);
+      await expect(clientRepo.getBySupabaseUid(authUid)).resolves.toMatchObject({
+        id: clientA,
+        passwordHash: null,
+      });
+    } finally {
+      for (const id of [clientA, clientB]) await admin!`delete from clients where id = ${id}`;
+    }
   });
 
   it('round-trips customer sessions through redis', async () => {

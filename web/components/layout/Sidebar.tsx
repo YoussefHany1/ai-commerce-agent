@@ -10,11 +10,13 @@ import {
   Settings,
   Sparkles,
   Store,
+  Users,
   Workflow,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/lib/locale';
 import { makeTranslator } from '@/lib/i18n';
+import { useSession, isOperator } from '@/hooks/useSession';
 
 interface NavItem {
   href: string;
@@ -33,6 +35,11 @@ const MANAGE_NAV: NavItem[] = [
   { href: '/dashboard/automation', key: 'navAutomation', icon: Workflow, mobile: true },
   { href: '/dashboard/billing', key: 'navBilling', icon: CreditCard, mobile: true },
   { href: '/dashboard/settings', key: 'navSettings', icon: Settings, mobile: true },
+];
+
+/** Operator-only: tenants of this install are managed here, never by the tenants themselves. */
+const ADMIN_NAV: NavItem[] = [
+  { href: '/dashboard/clients', key: 'navClients', icon: Users, mobile: true },
 ];
 
 interface SidebarProps {
@@ -96,6 +103,8 @@ export function Sidebar({ collapsed }: SidebarProps) {
   const { locale } = useLocale();
   const t = makeTranslator(locale);
   const pathname = usePathname();
+  const who = useSession();
+  const showAdmin = isOperator(who.data);
 
   return (
     <>
@@ -141,6 +150,16 @@ export function Sidebar({ collapsed }: SidebarProps) {
               <NavLink key={item.href} item={item} collapsed={collapsed} t={t} />
             ))}
           </div>
+          {showAdmin && (
+            <div className="space-y-1">
+              {!collapsed && (
+                <p className="label-muted px-3 pb-1">{t('navSectionAdmin', 'Admin')}</p>
+              )}
+              {ADMIN_NAV.map((item) => (
+                <NavLink key={item.href} item={item} collapsed={collapsed} t={t} />
+              ))}
+            </div>
+          )}
         </nav>
 
         {/* Upgrade card */}
@@ -168,7 +187,7 @@ export function Sidebar({ collapsed }: SidebarProps) {
 
       {/* Mobile bottom nav */}
       <nav className="fixed inset-x-0 bottom-0 z-40 flex h-16 items-stretch justify-around border-t border-slate-200/80 bg-white/90 px-1 backdrop-blur-xl md:hidden dark:border-white/5 dark:bg-[#0D0D14]/90">
-        {[...MAIN_NAV, ...MANAGE_NAV].map((item) => {
+        {[...MAIN_NAV, ...MANAGE_NAV, ...(showAdmin ? ADMIN_NAV : [])].map((item) => {
           const active = pathname === item.href || pathname.startsWith(item.href + '/');
           const Icon = item.icon;
           return (

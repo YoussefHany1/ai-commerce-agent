@@ -20,6 +20,7 @@ import { useTheme } from '@/lib/theme';
 import { useLocale } from '@/lib/locale';
 import { initials } from '@/lib/utils';
 import { useSelectedStore } from '@/hooks/useStores';
+import { useSession, isClient } from '@/hooks/useSession';
 import { api } from '@/lib/api';
 
 function useClickOutside(onClose: () => void) {
@@ -137,9 +138,12 @@ export function UserMenu() {
   const { theme, toggleTheme } = useTheme();
   const { toggleLocale } = useLocale();
   const { activeStore } = useSelectedStore();
+  const who = useSession();
   const router = useRouter();
-  const name = activeStore?.name ?? 'Store Owner';
-  const email = activeStore?.shopDomain ?? 'owner@store.com';
+  // A client account names itself; an operator shows the active store instead.
+  const client = isClient(who.data) ? who.data : null;
+  const name = client?.name ?? activeStore?.name ?? 'Store Owner';
+  const email = client?.email ?? activeStore?.shopDomain ?? 'owner@store.com';
 
   const signOut = useCallback(async () => {
     setSigningOut(true);

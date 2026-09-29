@@ -11,8 +11,9 @@ const admin = postgres(process.env.PGADMIN_URL?.trim() || 'postgres://postgres:p
 // only takes effect if the tenant_operator_* policies are satisfied. Harmless
 // when PGADMIN_URL is a superuser (which bypasses RLS regardless) and required
 // when it is a non-superuser owner - without this the updates below would
-// silently match zero rows, the same failure mode as commit ac0a2de.
-await admin`select set_config('app.operator', 'true', false)`;
+// silently match zero rows, the same failure mode as commit ac0a2de. The claim
+// is the identity carrier policies read since 0010 (`app.operator` GUC is gone).
+await admin`select set_config('request.jwt.claims', '{"app":{"operator":"true"}}', false)`;
 
 const target = config.encryption.version;
 if (!config.encryption.keys[target]) {

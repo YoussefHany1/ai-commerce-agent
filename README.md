@@ -1,6 +1,6 @@
 # AI Commerce Agent
 
-Runnable MVP for an AI sales agent connected to ecommerce stores.
+Production-ready, multi-tenant AI sales agent connected to ecommerce stores (Shopify, Salla, Zid).
 
 Licensed under the MIT License (see LICENSE).
 
@@ -48,9 +48,10 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
 - Generic webhook ingestion for Shopify/Salla/Zid
 - Salla + Zid OAuth install flows with real provider adapters
 - Arabic test/admin UI
+- Operator dashboard (`web/` Next.js service): RTL analytics, store management, chat, billing, and automation views; roles for the operator and per-merchant client accounts (Phase 16)
 
 ## Phase 0 + 1 (persistence)
-- Postgres via Drizzle ORM, 16-table schema, `store_id` on every table
+- Postgres via Drizzle ORM, 17-table schema, `store_id` on every tenant table
 - Row-level security (RLS) enforced per tenant via a dedicated non-owner `agent_app` role; `drizzle/0004_security_rls.sql` enables RLS + policies on all tenant tables so it can't be skipped
 - AES-256-GCM token encryption at rest with versioned keys (`platform_connections.key_version`)
 - Conversation + message persistence on every chat turn
@@ -100,7 +101,7 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
 - Checkout/portal calls use `fetch` against `api.stripe.com` directly (restricted key), no SDK dependency
 
 ## Phase 8 (Analytics + attribution)
-- `serves/src/services/analytics.ts` — daily rollups into `daily_metrics` (per store/day): orders, revenue, conversations, messages, recommendations, clicks, conversions; zero-filled windows, idempotent upsert on `(store_id, day)`
+- `src/services/analytics.ts` — daily rollups into `daily_metrics` (per store/day): orders, revenue, conversations, messages, recommendations, clicks, conversions; zero-filled windows, idempotent upsert on `(store_id, day)`
 - `GET /api/metrics/:storeId?days=N` (1–90, default 14) — returns daily rows + totals; **plan-gated**: `trial`/`active` allowed, otherwise `402 payment_required` (billing gate from Phase 7)
 - `POST /api/attributions/click {productId}` — records a recommendation click (row-per conversation+product in `attributions`); requires a Bearer customer-session token (minted by `POST /api/session` with the admin key)
 - Conversion attribution: on `orders/create|update` webhooks (Shopify + generic), the customer's phone/email is matched to their conversations and clicked-but-unconverted recommendations are marked `converted_at`
@@ -187,7 +188,16 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
 - Env: `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), `OPENROUTER_MODEL` (default `openai/gpt-4o-mini`, must support tool calling), `OPENROUTER_EMBEDDING_MODEL`.
 - Still no provider available → the existing Arabic fallback reply is returned. Unit-tested conversions in `llm.spec.ts`.
 
-## Phase 9 (Job queue — retries + dead-letter)
+## Phase 16 (Merchant client accounts — two-role dashboard)
+
+Two credentials now unlock the dashboard: the **operator** (one global account, unchanged) and **clients** — merchant accounts that each own a subset of stores. The whole point of the layer is least privilege: the API checks ownership, not the UI.
+
+- **Invite-only accounts**: there is no public signup. An operator creates an account (normalized email) via `POST /api/clients` (dashboard Clients page) or `npm run client:create -- "<name>" <email>` — since Phase 17 the identity is created in Supabase Auth (`email_confirm: true`, so the printed one-time password works immediately). `clients` gained RLS policies; `stores.client_id` (nullable, `ON DELETE set null`) links a store to its owner. Migration `0009_clients.sql` (hand-written).
+- **Client login** (`POST /api/auth/client/login`, mirrored by the BFF login route): returns `{ ok, clientId, name, email, sid, epoch, expiresIn }`. The `sid` is an opaque Redis session; the account is re-read from the DB on *every* guarded call, so a suspension kills live sessions immediately. Uniform `401` for unknown email / wrong password / suspended account (dummy scrypt burn keeps timing uniform), escalating per-IP **and** per-email lockout (5 → 30s doubling to 15m, Redis-resident, survives redeploys). Credentials verify against the legacy scrypt hash for not-yet-imported accounts and against Supabase Auth once an account has a `supabase_uid` (Phase 17).
+- **Session epoch per account** (`cli:sess:epoch:{clientId}`): changing the password logs every other device out and re-signs the caller's sid; suspension or a password reset logs everyone out. The BFF verifies the cookie against the same epoch, so revocation is instant on both sides. `logout` revokes the sid; logins are rate-limited per IP.
+- **Guard precedence**: `requireDashboard` on every tenant data path now accepts the operator admin key **or** a valid client session — and when a request carries both, the **client session wins** (a possession can't silently upgrade to operator scope). A client reaching a store it doesn't own gets `404 store_not_found`; a client call missing `storeId` gets `400 store_required`. Operator-only routes (`requireApiKey`) are unchanged: clients admin surface, automation run, jobs run, store api-key issue, PDPL actions.
+- **Dashboard**: the web login has Operator and Store sign-in tabs; operators see a new Clients page (list/create/suspend/reactivate/reset password with a one-time temporary password); client sessions hide the operator admin nav and the Shopify OAuth install block. The BFF forwards `x-client-session: <sid>` for client sessions and never `x-api-key`; the API is still the source of truth. No CORS change — everything still flows through the same-origin proxy.
+- Protected routes, ownership checks, and lockout are covered by `requireDashboard` unit tests (`src/lib/auth.spec.ts`) and route-level specs (`src/tests/clientAccounts.spec.ts`, with an in-memory Redis harness). The operator epoch and account epochs use the same rotation scheme (random value on bump, not `INCR` — seeds are hex strings).
 - Durable job queue backed by the existing `jobs` table (`jobsRepo`): `enqueue`, `listDue`, `run` (atomic claim → success/fail/backoff), `retry`, `list` (tenant + operator)
 - `MAX_ATTEMPTS = 3`, exponential backoff (`BASE_DELAY_MS × 2^(n-1)`, capped); after exhausting attempts → status `dead`
 - Deduplication on enqueue: same `(store_id, type)` won't create a second `pending`/`running` row
@@ -198,6 +208,54 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
   - `metrics.rollup` — rollup last 3 days
 - `POST /api/jobs` (enqueue), `GET /api/jobs/:storeId?status=` (list), `POST /api/jobs/:jobId/retry` (reschedule dead), `POST /api/jobs/run` (sync ad-hoc)
 - Catalog interval (`src/workers/catalogSync.ts`) now **enqueues** `catalog.sync` jobs instead of processing inline — the worker executes them with retries
+
+## Phase 17 (Supabase Auth migration — client identities + claim-based RLS)
+
+Client (merchant) credentials now live in **Supabase Auth**, not the app database. The
+identity layer moved there so the install can stop holding merchant passwords; everything
+else — stores, orders, billing, the Redis session layer — stays app-owned. The app's
+Postgres may itself *be* Supabase's managed Postgres during the migration, which is exactly
+what the migration is engineered for.
+
+- **Identity**: each `clients` row links to a Supabase user via `clients.supabase_uid`
+  (unique, nullable). `password_hash` holds the legacy scrypt digest for accounts **not
+  yet imported**; linking an identity (`setSupabaseUid`) withdraws the hash, so a linked
+  account can only sign in through Supabase.
+- **Dual-mode login** (`src/routes/clientAuth.ts`): an account still holding `password_hash`
+  verifies the scrypt digest (with the dummy-hash burn for unknown emails); an account
+  without one verifies against Supabase (`signInWithPassword`, gated on a confirmed email
+  and on the auth user matching `supabase_uid`). Failures are a uniform `401`. Without
+  Supabase keys configured the API fails closed with `503 auth_unavailable`.
+- **Self-service flows** (web BFF under `web/app/api/auth/*` + `web/app/auth/*`):
+  `/register` creates the identity with `email_confirm:false` (Supabase mails the
+  confirmation link), `/forgot` issues a recovery email pointing at
+  `<APP_BASE_URL>/login/reset`, `/reset` verifies the one-time token, rotates the password,
+  bumps the account epoch (killing every older session) and signs the caller back in, and
+  `/auth/callback` completes Google OAuth (PKCE). All of it runs in the server runtime:
+  the Supabase token is exchanged for this app's own Redis session id and dropped before
+  anything reaches the browser. The client sends only email/password forms and follows
+  redirects.
+- **Operator invite & import**: `POST /api/clients` /
+  `npm run client:create` create the Supabase user with `email_confirm:true`, so the printed
+  one-time password works immediately. Existing scrypt accounts are bulk-migrated by
+  `npm run client:import-supabase` — reuses the identity when the email already has one,
+  links the row (hash withdrawn), then prints per-account recovery links for the operator
+  to forward (no mailer in this repo).
+- **Claim-based RLS**: `drizzle/0010_supabase_rls.sql` rewrites the tenant policies to
+  `request.jwt.claims` (a `public.auth_jwt()` shim is provided for non-Supabase Postgres).
+  The API still sets the claims inside the same transaction it does the work in, so
+  behavior is identical against plain local Postgres and Supabase's `authenticated` role.
+  `drizzle/0011_store_api_key_columns.sql` adds the `stores.api_key_hash`/`api_key_hint`
+  columns that `0005` was committed without.
+- **Env**: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` on the API;
+  `SUPABASE_URL` + `SUPABASE_ANON_KEY` on the web service (anon only — the service-role key
+  never enters the web service). `APP_BASE_URL` must be the dashboard origin, because it is
+  the base of the recovery link (`login/reset`) and must match Supabase's `SITE_URL`.
+- **Verification**: the RLS policies run against local Postgres in the integration suite
+  via the `auth_jwt()` shim (`src/tests/integration.spec.ts`); the Supabase code paths are
+  covered with a stubbed SDK in `src/tests/clientAccounts.spec.ts` and the web BFF route
+  specs (`web/app/**/*/route.spec.ts`, `web/app/auth/callback/route.spec.ts`). The one-pass
+  live check runs once real project credentials are configured.
 
 ## Phase 11 (Rate limiting — per tenant, Redis)
 - **Implementation:** custom store-scoped Redis fixed-window limiter in `src/lib/rateLimit.ts` — **not** the `@fastify/rate-limit` plugin named in the original roadmap (the custom limiter keys per `store_id` from day one and lives on Redis, which fits multi-tenant needs better than the IP-based plugin)
@@ -210,7 +268,7 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
 
 ## Production hardening (security blocks)
 - **Guest sessions** (`src/lib/session.ts` + `src/routes/session.ts`): `POST /api/session` (admin-keyed, rate-limited) mints a short-TTL opaque token stored in Redis (`sess:{sha256(token)}`, `SESSION_TTL_SECONDS`, default 1h). `/api/chat` and `/api/attributions/click` now require `Authorization: Bearer <token>` and derive `store_id`/`conversation/store_id` from the session — no tenant key from the client
-- **RLS in the migration**: `drizzle/0004_security_rls.sql` enables RLS + tenant/operator policies on all 16 tables, so the distance between "migrations applied" and "RLS enforced" is zero; role/grants still live in `scripts/apply-rls.ts` (fails closed in production if `APP_DB_PASSWORD` is missing)
+- **RLS in the migration**: `drizzle/0004_security_rls.sql` enables RLS + tenant/operator policies on all 17 tables, so the distance between "migrations applied" and "RLS enforced" is zero; role/grants still live in `scripts/apply-rls.ts` (fails closed in production if `APP_DB_PASSWORD` is missing)
 - **OAuth hardening** (`src/routes/oauth.ts`): redirect URIs are restricted to `APP_BASE_URL` + `OAUTH_REDIRECT_ALLOWLIST` (no open redirect), and `/start` caps state creation per IP (100/10 min → `429`)
 - **Webhook signatures per platform** (`src/lib/webhooks.ts`): Shopify `x-shopify-hmac-sha256`, Salla `x-salla-signature`, Zid `x-zid-signature`, plus the shared `x-hub-signature-256` fallback — all verified from the raw body, fail closed when the secret is unset
 - **Zid secret at rest**: the `authorization` JWT is stored in `store.settings` via `updateSettingsEncrypted` (AES-256-GCM) and read back decrypted by the adapter (`storeRepo.getSecret`); never plaintext
@@ -227,3 +285,5 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
 - billing/subscriptions
 - attribution and analytics
 - retry/dead-letter jobs
+
+The items above are now implemented end-to-end (see the phase sections and `docs/ARCHITECTURE.md`). One deliberate limitation remains: Salla/Zid *webhook* payload shapes are pinned to the same documented mappers the sync/backfill paths use (`src/lib/webhookApply.ts`), but only live provider stores can confirm the exact wrapper keys for every event type — until then, a payload that does not resolve to a known `order`/`product` shape is logged and skipped rather than written with a synthetic id.

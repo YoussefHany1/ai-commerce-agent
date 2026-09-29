@@ -2,6 +2,14 @@ import 'server-only';
 import { createClient } from 'redis';
 
 const EPOCH_KEY = 'op:sess:epoch';
+/**
+ * Client session epoch seed, mirroring `src/lib/clientSession.ts` on the API side:
+ * one shared Redis key per account holding the current session epoch. A bump here
+ * (password change, suspension, reset) revokes every cookie minted against the old
+ * value. A missing key is seeded like the operator epoch, so a Redis flush fails
+ * closed rather than resurrecting revoked client sessions.
+ */
+const CLIENT_EPOCH_PREFIX = 'cli:sess:epoch:';
 
 const GENERATED_BYTES = 16;
 
@@ -58,6 +66,18 @@ export async function currentEpoch(): Promise<string> {
   // NX so concurrent callers converge on one winner; the loser re-reads.
   await redis.set(EPOCH_KEY, fresh, { NX: true });
   return (await redis.get(EPOCH_KEY)) ?? fresh;
+}
+
+/** Client analogue of {@link currentEpoch}, keyed per dashboard account. */
+export async function currentClientEpoch(clientId: string): Promise<string> {
+  const key = `${CLIENT_EPOCH_PREFIX}${clientId}`;
+  const redis = await getRedis();
+  const existing = await redis.get(key);
+  if (existing) return existing;
+
+  const fresh = randomHex(GENERATED_BYTES);
+  await redis.set(key, fresh, { NX: true });
+  return (await redis.get(key)) ?? fresh;
 }
 
 function randomHex(bytes: number): string {

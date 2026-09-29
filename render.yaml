@@ -53,8 +53,11 @@ services:
     healthCheckPath: /api/health
     # Migrations and RLS run here, in the same image as the service, immediately
     # before the new version starts serving. `tsx` is a runtime dependency
-    # precisely so this works in the production image.
-    # preDeployCommand: npm run db:bootstrap
+    # precisely so this works in the production image. DATABASE_URL/PGADMIN_URL
+    # are injected before the command runs, so db:bootstrap (migrate + RLS) sees
+    # them; set them before the first deploy, or the API boots against an empty
+    # or unpolicied database.
+    preDeployCommand: npm run db:bootstrap
     envVars:
       - key: NODE_ENV
         value: production
@@ -123,9 +126,25 @@ services:
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
+      - key: STRIPE_PRICE_PRO
+        sync: false # Stripe price ids for the billing plan tiers (STRIPE_SECRET_KEY must also be set)
+      - key: STRIPE_PRICE_ENTERPRISE
+        sync: false
       - key: WHATSAPP_APP_SECRET
         sync: false
       - key: WHATSAPP_WEBHOOK_VERIFY_TOKEN
+        sync: false
+      # OpenRouter fallback: only needed when OpenAI is absent or failing (chat + embeddings).
+      - key: OPENROUTER_API_KEY
+        sync: false
+      # Salla and Zid install flows fail closed (503) without these client credentials.
+      - key: SALLA_CLIENT_ID
+        sync: false
+      - key: SALLA_CLIENT_SECRET
+        sync: false
+      - key: ZID_CLIENT_ID
+        sync: false
+      - key: ZID_CLIENT_SECRET
         sync: false
 
   - type: web

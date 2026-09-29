@@ -741,7 +741,7 @@ describe('routes: store-scoped api keys', () => {
   it('accepts the operator key via bearer token on tenant routes', async () => {
     const res = await app.inject({
       method: 'GET',
-      url: '/api/jobs/s1',
+      url: '/api/jobs/00000000-0000-4000-8000-000000000001',
       headers: { authorization: `Bearer ${ADMIN_KEY}` },
     });
     expect(res.statusCode).toBe(200);

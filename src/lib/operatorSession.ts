@@ -36,5 +36,9 @@ export async function ensureOperatorSessionEpoch(): Promise<string> {
 
 export async function bumpOperatorSessionEpoch(): Promise<string> {
   const redis = await getRedis();
-  return String(await redis.incr(OPERATOR_EPOCH_KEY));
+  // Rotate rather than INCR: the seed is a random hex string, which Redis INCR
+  // would refuse ("value is not an integer"). Invalidation only needs inequality.
+  const fresh = randomBytes(GENERATED_BYTES).toString('hex');
+  await redis.set(OPERATOR_EPOCH_KEY, fresh);
+  return fresh;
 }

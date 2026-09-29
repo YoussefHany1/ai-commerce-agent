@@ -5,6 +5,7 @@ import { rollupDailyMetrics } from '../services/analytics.js';
 import { purgeStorePii } from '../services/pdpl.js';
 import { logger } from '../lib/logger.js';
 import { withLock } from '../lib/lock.js';
+import { config } from '../config.js';
 
 const POLL_INTERVAL_MS = 3_000;
 const LOCK_TTL_MS = 60_000;
@@ -118,14 +119,21 @@ export const jobHandlers: Record<string, JobHandler> = {
     await rollupDailyMetrics(storeId, 3);
   },
   'retention.purge': async (storeId) => {
+    // The retention worker only *enqueues* purge jobs while the kill switch is
+    // up; this body enforces it at execution time too, so the one path that can
+    // run a purge job on demand (`/api/jobs/run` via resolveHandler) cannot
+    // bypass RETENTION_ENABLED.
+    if (!config.retentionEnabled) throw new Error('retention_disabled');
     await purgeStorePii(storeId);
   },
 };
 
 export function resolveHandler(type: string): JobHandler {
-  const fn = jobHandlers[type];
-  if (!fn) throw new Error(`unknown_job_type_${type}`);
-  return fn;
+  // Own-property lookup only: a bare truthiness check hands `Object` back for the
+  // string "constructor" (or "toString", "valueOf", …), and the route would then
+  // call `Object(storeId, payload)` — a confusing 500 at best.
+  if (!Object.hasOwn(jobHandlers, type)) throw new Error(`unknown_job_type_${type}`);
+  return jobHandlers[type];
 }
 
 export function startJobsWorker(): { stop(): void } {

@@ -1,11 +1,20 @@
 import 'server-only';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { currentEpoch } from './redis';
+import { currentEpoch, currentClientEpoch } from './redis';
 
 export const SESSION_COOKIE = 'aca_session';
 export const SESSION_TTL_SECONDS = 8 * 60 * 60;
 
-const PAYLOAD_VERSION = 1;
+/**
+ * Payload format version. Bumping this invalidates every existing cookie, which is
+ * the intended coupling: the v2 payload carries `kind` and, for client sessions,
+ * the account id, sid and display name that the proxy and the session endpoint
+ * previously had no way to express. Old v1 operator cookies must not half-verify
+ * against a v2 validator, so a version bump is a deliberate log-everyone-out.
+ */
+const PAYLOAD_VERSION = 2;
+
+export type SessionKind = 'operator' | 'client';
 
 export type SessionPayload = {
   /** Payload format version, so a future change can invalidate old cookies. */
@@ -14,8 +23,23 @@ export type SessionPayload = {
   iat: number;
   /** Expiry, epoch seconds. */
   exp: number;
-  /** Operator session epoch this cookie is bound to. */
+  /** Who owns this session: the install (operator) or a dashboard account (client). */
+  kind: SessionKind;
+  /**
+   * The epoch this cookie is bound to — the operator session epoch for
+   * `operator`, the account's client session epoch for `client`. A revocation
+   * (operator revoke script, a client password change or suspension) moves the
+   * epoch and this cookie stops verifying.
+   */
   epoch: string;
+  /** `client` only: the dashboard account id, displayed in the shell. */
+  clientId?: string;
+  /** `client` only: the raw session id the proxy forwards in `x-client-session`. */
+  sid?: string;
+  /** `client` only: display name for the shell. */
+  name?: string;
+  /** `client` only: contact for the shell. */
+  email?: string;
 };
 
 function secret(): string {
@@ -51,6 +75,18 @@ export type VerifyResult = { ok: true; payload: SessionPayload } | { ok: false; 
  * route. Middleware only needs to know whether the cookie is structurally valid so
  * it can send an unauthenticated visitor to the login page.
  */
+export function isSessionPayload(value: unknown): value is SessionPayload {
+  if (typeof value !== 'object' || value === null) return false;
+  const p = value as SessionPayload;
+  if (p.v !== PAYLOAD_VERSION) return false;
+  if (typeof p.iat !== 'number' || typeof p.exp !== 'number') return false;
+  if (p.kind !== 'operator' && p.kind !== 'client') return false;
+  if (typeof p.epoch !== 'string' || !p.epoch) return false;
+  if (p.kind === 'client' && (typeof p.clientId !== 'string' || !p.clientId)) return false;
+  if (p.kind === 'client' && (typeof p.sid !== 'string' || !p.sid)) return false;
+  return true;
+}
+
 export function verifySessionSignature(token: string | undefined, now = Date.now()): VerifyResult {
   if (!token) return { ok: false, reason: 'malformed' };
 
@@ -71,18 +107,14 @@ export function verifySessionSignature(token: string | undefined, now = Date.now
   const b = Buffer.from(expected);
   if (a.length !== b.length || !timingSafeEqual(a, b)) return { ok: false, reason: 'bad_signature' };
 
-  let payload: SessionPayload;
+  let payload: unknown;
   try {
-    payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as SessionPayload;
+    payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
   } catch {
     return { ok: false, reason: 'malformed' };
   }
 
-  if (payload.v !== PAYLOAD_VERSION) return { ok: false, reason: 'malformed' };
-  if (typeof payload.exp !== 'number' || typeof payload.iat !== 'number') {
-    return { ok: false, reason: 'malformed' };
-  }
-  if (typeof payload.epoch !== 'string' || !payload.epoch) return { ok: false, reason: 'malformed' };
+  if (!isSessionPayload(payload)) return { ok: false, reason: 'malformed' };
   if (payload.exp * 1000 <= now) return { ok: false, reason: 'expired' };
 
   return { ok: true, payload };
@@ -102,7 +134,12 @@ export async function verifySession(token: string | undefined): Promise<VerifyRe
 
   let epoch: string;
   try {
-    epoch = await currentEpoch();
+    // An operator cookie is bound to the global operator epoch; a client cookie to
+    // the account's own epoch. Both live in the same Redis the API writes.
+    epoch =
+      signature.payload.kind === 'client'
+        ? await currentClientEpoch(signature.payload.clientId!)
+        : await currentEpoch();
   } catch {
     return { ok: false, reason: 'unavailable' };
   }
@@ -113,7 +150,25 @@ export async function verifySession(token: string | undefined): Promise<VerifyRe
 
 export function newSessionPayload(epoch: string, now = Date.now()): SessionPayload {
   const iat = Math.floor(now / 1000);
-  return { v: PAYLOAD_VERSION, iat, exp: iat + SESSION_TTL_SECONDS, epoch };
+  return { v: PAYLOAD_VERSION, kind: 'operator', iat, exp: iat + SESSION_TTL_SECONDS, epoch };
+}
+
+export function newClientSessionPayload(
+  input: { clientId: string; sid: string; epoch: string; name?: string; email?: string },
+  now = Date.now(),
+): SessionPayload {
+  const iat = Math.floor(now / 1000);
+  return {
+    v: PAYLOAD_VERSION,
+    kind: 'client',
+    iat,
+    exp: iat + SESSION_TTL_SECONDS,
+    epoch: input.epoch,
+    clientId: input.clientId,
+    sid: input.sid,
+    name: input.name,
+    email: input.email,
+  };
 }
 
 /**

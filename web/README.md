@@ -24,23 +24,42 @@ set `SESSION_COOKIE_SECURE=false`, or the browser will refuse to store the cooki
 
 ## How authentication works
 
-The browser never holds a credential. It posts the operator password once to this
-app's own `/api/auth/login`, which forwards it to the API's
-`/api/auth/operator/verify`; the API checks the scrypt hash and a Redis-backed
-attempt counter, then returns the current session epoch. This app mints an
-`HttpOnly` `aca_session` cookie (8h, `Secure`, `SameSite=Lax`) bound to that epoch.
+The browser never holds a credential. It posts the password once to this app's own
+`/api/auth/login`, which forwards to the API: the operator branch hits
+`/api/auth/operator/verify` (scrypt hash + Redis attempt counter → session epoch), the store
+(merchant client) branch hits `/api/auth/client/login` and receives a `sid` bound to the
+account's epoch. This app mints an `HttpOnly` `aca_session` cookie (8h, `Secure`,
+`SameSite=Lax`) carrying the credential type (`operator` | `client`), the matching epoch, and
+— for clients — the sid and account identity.
 
-Every data call then goes to this app's own `/api/*` route handlers, which verify
-the cookie, check the epoch against Redis, and attach `ADMIN_API_KEY` when calling
-the API. Consequences worth knowing:
+Every data call goes to this app's own `/api/*` route handlers, which verify the cookie and
+check the epoch against Redis, then call the API:
+
+- **operator**: attaches `ADMIN_API_KEY`.
+- **client**: attaches `x-client-session: <sid>` and **never** `x-api-key`.
+
+Client accounts (merchant login/register/forgot/reset, Google OAuth) sign in through
+**Supabase Auth**, served by dedicated BFF routes (`/api/auth/client/login`,
+`/register`, `/forgot`, `/reset`, `/auth/callback`): the email/password form, the PKCE
+OAuth exchange, and the password-reset OTP all happen against Supabase in the server
+runtime, and the browser only ever receives this app's own `aca_session` cookie. Leave
+`SUPABASE_URL`/`SUPABASE_ANON_KEY` unset and the client branch stays closed (fail-closed
+`503`s on the web side).
+
+The API is still the source of truth: it re-resolves the sid, re-reads the account status and
+store ownership on every guarded call, and its epoch keys are what make revocation instant.
+Consequences worth knowing:
 
 - `NEXT_PUBLIC_ADMIN_API_KEY` does not exist and must not be reintroduced. Any
   `NEXT_PUBLIC_`-prefixed value is inlined into the public bundle.
 - `REDIS_URL` must point at the same Redis as the API. It is what makes
-  `npm run revoke-operator-sessions` on the API take effect here.
+  `npm run revoke-operator-sessions` on the API take effect here, and what lets client
+  suspension/password resets log every live client out (`cli:sess:epoch:{clientId}`).
+- The client cookie is minted for the lifetime the API returns (`expiresIn` =
+  `CLIENT_SESSION_TTL_SECONDS` on the API), so that one knob governs both sides.
 - The API no longer needs to be CORS-reachable from a browser.
-- Revoking a session on the API also signs the operator out of this service,
-  because both compare the same epoch.
+- When a request would carry both a client session and the admin key, the API treats it as
+  the client (a possession cannot upgrade to operator scope).
 
 `web/proxy.ts` redirects signed-out visitors away from `/dashboard` on the Edge
 runtime, where neither `node:crypto` nor Redis is available, so it checks cookie
@@ -51,8 +70,12 @@ the signature and epoch on every request.
 
 `app/api/[...path]/route.ts` forwards a fixed allowlist of method-and-path pairs
 (`lib/server/upstream.ts`) and 404s anything else. It also caps request bodies at
-256 KiB, requires `application/json` on bodied requests, drops inbound `x-api-key`
-and `cookie` headers, and does not relay a caller-supplied `x-forwarded-for`.
+256 KiB, requires `application/json` on bodied requests, drops inbound `x-api-key`,
+`x-client-session` and `cookie` headers, and does not relay a caller-supplied
+`x-forwarded-for`. The allowlist includes the client-admin surface operators use on
+the dashboard (`GET/POST /api/clients`, `PATCH /api/clients/:id/status`,
+`POST /api/clients/:id/reset-password`); store attach/detach (`POST/DELETE
+/api/clients/:id/stores`) stays CLI/API-only.
 
 `lib/server/upstream.spec.ts` mirrors the call sites in `lib/api.ts`, so adding an
 API method without an allowlist rule fails a test rather than returning 404 at
@@ -62,10 +85,11 @@ runtime.
 
 | Route                      | Purpose                                                   |
 | -------------------------- | --------------------------------------------------------- |
-| `/login`                   | Operator sign in; accepts a `?next=` return path          |
+| `/login`                   | Operator or store (client) sign in; accepts a `?next=` return path |
 | `/dashboard`               | KPI cards, revenue/conversations/funnel charts, quick chat |
 | `/dashboard/analytics`     | Attribution table, top products, sources funnel, lag chart |
-| `/dashboard/stores`        | Store cards, add-store modal + Shopify OAuth, disconnect   |
+| `/dashboard/clients`       | Operator-only: invite, suspend/reactivate, reset client passwords |
+| `/dashboard/stores`        | Store cards, add-store modal + Shopify OAuth, disconnect. Shopify OAuth install is hidden from client sessions |
 | `/dashboard/automation`    | Automation rules, toggle, create drawer, delete dialog     |
 | `/dashboard/billing`       | Plan cards, Stripe checkout/portal, trial status           |
 | `/dashboard/settings`      | WhatsApp channel config, live health, danger zone          |
@@ -78,6 +102,8 @@ runtime.
 | `API_URL`               | no     | —                       | Server-side upstream target for the proxy                       |
 | `ADMIN_API_KEY`         | no     | —                       | Operator credential the proxy attaches; must match the API       |
 | `SESSION_SECRET`        | no     | —                       | HMAC key for the session cookie, min 32 chars                    |
+| `SUPABASE_URL`          | no     | —                       | Supabase project URL for client auth (BFF-side)                  |
+| `SUPABASE_ANON_KEY`     | no     | —                       | Anon (public) key, not the service-role key; never inlined       |
 | `REDIS_URL`             | no     | —                       | Same Redis as the API, for the session epoch                     |
 | `SESSION_COOKIE_SECURE` | no     | `Secure` in production  | Set `false` for local http                                       |
 

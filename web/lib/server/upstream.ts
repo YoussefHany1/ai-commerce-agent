@@ -43,6 +43,13 @@ const ALLOWLIST: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   { method: 'POST', pattern: /^\/automation\/run$/ },
   { method: 'GET', pattern: /^\/jobs\/[^/]+$/ },
   { method: 'POST', pattern: /^\/jobs\/[^/]+\/retry$/ },
+  // Operator account admin. The API still enforces the admin key on these, so a
+  // client session proxied here gets the API's own 401 `unauthorized` rather than
+  // any data.
+  { method: 'GET', pattern: /^\/clients$/ },
+  { method: 'POST', pattern: /^\/clients$/ },
+  { method: 'PATCH', pattern: /^\/clients\/[^/]+\/status$/ },
+  { method: 'POST', pattern: /^\/clients\/[^/]+\/reset-password$/ },
 ];
 
 /**
@@ -117,14 +124,32 @@ export function normalizeApiPath(segments: string[] | undefined): string | null 
 }
 
 /**
+ * Which credential the proxy presents to the API for this request.
+ *
+ * The operator presentation is the admin API key, attached server-side and never
+ * seen by the browser. A client session presents the raw session id it holds in
+ * its signed cookie, forwarded as `x-client-session`; the API is authoritative
+ * for it (Redis liveness + account status), so the proxy hands over only enough
+ * to authenticate, never a credential with wider scope than the cookie's owner.
+ * A client must never be proxied with the admin key, so the two presentations
+ * are mutually exclusive by construction.
+ */
+export type UpstreamPrincipal =
+  | { kind: 'operator' }
+  | { kind: 'client'; sid: string };
+
+/**
  * Builds the upstream request headers.
  *
  * The operator's API key is attached here and nowhere else — it is read from a
- * server-only environment variable and never reaches the browser. Any inbound
- * `x-api-key` or `cookie` is dropped so a caller cannot inject or override
- * credentials. `authorization` is forwarded because the customer-facing chat and
- * session endpoints authenticate with a bearer token rather than the operator key;
- * no operator-guarded route in the allowlist reads that header.
+ * server-only environment variable and never reaches the browser. A client
+ * request swaps it for `x-client-session`, so a client's every data call is
+ * scoped by the API to exactly the account it belongs to. Any inbound
+ * `x-api-key`, `x-client-session` or `cookie` is dropped so a caller cannot
+ * inject or override credentials. `authorization` is forwarded because the
+ * customer-facing chat and session endpoints authenticate with a bearer token
+ * rather than the operator key; no operator-guarded route in the allowlist reads
+ * that header.
  *
  * `x-forwarded-for` is deliberately not forwarded. A Next route handler has no
  * trustworthy socket address, so any value available here is client-asserted, and
@@ -132,9 +157,17 @@ export function normalizeApiPath(segments: string[] | undefined): string | null 
  * Omitting it means the API sees this service's egress address, which is
  * spoof-proof. The trade-off is documented in DEPLOYMENT.md.
  */
-export function buildUpstreamHeaders(incoming: Headers, contentType: string | null): Headers {
+export function buildUpstreamHeaders(
+  incoming: Headers,
+  contentType: string | null,
+  principal: UpstreamPrincipal,
+): Headers {
   const headers = new Headers();
-  headers.set('x-api-key', requireApiKey());
+  if (principal.kind === 'operator') {
+    headers.set('x-api-key', requireApiKey());
+  } else {
+    headers.set('x-client-session', principal.sid);
+  }
 
   if (contentType) headers.set('content-type', contentType);
 

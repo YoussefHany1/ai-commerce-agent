@@ -13,7 +13,7 @@ import { answerWithTools, toChatHistory } from '../services/agent.js';
 import { retrieve, embedMissingCatalog } from '../services/retrieval.js';
 import { dbPing, redisPing, rlsPing } from '../lib/health.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey, requireStoreOrOperator, sha256Hex } from '../lib/auth.js';
+import { requireApiKey, requireDashboard, sha256Hex, type Principal } from '../lib/auth.js';
 import { requireSession, type CustomerSession } from '../lib/session.js';
 import { config } from '../config.js';
 
@@ -44,16 +44,18 @@ export async function api(app: FastifyInstance) {
 
   app.get(
     '/api/stores',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
-    async () => {
-    const rows = await storeRepo.list();
+    { preHandler: [requireDashboard(), storeRateLimitWindow('api', apiWindow)] },
+    async (req) => {
+    const principal = (req as any).principal as Principal;
+    // A client sees only its own stores (RLS-scoped); the operator sees all.
+    const rows = principal.kind === 'client' ? await storeRepo.listForClient(principal.clientId) : await storeRepo.list();
     return rows.map(storeToPublic);
   });
 
   app.post(
     '/api/stores',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
-    async (req) => {
+    { preHandler: [requireDashboard(), storeRateLimitWindow('api', apiWindow)] },
+    async (req, rep) => {
     const body = z
       .object({
         name: z.string().min(1),
@@ -62,7 +64,20 @@ export async function api(app: FastifyInstance) {
         accessToken: z.string().optional(),
       })
       .parse(req.body);
-    const id = await storeRepo.create(body);
+
+    // Manual duplicate guard: (platform, shop_domain) has no DB unique index.
+    if (body.shopDomain) {
+      const existing = await storeRepo.findByPlatformAndDomain(body.platform, body.shopDomain);
+      if (existing) return rep.code(409).send({ error: 'store_already_exists' });
+    }
+
+    const principal = (req as any).principal as Principal;
+    // A client creates its store inside its own scope, so the WITH CHECK clause on
+    // tenant_client_stores proves the row is being scoped to the caller.
+    const id =
+      principal.kind === 'client'
+        ? await storeRepo.create({ ...body, clientId: principal.clientId })
+        : await storeRepo.create(body);
 
     // Manually added stores never went through saveInstall, so they miss the
     // install-time kick. Enqueue the order backfill here too, otherwise a store
@@ -79,7 +94,7 @@ export async function api(app: FastifyInstance) {
 
   app.delete(
     '/api/stores/:storeId',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireDashboard((req) => (req.params as { storeId?: string }).storeId), storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);
@@ -127,7 +142,7 @@ export async function api(app: FastifyInstance) {
 
   app.get(
     '/api/products/:storeId',
-    { preHandler: [requireStoreOrOperator((req) => (req.params as { storeId?: string }).storeId), storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireDashboard((req) => (req.params as { storeId?: string }).storeId, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);

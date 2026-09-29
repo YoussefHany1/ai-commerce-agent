@@ -69,6 +69,10 @@ Optional rotation values: `ADMIN_API_KEY_PREVIOUS` and `OPERATOR_PASSWORD_HASH_P
 are accepted alongside their current counterparts so a secret can be rotated across two
 deploys. Clear the `_PREVIOUS` value on the deploy after the rotation.
 
+Optional: `CLIENT_SESSION_TTL_SECONDS` (seconds, default `28800` = 8h) — how long a merchant
+client stays signed in. The API returns it as `expiresIn` and the dashboard mints its cookie
+for the same lifetime, so it is a single knob.
+
 ## Operator access and session revocation
 
 The dashboard (`web/`) is a separate service that authenticates with a signed session
@@ -89,6 +93,31 @@ Failed operator logins are counted in Redis: five failures triggers a lockout st
 endpoint returns `503` rather than skipping the check, so a Redis outage cannot be used to
 brute-force the password.
 
+### Client accounts (merchants) and their sessions
+
+The dashboard also signs in merchant **client accounts** — invite-only, each owning a subset
+of stores. The web service reuses the same Redis and verifies client cookies against the same
+epoch keys, so suspension and password resets revoke live sessions instantly:
+
+- **Inviting**: dashboard Clients page (operator-only) or
+  `npm run client:create -- "<Name>" <email@example.com>` — emails are normalized (trimmed,
+  lower-cased), and the first login hands out a temporary password that must be changed.
+- **Attaching stores** (operator-only, CLI/API):
+  ```bash
+  curl -X POST -H "X-Api-Key: $ADMIN_API_KEY" -H "content-type: application/json" \
+    -d '{"storeId":"<storeId>"}' http://localhost:3000/api/clients/<clientId>/stores
+  # detach: curl -X DELETE -H "X-Api-Key: $ADMIN_API_KEY" \
+  #   http://localhost:3000/api/clients/<clientId>/stores/<storeId>
+  ```
+- **Ownership is enforced by the API, not the UI**: every guarded data call re-resolves the
+  client session and checks the targeted store belongs to the account (`404 store_not_found`
+  otherwise). When a request carries both a client session and the admin key, the **session
+  wins** — possession cannot upgrade to operator scope.
+- **Revocation**: client sessions live in Redis (`cli:sess:…` plus a per-account epoch key
+  `cli:sess:epoch:{clientId}`). Changing the password logs out every other device (the caller
+  is re-signed); suspending an account or resetting its password via the Clients page bumps
+  the epoch and kills every live sid.
+
 ### What the API sees as the client address
 
 The dashboard proxy does **not** forward `X-Forwarded-For`. It cannot: a browser can set
@@ -104,6 +133,11 @@ to originate from the proxy's own address, and two consequences follow:
   never sees the real address.
 - Rate limits on proxied API routes are shared across all dashboard traffic. Size them for
   your operator count, not your customer count.
+
+Client login counts failures **per IP and per email**. Through the dashboard, the IP bucket is
+effectively global (the API sees the proxy's address, exactly as for the operator); the email
+bucket still isolates one account's spray from every other account. The trade is identical to
+the operator one above and deliberate for the same reason.
 
 Set `TRUST_PROXY` on the API exactly as described above: it governs the address of requests
 that reach the API *directly* (OAuth callbacks, webhooks, health checks, anything scripted).
@@ -130,7 +164,10 @@ before the first deploy:
    `vector(1536)` column. Create the database at a provider that does (Neon, Supabase,
    Timescale) and set `DATABASE_URL` / `PGADMIN_URL` on the API service. The blueprint
    ships no `databases:` block at all, because one referencing Render Postgres could
-   never satisfy the requirement above.
+   never satisfy the requirement above. Once the Phase 17 migration is applied, a
+   Supabase-managed Postgres is a first-class target: the RLS is rewritten onto
+   `request.jwt.claims` (with `public.auth_jwt()` provided for non-Supabase hosts) and
+   the API connects as the `authenticated` role, so the migrated policies hold there.
 2. **`API_URL` is set by hand** on the dashboard service. Use the private-network origin,
    `http://agent-api:10000` — `10000` is Render's default `PORT`, which `src/server.ts`
    binds to. A Blueprint cannot compose the `host` and `port` properties into a single
@@ -195,6 +232,18 @@ When unset the server still logs errors and proceeds without Sentry.
    Hand the `sk_live_…` key to the merchant/agent dashboard. It is stored only as a
    SHA-256 hash (`stores.api_key_hash`) plus a 4-char hint; the hint is shown by
    `GET /api/stores/<storeId>/keys`. Revoke/rotate with `DELETE …/keys` then re-issue.
+7. Invite merchant client accounts (operator-only, CLI or the dashboard Clients page) and
+   attach their stores:
+   ```bash
+   npm run client:create -- "Acme Inc" acme@example.com   # shows a one-time temporary password
+   curl -X POST -H "X-Api-Key: $ADMIN_API_KEY" -H "content-type: application/json" \
+     -d '{"storeId":"<storeId>"}' http://localhost:3000/api/clients/<clientId>/stores
+   ```
+   The account lives in Supabase Auth (`email_confirm: true`, so the temporary
+   password works immediately). The client signs in on the dashboard (Login →
+   Store) with that email and the temporary password, then manages their own
+   stores. They can move to a password of their own via the Forgot-password email
+   recovery link or the API's authenticated change-password route.
 
 ## Runbook — rotation, upgrades, incidents
 

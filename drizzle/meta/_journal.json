@@ -64,6 +64,27 @@
       "when": 1790500000000,
       "tag": "0008_order_backfill",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790600000000,
+      "tag": "0009_clients",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790700000000,
+      "tag": "0010_supabase_rls",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790700001000,
+      "tag": "0011_store_api_key_columns",
+      "breakpoints": true
     }
   ]
 }

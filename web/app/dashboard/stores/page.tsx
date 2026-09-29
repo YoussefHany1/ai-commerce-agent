@@ -15,6 +15,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { useSelectedStore, useCreateStore, STORES_KEY } from '@/hooks/useStores';
+import { useSession, isClient } from '@/hooks/useSession';
 import { API_BASE_URL, api, isSessionExpired } from '@/lib/api';
 import type { Store } from '@/lib/types';
 
@@ -37,6 +38,11 @@ export default function StoresPage() {
   const { stores, isLoading, isError, error, storeId, setActiveStoreId } = useSelectedStore();
   const createStore = useCreateStore();
   const queryClient = useQueryClient();
+  const who = useSession();
+  // The Shopify OAuth install is an operator flow: its callback creates a store
+  // keyed to the operator, which a client account cannot see. Clients connect
+  // stores by pasting credentials instead.
+  const clientSession = isClient(who.data);
 
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm);
@@ -214,13 +220,17 @@ export default function StoresPage() {
             label="Access token"
             placeholder="shpat_…"
             type="password"
-            hint="Required for Salla/Zid. Optional for Shopify — use OAuth below."
+            hint={
+              clientSession
+                ? 'Required for Salla/Zid. For Shopify, paste a token from the admin so the agent can read products.'
+                : 'Required for Salla/Zid. Optional for Shopify — use OAuth below.'
+            }
             value={form.accessToken}
             onChange={(e) => setForm((f) => ({ ...f, accessToken: e.target.value }))}
             error={errors.accessToken}
           />
 
-          {form.platform === 'shopify' && (
+          {!clientSession && form.platform === 'shopify' && (
             <div className="flex flex-col gap-2 rounded-xl border border-slate-200/70 bg-slate-50/60 p-4 dark:border-white/5 dark:bg-white/[0.02]">
               <p className="text-xs font-medium text-slate-500 dark:text-slate-400">
                 Prefer one-click setup?

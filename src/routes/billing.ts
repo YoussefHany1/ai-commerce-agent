@@ -5,7 +5,7 @@ import { billingRepo, storeRepo } from '../db/repos.js';
 import { verifyStripeSignature } from '../lib/webhooks.js';
 import { createCheckoutSession, createPortalSession } from '../integrations/stripe.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireStoreOrOperator } from '../lib/auth.js';
+import { requireDashboard } from '../lib/auth.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
 const bodyStoreIdRef = (req: any) => (req.body as { storeId?: string })?.storeId;
@@ -34,7 +34,7 @@ function planFromSubscription(obj: any): string {
 export async function billing(app: FastifyInstance) {
   app.post(
     '/api/billing/checkout',
-    { preHandler: [requireStoreOrOperator(bodyStoreIdRef), storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireDashboard(bodyStoreIdRef, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = z.object({ storeId: z.string(), plan: z.enum(['pro', 'enterprise']) }).parse(req.body);
       const store = await storeRepo.get(body.storeId);
@@ -46,7 +46,7 @@ export async function billing(app: FastifyInstance) {
 
   app.post(
     '/api/billing/portal',
-    { preHandler: [requireStoreOrOperator(bodyStoreIdRef), storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireDashboard(bodyStoreIdRef, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = z.object({ storeId: z.string() }).parse(req.body);
       const sub = await billingRepo.byStore(body.storeId);
@@ -56,7 +56,7 @@ export async function billing(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/billing/status/:storeId', { preHandler: [requireStoreOrOperator(paramStoreIdRef), storeRateLimitWindow('api', apiWindow)] }, async (req, reply) => {
+  app.get('/api/billing/status/:storeId', { preHandler: [requireDashboard(paramStoreIdRef, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] }, async (req, reply) => {
     const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
     const store = await storeRepo.get(storeId);
     if (!store) return reply.code(404).send({ error: 'store_not_found' });

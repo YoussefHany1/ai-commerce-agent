@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { automationRepo } from '../db/repos.js';
 import { runAllAutomation } from '../services/automation.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey, requireStoreOrOperator } from '../lib/auth.js';
+import { requireApiKey, requireDashboard } from '../lib/auth.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -23,7 +23,7 @@ const updateSchema = createSchema.partial().required({ storeId: true });
 export async function automation(app: FastifyInstance) {
   app.post(
     '/api/automation/rules',
-    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireDashboard(storeIdRef, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = createSchema.parse(req.body);
       const id = await automationRepo.create(body.storeId, body);
@@ -31,14 +31,14 @@ export async function automation(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/automation/rules/:storeId', { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] }, async (req) => {
+  app.get('/api/automation/rules/:storeId', { preHandler: [requireDashboard(storeIdRef, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] }, async (req) => {
     const { storeId } = z.object({ storeId: z.string().min(1) }).parse(req.params);
     return { storeId, rules: await automationRepo.list(storeId) };
   });
 
   app.put(
     '/api/automation/rules/:ruleId',
-    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireDashboard(storeIdRef, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { ruleId } = z.object({ ruleId: z.string().min(1) }).parse(req.params);
       const body = updateSchema.parse(req.body);
@@ -50,7 +50,7 @@ export async function automation(app: FastifyInstance) {
 
   app.delete(
     '/api/automation/rules/:ruleId',
-    { preHandler: [requireStoreOrOperator(storeIdRef), storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireDashboard(storeIdRef, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const { ruleId } = z.object({ ruleId: z.string().min(1) }).parse(req.params);
       const body = z.object({ storeId: z.string() }).parse(req.body);

@@ -1,11 +1,17 @@
 import { NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { SESSION_COOKIE, verifySession } from '@/lib/server/session';
-import { buildUpstreamHeaders, isAllowed, MAX_BODY_BYTES, normalizeApiPath } from '@/lib/server/upstream';
+import {
+  buildUpstreamHeaders,
+  isAllowed,
+  MAX_BODY_BYTES,
+  normalizeApiPath,
+  type UpstreamPrincipal,
+} from '@/lib/server/upstream';
 
 export const dynamic = 'force-dynamic';
 
-const METHODS = ['GET', 'POST', 'PUT', 'DELETE'] as const;
+const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 type Method = (typeof METHODS)[number];
 
 /**
@@ -15,9 +21,10 @@ type Method = (typeof METHODS)[number];
  * (e.g. DELETE /automation/rules/:id) and the client sends it. Excluding DELETE
  * silently dropped the body, so the upstream parsed `req.body ?? {}` and failed
  * validation on every call. Including it also means a bodied DELETE must send
- * application/json, which extends the CSRF property below to DELETE.
+ * application/json, which extends the CSRF property below to DELETE. PATCH is
+ * included the same way for the account status route.
  */
-const BODIED = new Set<Method>(['POST', 'PUT', 'DELETE']);
+const BODIED = new Set<Method>(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 function json(body: unknown, status: number): NextResponse {
   return NextResponse.json(body, { status });
@@ -87,10 +94,17 @@ async function handler(request: Request, ctx: { params: Promise<{ path?: string[
     // `session_expired`, not `unauthorized`: the upstream's own key rejection uses
     // the same `unauthorized` body (src/lib/auth.ts), and a relayed upstream 401
     // would otherwise be indistinguishable from a dead session. The client reads
-    // this code to decide whether to send the operator back to /login, so a
+    // this code to decide whether to send the session holder back to /login, so a
     // misconfigured proxy surfaces as a server error instead of a login loop.
     return json({ error: 'session_expired' }, 401);
   }
+
+  // The cookie's kind decides which credential the upstream sees. A client
+  // forwards its sid (`x-client-session`) and never the operator key.
+  const principal: UpstreamPrincipal =
+    session.payload.kind === 'client'
+      ? { kind: 'client', sid: session.payload.sid! }
+      : { kind: 'operator' };
 
   const { path } = await ctx.params;
   const apiPath = normalizeApiPath(path);
@@ -133,7 +147,7 @@ async function handler(request: Request, ctx: { params: Promise<{ path?: string[
   try {
     upstream = await fetch(target, {
       method,
-      headers: buildUpstreamHeaders(request.headers, body ? 'application/json' : null),
+      headers: buildUpstreamHeaders(request.headers, body ? 'application/json' : null, principal),
       body,
       redirect: 'manual',
       cache: 'no-store',
@@ -159,4 +173,5 @@ async function handler(request: Request, ctx: { params: Promise<{ path?: string[
 export const GET = handler;
 export const POST = handler;
 export const PUT = handler;
+export const PATCH = handler;
 export const DELETE = handler;

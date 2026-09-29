@@ -6,7 +6,7 @@ import { verifyHubSignature } from '../lib/webhooks.js';
 import { answerWithTools, toChatHistory } from '../services/agent.js';
 import { sendText } from '../integrations/whatsapp.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey, requireStoreOrOperator } from '../lib/auth.js';
+import { requireApiKey, requireDashboard } from '../lib/auth.js';
 import { logger } from '../lib/logger.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -42,7 +42,7 @@ export async function whatsapp(app: FastifyInstance) {
 
   app.post(
     '/api/whatsapp/channels',
-    { preHandler: [requireStoreOrOperator((req) => (req.body as { storeId?: string })?.storeId), storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireDashboard((req) => (req.body as { storeId?: string })?.storeId, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = z
         .object({

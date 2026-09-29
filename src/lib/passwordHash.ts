@@ -14,8 +14,11 @@ const KEYLEN = 64;
 const SALT_BYTES = 16;
 const MAX_N = 1 << 20;
 
-export const MIN_OPERATOR_PASSWORD_LENGTH = 12;
-export const MAX_OPERATOR_PASSWORD_LENGTH = 1024;
+export const MIN_PASSWORD_LENGTH = 12;
+/** The operator constants are kept as aliases for existing call sites and scripts. */
+export const MIN_OPERATOR_PASSWORD_LENGTH = MIN_PASSWORD_LENGTH;
+export const MAX_PASSWORD_LENGTH = 1024;
+export const MAX_OPERATOR_PASSWORD_LENGTH = MAX_PASSWORD_LENGTH;
 
 /**
  * Encoded form: `scrypt$<N>$<r>$<p>$<saltHex>$<hashHex>`.
@@ -52,6 +55,18 @@ export async function hashOperatorPassword(password: string): Promise<string> {
   return [PREFIX, PARAMS.N, PARAMS.r, PARAMS.p, salt.toString('hex'), key.toString('hex')].join('$');
 }
 
+/**
+ * The same scrypt format, under a name that does not claim to be operator-only.
+ *
+ * `clients.password_hash` stores the identical encoding, so there is exactly one
+ * hasher and one verifier for every password in the system; the "operator" names
+ * are kept because `operatorAuth.ts`, the config boot checks and the provisioning
+ * scripts already import them.
+ */
+export function hashPassword(password: string): Promise<string> {
+  return hashOperatorPassword(password);
+}
+
 export async function verifyOperatorPassword(password: string, stored: string): Promise<boolean> {
   if (!isOperatorHashFormat(stored)) return false;
   if (password.length > MAX_OPERATOR_PASSWORD_LENGTH) return false;
@@ -69,4 +84,8 @@ export async function verifyOperatorPassword(password: string, stored: string): 
     return false;
   }
   return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export function verifyPassword(password: string, stored: string): Promise<boolean> {
+  return verifyOperatorPassword(password, stored);
 }

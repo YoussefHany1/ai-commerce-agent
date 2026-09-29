@@ -1,11 +1,19 @@
 import { catalogRepo, orderRepo, storeRepo } from '../db/repos.js';
 import { markConversionsForOrder } from '../services/analytics.js';
-import { logger } from '../lib/logger.js';
+import { logger } from './logger.js';
 import type { Product, Order, Platform } from '../types.js';
-import type { WebhookEvent } from '../lib/webhooks.js';
+import type { WebhookEvent } from './webhooks.js';
+// Salla/Zid payload shapes are pinned to those the sync + order-backfill paths
+// already document and unit-test, so a webhook resolves to exactly the same
+// Order/Product as the API responses it mirrors. See the mappers' fixtures in
+// src/integrations/{salla,zid}.spec.ts.
+import { mapSallaOrder, mapSallaProduct } from '../integrations/salla.js';
+import { mapZidOrder, mapZidProduct } from '../integrations/zid.js';
 
-function mapShopifyProduct(p: Record<string, any>): Product | null {
-  const variants = (p.variants ?? []) as Record<string, any>[];
+type RawEntity = Record<string, any>;
+
+function mapShopifyProduct(p: RawEntity): Product | null {
+  const variants = (p.variants ?? []) as RawEntity[];
   const v = variants.find((x) => x != null) ?? {};
   if (!p.id) return null;
   return {
@@ -19,6 +27,18 @@ function mapShopifyProduct(p: Record<string, any>): Product | null {
     sku: v.sku ?? undefined,
   };
 }
+
+// Platform-pinned entity mappers. `mapSallaOrder`/`mapZidOrder` accept the
+// documented raw API shapes; the webhook wrapper entities are structurally the
+// same records those mappers already parse.
+const orderMappers: Partial<Record<Platform, (raw: RawEntity) => Order>> = {
+  salla: (raw) => mapSallaOrder(raw as Parameters<typeof mapSallaOrder>[0]),
+  zid: (raw) => mapZidOrder(raw as Parameters<typeof mapZidOrder>[0]),
+};
+const productMappers: Partial<Record<Platform, (raw: RawEntity) => Product>> = {
+  salla: (raw) => mapSallaProduct(raw as Parameters<typeof mapSallaProduct>[0]),
+  zid: (raw) => mapZidProduct(raw as Parameters<typeof mapZidProduct>[0]),
+};
 
 function mapShopifyOrder(o: Record<string, any>): Order | null {
   if (!o.id) return null;
@@ -36,7 +56,7 @@ function mapShopifyOrder(o: Record<string, any>): Order | null {
   };
 }
 
-function mapGenericSingle<T extends Record<string, any>>(
+function mapGenericSingle<T extends RawEntity>(
   payload: Record<string, unknown>,
   getters: string[],
 ): T | null {
@@ -78,33 +98,33 @@ export async function applyWebhook(
     return;
   }
 
-  const type = event.type.toLowerCase();
-  const order = mapGenericSingle<Record<string, any>>(event.payload, ['order', 'order_data']);
-  if (type.includes('order') && order) {
-    const mapped: Order = {
-      id: String(order.id ?? event.payload.order_id ?? 'order-missing-id'),
-      status: order.status ?? null,
-      paymentStatus: order.payment_status ?? null,
-      total: Number(order.total ?? order.amount ?? 0),
-      currency: order.currency ?? 'SAR',
-      customer: order.customer
-        ? { name: order.customer.name, phone: order.customer.phone, email: order.customer.email }
-        : undefined,
-    };
-    await orderRepo.upsert(storeId, mapped);
-    await markConversionsForOrder(storeId, mapped);
+  if (platform !== 'salla' && platform !== 'zid') {
+    logger.warn({ platform }, 'webhook: no pinned entity mapper — dropped');
+    return;
   }
-  const product = mapGenericSingle<Record<string, any>>(event.payload, ['product', 'product_data']);
-  if (type.includes('product') && product) {
-    await catalogRepo.upsertWebhook(storeId, {
-      id: String(product.id ?? event.payload.product_id ?? 'product-missing-id'),
-      title: product.title ?? '',
-      description: product.description ?? undefined,
-      price: Number(product.price ?? 0),
-      currency: product.currency ?? 'SAR',
-      available: product.available ?? true,
-      url: undefined,
-      sku: product.sku ?? undefined,
-    });
+
+  const type = event.type.toLowerCase();
+  const mapOrder = orderMappers[platform];
+  const mapProduct = productMappers[platform];
+
+  if (type.includes('order')) {
+    const raw = mapGenericSingle<RawEntity>(event.payload, ['order', 'order_data']);
+    const mapped = raw ? mapOrder!(raw) : null;
+    if (mapped?.id) {
+      await orderRepo.upsert(storeId, mapped);
+      await markConversionsForOrder(storeId, mapped);
+    } else {
+      logger.warn({ platform, type }, 'webhook: order payload resolved to no id — skipped');
+    }
+  }
+
+  if (type.includes('product')) {
+    const raw = mapGenericSingle<RawEntity>(event.payload, ['product', 'product_data']);
+    const mapped = raw ? mapProduct!(raw) : null;
+    if (mapped?.id) {
+      await catalogRepo.upsertWebhook(storeId, mapped);
+    } else {
+      logger.warn({ platform, type }, 'webhook: product payload resolved to no id — skipped');
+    }
   }
 }

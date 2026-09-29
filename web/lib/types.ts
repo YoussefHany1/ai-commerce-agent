@@ -171,6 +171,39 @@ export interface HealthResponse {
   time: string;
 }
 
+/**
+ * The account behind the current cookie, per `/api/auth/session`.
+ *
+ * Unlike the operator (who is a person operating the install), a client is a
+ * tenant account: an invited merchant with a name and contact the dashboard
+ * shell shows instead of a store name.
+ */
+export type SessionInfo =
+  | { authenticated: true; kind: 'operator' }
+  | {
+      authenticated: true;
+      kind: 'client';
+      clientId: string;
+      name: string | null;
+      email: string | null;
+    }
+  | { authenticated: false };
+
+export interface ClientAccount {
+  id: string;
+  name: string;
+  email: string;
+  status: 'active' | 'suspended';
+  createdAt: string;
+  updatedAt: string;
+  storeCount: number;
+}
+
+export interface ClientCreateResult extends ClientAccount {
+  /** Shown exactly once by the operator; the invite holder must change it. */
+  temporaryPassword?: string;
+}
+
 export interface ChatResponse {
   reply: string;
   products: Array<{

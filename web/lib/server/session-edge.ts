@@ -20,7 +20,7 @@
  * by checking it here is nil because the proxy re-checks anyway.
  */
 
-const PAYLOAD_VERSION = 1;
+const PAYLOAD_VERSION = 2;
 
 export type EdgeVerifyFailure = 'malformed' | 'expired';
 
@@ -35,7 +35,7 @@ export function verifySessionCookieShape(
   const dot = token.indexOf('.');
   if (dot <= 0 || dot === token.length - 1) return { ok: false, reason: 'malformed' };
 
-  let payload: { v?: unknown; exp?: unknown; epoch?: unknown };
+  let payload: { v?: unknown; exp?: unknown; kind?: unknown; epoch?: unknown; clientId?: unknown; sid?: unknown };
   try {
     payload = JSON.parse(decodeBase64Url(token.slice(0, dot)));
   } catch {
@@ -44,7 +44,14 @@ export function verifySessionCookieShape(
 
   if (payload.v !== PAYLOAD_VERSION) return { ok: false, reason: 'malformed' };
   if (typeof payload.exp !== 'number') return { ok: false, reason: 'malformed' };
+  if (payload.kind !== 'operator' && payload.kind !== 'client') return { ok: false, reason: 'malformed' };
   if (typeof payload.epoch !== 'string' || !payload.epoch) return { ok: false, reason: 'malformed' };
+  if (payload.kind === 'client' && (typeof payload.clientId !== 'string' || !payload.clientId)) {
+    return { ok: false, reason: 'malformed' };
+  }
+  if (payload.kind === 'client' && (typeof payload.sid !== 'string' || !payload.sid)) {
+    return { ok: false, reason: 'malformed' };
+  }
   if (payload.exp * 1000 <= now) return { ok: false, reason: 'expired' };
 
   return { ok: true };

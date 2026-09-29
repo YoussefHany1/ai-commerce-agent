@@ -1,7 +1,8 @@
-import { and, desc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
-import { withOperator, withTenant } from './client.js';
+import { and, count, desc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { withClient, withOperator, withTenant, type Db } from './client.js';
 import { encryptPii, decryptPii } from '../services/pii.js';
 import {
+  clients,
   stores,
   platformConnections,
   products,
@@ -30,6 +31,7 @@ import {
   type BillingSubscription,
   type AutomationAction,
   type AutomationRule,
+  type Client,
 } from './schema.js';
 import { decryptKey, encryptKey, keyVersionOf, isEncrypted } from '../lib/encryption.js';
 import { refreshProviderToken } from '../integrations/refresh.js';
@@ -48,17 +50,150 @@ export function storeToPublic(s: Store) {
   };
 }
 
+/** One shard of a client's row, safe to hand to an HTTP response. */
+export function clientToPublic(c: Client) {
+  return {
+    id: c.id,
+    name: c.name,
+    email: c.email,
+    status: c.status,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+  };
+}
+
+type ClientCreateInput = {
+  name: string;
+  email: string;
+  /** Legacy scrypt digest; null once Supabase Auth owns the password. */
+  passwordHash: string | null;
+  supabaseUid?: string;
+};
+
+export const clientRepo = {
+  async create(input: ClientCreateInput): Promise<string> {
+    const id = await withOperator(async (tx) => {
+      const [r] = await tx.insert(clients).values(input).returning({ id: clients.id });
+      return r?.id ?? '';
+    });
+    return id;
+  },
+
+  /** Operator view — any account. */
+  async get(id: string): Promise<Client | null> {
+    const [row] = await withOperator((tx) => tx.select().from(clients).where(eq(clients.id, id)));
+    return row ?? null;
+  },
+
+  /** The row when acting *as* the client: scoped by the tenant_client_clients policy. */
+  async getForAuth(clientId: string): Promise<{ id: string; name: string; email: string; status: string } | null> {
+    const row = await withClient(clientId, (tx) =>
+      tx
+        .select({ id: clients.id, name: clients.name, email: clients.email, status: clients.status })
+        .from(clients)
+        .where(eq(clients.id, clientId)),
+    );
+    return row[0] ?? null;
+  },
+
+  async findByEmail(email: string): Promise<Client | null> {
+    const [row] = await withOperator((tx) => tx.select().from(clients).where(eq(clients.email, email)));
+    return row ?? null;
+  },
+
+  /** The account bound to a Supabase auth user, resolved in operator scope. */
+  async getBySupabaseUid(uid: string): Promise<Client | null> {
+    const [row] = await withOperator((tx) =>
+      tx.select().from(clients).where(eq(clients.supabaseUid, uid)),
+    );
+    return row ?? null;
+  },
+
+  /**
+   * Links a Supabase auth user to an account and withdraws the legacy scrypt hash
+   * at the same time: once an identity is linked, Supabase owns the credential, and
+   * keeping `passwordHash` would route `login` at the stale scrypt digest forever
+   * (a client who set a new Supabase password through password recovery would then
+   * fail every sign-in with the old hash). Returns false when it misses.
+   */
+  async setSupabaseUid(clientId: string, uid: string): Promise<boolean> {
+    const done = await withOperator(async (tx) => {
+      const [r] = await tx
+        .update(clients)
+        .set({ supabaseUid: uid, passwordHash: null, updatedAt: new Date() })
+        .where(eq(clients.id, clientId))
+        .returning({ id: clients.id });
+      return !!r;
+    });
+    return done;
+  },
+
+  async list(): Promise<Client[]> {
+    return withOperator((tx) =>
+      tx.select().from(clients).orderBy(desc(clients.createdAt)),
+    );
+  },
+
+  /** Store count per account, resolved in the same operator transaction as the list. */
+  async storeCountsFor(clientIds: string[]): Promise<Map<string, number>> {
+    if (clientIds.length === 0) return new Map();
+    const rows = await withOperator((tx) =>
+      tx
+        .select({ clientId: stores.clientId, n: count() })
+        .from(stores)
+        .where(inArray(stores.clientId, clientIds))
+        .groupBy(stores.clientId),
+    );
+    return new Map(rows.map((r) => [r.clientId ?? '', r.n]));
+  },
+
+  async setStatus(clientId: string, status: 'active' | 'suspended'): Promise<boolean> {
+    const done = await withOperator(async (tx) => {
+      const [r] = await tx
+        .update(clients)
+        .set({ status, updatedAt: new Date() })
+        .where(eq(clients.id, clientId))
+        .returning({ id: clients.id });
+      return !!r;
+    });
+    return done;
+  },
+
+  async setPassword(clientId: string, passwordHash: string): Promise<boolean> {
+    const done = await withOperator(async (tx) => {
+      const [r] = await tx
+        .update(clients)
+        .set({ passwordHash, updatedAt: new Date() })
+        .where(eq(clients.id, clientId))
+        .returning({ id: clients.id });
+      return !!r;
+    });
+    return done;
+  },
+};
+
 export const storeRepo = {
   async create(
     input: NewStore & { accessToken?: string; refreshToken?: string; expiresAt?: Date; scopes?: string[] },
   ): Promise<string> {
-    const row = await withOperator(async (tx) => {
+    // Operator callers insert with the operator claim; a client-created store
+    // inserts with the client_id claim so the tenant_client_stores WITH CHECK
+    // clause proves the row is being scoped to the caller rather than trusting
+    // the handler.
+    const insert = async (tx: Db) => {
       const [r] = await tx
         .insert(stores)
-        .values({ name: input.name, platform: input.platform, shopDomain: input.shopDomain })
+        .values({
+          name: input.name,
+          platform: input.platform,
+          shopDomain: input.shopDomain,
+          clientId: input.clientId,
+        })
         .returning({ id: stores.id });
       return r;
-    });
+    };
+    const row = input.clientId ? await withClient(input.clientId, insert) : await withOperator(insert);
+
     const connection: NewPlatformConnection = {
       storeId: row.id,
       platform: input.platform,
@@ -77,6 +212,46 @@ export const storeRepo = {
 
   async list(): Promise<Omit<Store, never>[]> {
     return withOperator((tx) => tx.select().from(stores).orderBy(desc(stores.createdAt)));
+  },
+
+  /**
+   * The stores visible to an account. Scoped by RLS rather than by a WHERE
+   * clause so a filtering bug cannot earn a client a cross-tenant view.
+   */
+  async listForClient(clientId: string): Promise<Omit<Store, never>[]> {
+    return withClient(clientId, (tx) => tx.select().from(stores).orderBy(desc(stores.createdAt)));
+  },
+
+  async belongsToClient(storeId: string, clientId: string): Promise<boolean> {
+    const rows = await withClient(clientId, (tx) =>
+      tx
+        .select({ id: stores.id })
+        .from(stores)
+        .where(and(eq(stores.id, storeId), eq(stores.clientId, clientId)))
+        .limit(1),
+    );
+    return rows.length > 0;
+  },
+
+  /** Manual duplicate guard: (platform, shop_domain) has no DB unique index. */
+  async findByPlatformAndDomain(platform: string, shopDomain: string): Promise<Store | null> {
+    const [row] = await withOperator((tx) =>
+      tx.select().from(stores).where(and(eq(stores.platform, platform), eq(stores.shopDomain, shopDomain))).limit(1),
+    );
+    return row ?? null;
+  },
+
+  /** Attaches or detaches a store to an account (operator only). */
+  async assignClient(storeId: string, clientId: string | null): Promise<boolean> {
+    const done = await withOperator(async (tx) => {
+      const [r] = await tx
+        .update(stores)
+        .set({ clientId })
+        .where(eq(stores.id, storeId))
+        .returning({ id: stores.id });
+      return !!r;
+    });
+    return done;
   },
 
   async get(id: string): Promise<Store | null> {
