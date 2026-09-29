@@ -36,7 +36,7 @@ export async function GET(request: Request): Promise<NextResponse> {
   const { headers: nextHeaders } = await import('next/headers');
   await nextHeaders();
 
-  const login = (error: string) => NextResponse.redirect(new URL(`/login?error=${error}`, request.url));
+  const login = (error: string) => redirect(`/login?error=${error}`);
 
   const url = new URL(request.url);
   const code = url.searchParams.get('code');
@@ -97,5 +97,5 @@ export async function GET(request: Request): Promise<NextResponse> {
   
   console.log('[auth/callback] success - session minted, kind:', built.payload.kind, 'redirect:', redirectTo);
   
-  return NextResponse.redirect(new URL(redirectTo, request.url));
+  redirect(redirectTo);
 }
