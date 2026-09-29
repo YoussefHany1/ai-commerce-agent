@@ -29,14 +29,17 @@ export async function GET(request: Request): Promise<NextResponse> {
   const supabase = createDashboardSupabaseClient();
   if (!supabase) return login('auth_unavailable');
 
-  let accessToken: string | undefined;
+  let exchangeResult: Awaited<ReturnType<typeof supabase.auth.exchangeCodeForSession>>;
   try {
-    const { data: exchangeData, error } = await supabase.auth.exchangeCodeForSession(code);
-    if (error || !exchangeData.session?.access_token) return login('auth_callback');
-    accessToken = exchangeData.session.access_token;
+    exchangeResult = await supabase.auth.exchangeCodeForSession(code);
   } catch {
     return login('auth_unavailable');
   }
+  if (exchangeResult.error || !exchangeResult.data.session?.access_token) {
+    return login('auth_callback');
+  }
+  const accessToken = exchangeResult.data.session.access_token;
+
 
   const out = await callAuthApi('exchange', { accessToken });
   if (out.status !== 200) return login('auth_unavailable');
