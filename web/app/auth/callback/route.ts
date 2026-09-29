@@ -6,6 +6,8 @@ import { buildPayload, callAuthApi, safeNext } from '@/lib/server/authExchange';
 import { SESSION_COOKIE, serializeSession, sessionCookieOptions } from '@/lib/server/session';
 
 export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+export const fetchCache = 'force-no-store';
 
 /**
  * OAuth / PKCE callback target.
@@ -29,7 +31,11 @@ export const dynamic = 'force-dynamic';
  * sending the user straight back to /login. Setting the cookie on the response directly
  * guarantees it is included in the redirect's Set-Cookie header.
  */
-export async function GET(request: Request): Promise<NextResponse> {
+export async function GET(request: Request): Promise<NextResponse | void> {
+  // Opt into dynamic rendering immediately
+  const { headers: nextHeaders } = await import('next/headers');
+  await nextHeaders();
+
   const login = (error: string) => NextResponse.redirect(new URL(`/login?error=${error}`, request.url));
 
   const url = new URL(request.url);
