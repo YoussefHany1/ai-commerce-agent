@@ -97,5 +97,5 @@ export async function GET(request: Request): Promise<NextResponse> {
   
   console.log('[auth/callback] success - session minted, kind:', built.payload.kind, 'redirect:', redirectTo);
   
-  redirect(redirectTo);
+  return NextResponse.redirect(new URL(redirectTo, request.url));
 }

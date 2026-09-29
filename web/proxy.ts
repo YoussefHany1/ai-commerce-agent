@@ -101,6 +101,7 @@ function applyHeaders(res: NextResponse, request: NextRequest, policy: string): 
  * and nothing is served on the strength of this check.
  */
 export async function proxy(request: NextRequest): Promise<NextResponse> {
+  console.log(`[proxy] intercepted: ${request.nextUrl.pathname}${request.nextUrl.search}`);
   const policy = csp(mintNonce());
   const requestHeaders = new Headers(request.headers);
   // The request-side CSP is what Next parses to nonce its own scripts; the
