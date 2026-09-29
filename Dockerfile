@@ -17,9 +17,11 @@ COPY --from=build /app/dist/ dist/
 COPY drizzle/ drizzle/
 COPY scripts/ scripts/
 # scripts/apply-rls.ts and scripts/rotate-key.ts import ../src/*.js and run under
-# tsx, so `npm run db:bootstrap` (render.yaml preDeployCommand) and
-# `npm run db:rotate-key` need the sources present. Without this the first
-# Render deploy fails at ERR_MODULE_NOT_FOUND even though the build is green.
+# tsx, so `npm run db:bootstrap` and `npm run db:rotate-key` need the sources
+# present. render.yaml declares no preDeployCommand — Render refuses one on a free
+# plan — so migrations run from CI or from a shell on this image, but the command
+# still has to work when they do. Without this copy it fails at
+# ERR_MODULE_NOT_FOUND even though the build is green.
 # Copied from the build stage so it is byte-identical to what was compiled.
 COPY --from=build /app/src/ src/
 ENV NODE_ENV=production

@@ -156,8 +156,8 @@ may briefly run the same worker until the lease store is back.
 
 ## Deploying to Render
 
-`render.yaml` defines the API, the dashboard, and a Redis instance. Two things to settle
-before the first deploy:
+`render.yaml` defines the API, the dashboard, and a Redis instance. Three things to
+settle before the first deploy:
 
 1. **The database must have pgvector.** Render's managed PostgreSQL does not ship the
    `vector` extension, and the first migration runs `CREATE EXTENSION vector` with a
@@ -173,9 +173,29 @@ before the first deploy:
    binds to. A Blueprint cannot compose the `host` and `port` properties into a single
    value, and `property: privateHost` is not a real property: the spec's only address
    properties are `host` (a bare private hostname, no scheme) and `hostport`.
-3. **Migrations run as `preDeployCommand`** (`npm run db:bootstrap`) immediately before a
-   new version serves traffic. `tsx` is a runtime dependency specifically so this works
-   in the production image.
+3. **Migrations are an out-of-band step**, not a `preDeployCommand`. Render supports
+   pre-deploy commands only on paid plans, and it checks that while *parsing* the
+   Blueprint, so a free service that declares one fails the entire apply with
+   `services[n]: pre-deploy command is not supported for free tier services` — the
+   dashboard and Redis are not provisioned either, and the message names only an
+   index. Free services also cannot run one-off jobs, so there is no in-platform
+   hook. Run migrations yourself, before the deploy, with the **owner** connection
+   string:
+   ```bash
+   PGADMIN_URL=postgres://agent_owner:...@host/db?sslmode=require npm run db:bootstrap
+   ```
+   `db:bootstrap` is `db:migrate` + `db:apply-rls`, and it needs the owner role
+   because it alters policies and creates the app role the RLS is written for —
+   `DATABASE_URL` (the RLS-restricted role) is not enough. Ordering: apply
+   migrations → sync/deploy the Blueprint → the new code serves. Migrate first:
+   the old version keeps running against the new schema, whereas the reverse leaves
+   it serving against tables it expects but that no longer exist. Keep
+   `PGADMIN_URL` somewhere reachable from CI so this is a pipeline step, not a
+   laptop ritual. `tsx` and `src/` are still in the production image, so the same
+   command can run from a shell on the deployed service if you ever need to.
+
+   On a paid plan, put `preDeployCommand: npm run db:bootstrap` back on the API
+   service and delete the manual step. Do not do both.
 
 Public origins come from `RENDER_EXTERNAL_URL` rather than a `host` property. That
 matters: `APP_BASE_URL` is validated with `z.string().url()`, so a bare `agent-api`
@@ -184,10 +204,11 @@ inlined into the browser bundle, where a scheme-less value produces a dead OAuth
 
 `npm run check:render` validates the blueprint against the published spec — every
 `fromService` property against the documented set, every reference against a service or
-database the blueprint declares, plan IDs, and the two mistakes that render green and
-fail at runtime: a secret declared as both a build arg and a runtime variable (Render
-resolves those to two different generated values), and a URL variable fed a scheme-less
-`host`.
+database the blueprint declares, plan IDs, keys Render refuses on a free plan
+(`preDeployCommand`, `cronSchedule`, `maxScale`), and the two mistakes that render green
+and fail at runtime: a secret declared as both a build arg and a runtime variable
+(Render resolves those to two different generated values), and a URL variable fed a
+scheme-less `host`.
 
 ## Health checks
 
@@ -247,8 +268,10 @@ When unset the server still logs errors and proceeds without Sentry.
 
 ## Runbook — rotation, upgrades, incidents
 
-- **DB migration**: run `PGADMIN_URL=… npm run db:migrate` (apply-rls once in `db:bootstrap`).
-  Backup before and after. Downtime is not required.
+- **DB migration**: run `PGADMIN_URL=… npm run db:bootstrap` (migrate + apply-rls; the
+  owner role, not `DATABASE_URL`) *before* deploying the code that needs the new
+  columns. Backup before and after. Downtime is not required. On Render this is a manual
+  or CI step — see "Deploying to Render", item 3.
 - **Store key rotation**: `POST /api/stores/<storeId>/keys` replaces the key atomically.
   Old key is invalid the moment the new one is stored; coordinate with the merchant's dashboard.
 - **Admin key rotation**: deploy with the new key in `ADMIN_API_KEY` and the old one in

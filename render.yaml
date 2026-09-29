@@ -51,13 +51,26 @@ services:
     # /api/health answers 200 without a credential, which is what the health
     # check needs; the worker and rate-limit subsystems report their own state.
     healthCheckPath: /api/health
-    # Migrations and RLS run here, in the same image as the service, immediately
-    # before the new version starts serving. `tsx` is a runtime dependency
-    # precisely so this works in the production image. DATABASE_URL/PGADMIN_URL
-    # are injected before the command runs, so db:bootstrap (migrate + RLS) sees
-    # them; set them before the first deploy, or the API boots against an empty
-    # or unpolicied database.
-    preDeployCommand: npm run db:bootstrap
+    # NO preDeployCommand. Render rejects the whole Blueprint with
+    # "pre-deploy command is not supported for free tier services", and it
+    # validates that at sync time, so one such key makes the apply fail
+    # outright — the whole blueprint, not just this service. The paid plans
+    # (starter and up) support it; `plan: free` does not.
+    #
+    # Migrations and RLS are therefore an operator step that runs before the
+    # deploy, from a machine or CI with the admin connection string:
+    #
+    #     PGADMIN_URL=postgres://agent_owner:... npm run db:bootstrap
+    #
+    # `npm run db:bootstrap` = db:migrate + db:apply-rls, and it needs the OWNER
+    # role, not DATABASE_URL: it alters policies and creates the app role that
+    # the RLS is written for. Render free web services also cannot run one-off
+    # jobs, so there is no in-platform way to do this. See DEPLOYMENT.md
+    # ("Deploying to Render") for the ordering.
+    #
+    # The image still ships src/ and tsx, so the same command runs from a shell
+    # on the deployed service (`docker run`/`render ssh`, or the Render shell on
+    # a paid plan) if you ever need to migrate from Render itself.
     envVars:
       - key: NODE_ENV
         value: production
@@ -72,7 +85,8 @@ services:
       # External pgvector-capable Postgres, set by hand: see note 1. DATABASE_URL is
       # the RLS-restricted role the app connects as; PGADMIN_URL is the owner role the
       # migration and RLS scripts use to alter policies. They must not be the same
-      # account, or RLS protects nothing.
+      # account, or RLS protects nothing. PGADMIN_URL is needed off-Render too, for the
+      # out-of-band `npm run db:bootstrap` above — keep it somewhere reachable from CI.
       - key: DATABASE_URL
         sync: false # postgres://agent_app:...@host/db?sslmode=require
       - key: PGADMIN_URL

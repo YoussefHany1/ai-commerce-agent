@@ -34,9 +34,19 @@ const SERVICE_PROPERTIES = new Set([
   'database',
 ]);
 
-/** Plan IDs from the spec's per-type tables, unioned. */
+/**
+ * Plan IDs from the spec's per-type tables, unioned. Web services take the named
+ * plans (free, starter, ...); private services and Key Value take RAM-based ids.
+ */
 const PLANS = new Set([
   'free',
+  'starter',
+  'standard',
+  'pro',
+  'pro_max',
+  'pro_plus',
+  'pro_ultra',
+  'pro_ultra_plus',
   '0.1c-256mb',
   '0.5c-512mb',
   '1c-1g',
@@ -63,6 +73,22 @@ const PLANS = new Set([
   '50g',
   '100g',
 ]);
+
+/**
+ * Keys Render refuses on a free plan. It validates these at *sync* time, so a
+ * single offending key fails the whole Blueprint apply rather than one service —
+ * the dashboard and Redis come back unprovisioned too, and the error names only
+ * the service index.
+ *
+ * preDeployCommand is the one this repo hit: it is how migrations used to run on
+ * Render, and Render answers "pre-deploy command is not supported for free tier
+ * services". Migrate out of band instead (see DEPLOYMENT.md), or pay for starter.
+ */
+const PAID_ONLY_KEYS = [
+  'preDeployCommand',
+  'cronSchedule',
+  'maxScale',
+];
 
 /**
  * Variables that must hold a parseable absolute URL. `host` and `hostport` are
@@ -120,8 +146,22 @@ for (const service of services) {
   if (service.plan !== undefined && !PLANS.has(String(service.plan))) {
     problems.push(
       `${service.name}: plan '${service.plan}' is not a plan ID from the spec ` +
-        `(e.g. free, 0.5c-512mb, 1c-2g)`,
+        `(e.g. free, starter, 0.5c-512mb, 1c-2g)`,
     );
+  }
+
+  // Free plan, paid-plan-only key. Render fails the entire Blueprint sync on
+  // this, naming only `services[n]`, so catch it where the service is named.
+  if (String(service.plan) === 'free') {
+    for (const key of PAID_ONLY_KEYS) {
+      if (service[key] !== undefined) {
+        problems.push(
+          `${service.name}: ${key} is not supported on the free plan, and Render rejects the ` +
+            `whole Blueprint with "services[n]: ${key} is not supported for free tier services". ` +
+            `Remove it, or change the plan to 'starter'`,
+        );
+      }
+    }
   }
 
   // Key Value instances require an explicit inbound rule, and an empty list is the
