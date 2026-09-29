@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server';
-import { cookies } from 'next/headers';
 import { createDashboardSupabaseClient } from '@/lib/server/supabase';
 import { callAuthApi, mintSessionCookie, safeNext } from '@/lib/server/authExchange';
 
@@ -30,29 +29,21 @@ export async function GET(request: Request): Promise<NextResponse> {
   const supabase = createDashboardSupabaseClient();
   if (!supabase) return login('auth_unavailable');
 
+  let accessToken: string | undefined;
   try {
-    const { error } = await supabase.auth.exchangeCodeForSession(code);
-    if (error) return login('auth_callback');
+    const { data: exchangeData, error } = await supabase.auth.exchangeCodeForSession(code);
+    if (error || !exchangeData.session?.access_token) return login('auth_callback');
+    accessToken = exchangeData.session.access_token;
   } catch {
     return login('auth_unavailable');
   }
 
-  const { data, error: getError } = await supabase.auth.getSession();
-  const accessToken = data.session?.access_token;
-  if (getError || !accessToken) return login('auth_callback');
-
   const out = await callAuthApi('exchange', { accessToken });
   if (out.status !== 200) return login('auth_unavailable');
 
-  const { buildPayload } = await import('@/lib/server/authExchange');
-  const { serializeSession, sessionCookieOptions, SESSION_COOKIE } = await import('@/lib/server/session');
-  const parsed = buildPayload(out.payload as any);
-  if (!parsed) return login('auth_unavailable');
+  const minted = await mintSessionCookie(out.payload);
+  if (!minted) return login('auth_unavailable');
 
   const redirectTo = safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard';
-  
-  const cookieStore = await cookies();
-  cookieStore.set(SESSION_COOKIE, serializeSession(parsed.payload), sessionCookieOptions(parsed.expiresIn));
-
   return NextResponse.redirect(new URL(redirectTo, request.url));
 }
