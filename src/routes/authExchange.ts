@@ -171,6 +171,7 @@ async function resolveIdentity(
 
   let userId: string;
   let userEmail: string | undefined;
+  let userName: string | undefined;
   try {
     const { data, error } = await admin.auth.getUser(accessToken);
     if (error || !data.user) {
@@ -179,6 +180,7 @@ async function resolveIdentity(
     }
     userId = data.user.id;
     userEmail = data.user.email ?? undefined;
+    userName = data.user.user_metadata?.name || data.user.user_metadata?.full_name;
   } catch {
     rep.code(503).send({ error: 'auth_unavailable' });
     return null;
@@ -224,6 +226,11 @@ async function resolveIdentity(
       if (byEmail && !operatorByEmail) {
         await clientRepo.setSupabaseUid(byEmail.id, userId);
         client = byEmail;
+      } else if (!byEmail && !operatorByEmail) {
+        // Auto-provision a new client account for OAuth sign-ins
+        const name = userName || email.split('@')[0];
+        const newId = await clientRepo.create({ name, email, passwordHash: null, supabaseUid: userId });
+        client = await clientRepo.get(newId);
       }
     }
     if (!client || client.status !== 'active') {

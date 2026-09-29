@@ -9,7 +9,7 @@ export const dynamic = 'force-dynamic';
  */
 export async function GET(request: Request): Promise<NextResponse> {
   const supabase = createDashboardSupabaseClient();
-  if (!supabase) return NextResponse.json({ error: 'auth_unavailable' }, { status: 503 });
+  if (!supabase) return NextResponse.json({ error: 'auth_unavailable', reason: 'SUPABASE_URL or SUPABASE_ANON_KEY is missing in env' }, { status: 503 });
 
   const origin = new URL(request.url).origin;
   try {
@@ -19,9 +19,9 @@ export async function GET(request: Request): Promise<NextResponse> {
         redirectTo: `${origin}/auth/callback`,
       },
     });
-    if (error || !data.url) return NextResponse.json({ error: 'auth_unavailable' }, { status: 503 });
+    if (error || !data.url) return NextResponse.json({ error: 'auth_unavailable', details: error?.message || 'no url returned' }, { status: 503 });
     return NextResponse.redirect(data.url);
-  } catch {
-    return NextResponse.json({ error: 'auth_unavailable' }, { status: 503 });
+  } catch (e: any) {
+    return NextResponse.json({ error: 'auth_unavailable', exception: e?.message }, { status: 503 });
   }
 }
