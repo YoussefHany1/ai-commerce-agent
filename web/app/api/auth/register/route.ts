@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { callClientAuth } from '@/lib/server/clientExchange';
+import { callAuthApi } from '@/lib/server/authExchange';
 
 export const dynamic = 'force-dynamic';
 
@@ -37,7 +37,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ error: 'invalid_request' }, { status: 400 });
   }
 
-  const out = await callClientAuth('register', {
+  const out = await callAuthApi('client/register', {
     name: body.name.trim(),
     email: body.email.trim(),
     password: body.password,

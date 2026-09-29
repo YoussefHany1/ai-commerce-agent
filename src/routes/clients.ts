@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { clientRepo, storeRepo, clientToPublic, storeToPublic } from '../db/repos.js';
 import { hashPassword, MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH } from '../lib/passwordHash.js';
 import { bumpClientSessionEpoch } from '../lib/clientSession.js';
-import { requireApiKey } from '../lib/auth.js';
+import { requireOperator } from '../lib/auth.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
 import { config } from '../config.js';
 import { supabaseAdmin, findSupabaseUserByEmail } from '../lib/supabase.js';
@@ -39,7 +39,7 @@ const assignBody = z.object({ storeId: z.string().uuid() });
 const assignParam = z.object({ id: z.string().uuid(), storeId: z.string().uuid() });
 
 export async function clients(app: FastifyInstance) {
-  app.get('/api/clients', { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] }, async () => {
+  app.get('/api/clients', { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] }, async () => {
     const rows = await clientRepo.list();
     const counts = await clientRepo.storeCountsFor(rows.map((r) => r.id));
     return rows.map((c) => ({ ...clientToPublic(c), storeCount: counts.get(c.id) ?? 0 }));
@@ -47,7 +47,7 @@ export async function clients(app: FastifyInstance) {
 
   app.post(
     '/api/clients',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const body = createBody.parse(req.body);
       const email = normalizeEmail(body.email);
@@ -76,7 +76,7 @@ export async function clients(app: FastifyInstance) {
 
   app.get(
     '/api/clients/:id',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { id } = idParam.parse(req.params);
       const client = await clientRepo.get(id);
@@ -94,7 +94,7 @@ export async function clients(app: FastifyInstance) {
    */
   app.patch(
     '/api/clients/:id/status',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { id } = idParam.parse(req.params);
       const { status } = statusBody.parse(req.body);
@@ -113,7 +113,7 @@ export async function clients(app: FastifyInstance) {
 
   app.post(
     '/api/clients/:id/reset-password',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { id } = idParam.parse(req.params);
       const { password } = passwordBody.parse(req.body);
@@ -147,7 +147,7 @@ export async function clients(app: FastifyInstance) {
 
   app.post(
     '/api/clients/:id/stores',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { id } = idParam.parse(req.params);
       const { storeId } = assignBody.parse(req.body);
@@ -160,7 +160,7 @@ export async function clients(app: FastifyInstance) {
 
   app.delete(
     '/api/clients/:id/stores/:storeId',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { id, storeId } = assignParam.parse(req.params);
       // Only detach from the account named in the URL: a store keyed to client B

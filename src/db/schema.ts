@@ -70,6 +70,50 @@ export const clients = pgTable(
   ],
 );
 
+/**
+ * An operator — the person (or people) who administers this install.
+ *
+ * The operator used to be a single shared password in the environment with no
+ * identity behind it. This row is that identity: a Supabase Auth user
+ * (`supabaseUid` = `auth.users.id`) plus the two application-side facts worth
+ * storing locally — the display name, and whether the account is currently allowed
+ * in. The `status` re-read on every authenticated request is what makes a
+ * suspension take effect immediately rather than at the next login.
+ *
+ * There is no `passwordHash` column, and that is the point: Supabase Auth is the
+ * only credential store for an operator, so there is no local secret to leak, to
+ * rotate in place, or to disagree with the identity provider.
+ *
+ * Shaped like `clients` on purpose, so both principals are read the same way — but
+ * without a `settings` bag or a `client_id` policy tier: an operator is the tier
+ * above tenants, not a tenant.
+ */
+export const operators = pgTable(
+  'operators',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    name: text('name').notNull(),
+    /** Lowercased and trimmed on the way in, so lookups cannot be dodged by casing. */
+    email: text('email').notNull(),
+    /**
+     * The Supabase Auth user id backing this operator, or NULL between creating the
+     * row and linking the identity. Unique while present, so one auth identity maps
+     * to at most one operator — which is what stops a person invited as a client
+     * from also resolving as an operator.
+     */
+    supabaseUid: uuid('supabase_uid'),
+    /** 'active' | 'suspended'. A suspended operator cannot log in and live sessions stop verifying. */
+    status: text('status').notNull().default('active'),
+    createdAt: ts(),
+    updatedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('operators_email_uidx').on(t.email),
+    index('operators_status_idx').on(t.status),
+    uniqueIndex('operators_supabase_uid_uidx').on(t.supabaseUid),
+  ],
+);
+
 export const stores = pgTable(
   'stores',
   {
@@ -411,6 +455,8 @@ export const dailyMetrics = pgTable(
 
 export type Client = typeof clients.$inferSelect;
 export type NewClient = typeof clients.$inferInsert;
+export type Operator = typeof operators.$inferSelect;
+export type NewOperator = typeof operators.$inferInsert;
 export type Store = typeof stores.$inferSelect;
 export type NewStore = typeof stores.$inferInsert;
 export type PlatformConnection = typeof platformConnections.$inferSelect;

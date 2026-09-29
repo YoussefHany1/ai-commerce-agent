@@ -6,7 +6,7 @@ import { verifyHubSignature } from '../lib/webhooks.js';
 import { answerWithTools, toChatHistory } from '../services/agent.js';
 import { sendText } from '../integrations/whatsapp.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey, requireDashboard } from '../lib/auth.js';
+import { requireOperator, requireDashboard } from '../lib/auth.js';
 import { logger } from '../lib/logger.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -57,7 +57,7 @@ export async function whatsapp(app: FastifyInstance) {
     },
   );
 
-  app.get('/api/whatsapp/channels', { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] }, async () => whatsappRepo.listChannels());
+  app.get('/api/whatsapp/channels', { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] }, async () => whatsappRepo.listChannels());
 }
 
 type WhatsappChange = {

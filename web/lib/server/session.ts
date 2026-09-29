@@ -1,46 +1,21 @@
 import 'server-only';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { currentEpoch, currentClientEpoch } from './redis';
+import { currentEpoch, currentClientEpoch, currentOperatorEpoch } from './redis';
+import { isSessionPayload, PAYLOAD_VERSION, type SessionPayload } from './sessionShape';
+
+// The shape rules are shared with the Edge middleware, which cannot import this file
+// (it needs `node:crypto`). They are re-exported here so callers of the Node-side
+// session API have one import site for the whole thing.
+export { isSessionPayload, PAYLOAD_VERSION };
+export type { SessionPayload, SessionKind } from './sessionShape';
 
 export const SESSION_COOKIE = 'aca_session';
-export const SESSION_TTL_SECONDS = 8 * 60 * 60;
-
 /**
- * Payload format version. Bumping this invalidates every existing cookie, which is
- * the intended coupling: the v2 payload carries `kind` and, for client sessions,
- * the account id, sid and display name that the proxy and the session endpoint
- * previously had no way to express. Old v1 operator cookies must not half-verify
- * against a v2 validator, so a version bump is a deliberate log-everyone-out.
+ * Fallback cookie lifetime, used only when a caller has no `expiresIn` to pass — the
+ * `sessionCookieOptions()` default. Sign-in always supplies the API's own figure, so
+ * this exists for the specs and for a caller minting a cookie by hand.
  */
-const PAYLOAD_VERSION = 2;
-
-export type SessionKind = 'operator' | 'client';
-
-export type SessionPayload = {
-  /** Payload format version, so a future change can invalidate old cookies. */
-  v: number;
-  /** Issued-at, epoch seconds. */
-  iat: number;
-  /** Expiry, epoch seconds. */
-  exp: number;
-  /** Who owns this session: the install (operator) or a dashboard account (client). */
-  kind: SessionKind;
-  /**
-   * The epoch this cookie is bound to — the operator session epoch for
-   * `operator`, the account's client session epoch for `client`. A revocation
-   * (operator revoke script, a client password change or suspension) moves the
-   * epoch and this cookie stops verifying.
-   */
-  epoch: string;
-  /** `client` only: the dashboard account id, displayed in the shell. */
-  clientId?: string;
-  /** `client` only: the raw session id the proxy forwards in `x-client-session`. */
-  sid?: string;
-  /** `client` only: display name for the shell. */
-  name?: string;
-  /** `client` only: contact for the shell. */
-  email?: string;
-};
+export const SESSION_TTL_SECONDS = 8 * 60 * 60;
 
 function secret(): string {
   const value = process.env.SESSION_SECRET;
@@ -71,22 +46,10 @@ export type VerifyResult = { ok: true; payload: SessionPayload } | { ok: false; 
  * Verifies a cookie's signature and expiry.
  *
  * Deliberately does not consult the session epoch: the authoritative check (which
- * includes the epoch, and therefore revocation) happens in the Node-runtime proxy
+ * includes the epochs, and therefore revocation) happens in the Node-runtime proxy
  * route. Middleware only needs to know whether the cookie is structurally valid so
  * it can send an unauthenticated visitor to the login page.
  */
-export function isSessionPayload(value: unknown): value is SessionPayload {
-  if (typeof value !== 'object' || value === null) return false;
-  const p = value as SessionPayload;
-  if (p.v !== PAYLOAD_VERSION) return false;
-  if (typeof p.iat !== 'number' || typeof p.exp !== 'number') return false;
-  if (p.kind !== 'operator' && p.kind !== 'client') return false;
-  if (typeof p.epoch !== 'string' || !p.epoch) return false;
-  if (p.kind === 'client' && (typeof p.clientId !== 'string' || !p.clientId)) return false;
-  if (p.kind === 'client' && (typeof p.sid !== 'string' || !p.sid)) return false;
-  return true;
-}
-
 export function verifySessionSignature(token: string | undefined, now = Date.now()): VerifyResult {
   if (!token) return { ok: false, reason: 'malformed' };
 
@@ -122,7 +85,7 @@ export function verifySessionSignature(token: string | undefined, now = Date.now
 
 /**
  * Authoritative check for proxied requests: signature, expiry, and the session
- * epoch.
+ * epoch(s).
  *
  * Fails closed when Redis is unreachable. A verification outage must not become an
  * authentication bypass, so the request is refused rather than let through on an
@@ -132,29 +95,69 @@ export async function verifySession(token: string | undefined): Promise<VerifyRe
   const signature = verifySessionSignature(token);
   if (!signature.ok) return signature;
 
-  let epoch: string;
+  const p = signature.payload;
   try {
-    // An operator cookie is bound to the global operator epoch; a client cookie to
-    // the account's own epoch. Both live in the same Redis the API writes.
-    epoch =
-      signature.payload.kind === 'client'
-        ? await currentClientEpoch(signature.payload.clientId!)
-        : await currentEpoch();
+    // Both kinds live in the same Redis the API writes; the key names and seeding
+    // rules are duplicated by contract in `redis.ts`.
+    if (p.kind === 'client') {
+      if (p.epoch !== (await currentClientEpoch(p.clientId!))) {
+        return { ok: false, reason: 'stale_epoch' };
+      }
+      return signature;
+    }
+
+    // An operator has two: their own (suspension, per-person revocation) and the
+    // install-wide one (revoke-all). Both must match, so neither a targeted nor a
+    // blanket revocation can be laundered past the proxy by holding the other.
+    const [own, global] = await Promise.all([
+      currentOperatorEpoch(p.operatorId!),
+      currentEpoch(),
+    ]);
+    if (p.epoch !== own) return { ok: false, reason: 'stale_epoch' };
+    if (p.globalEpoch !== global) return { ok: false, reason: 'stale_epoch' };
+    return signature;
   } catch {
     return { ok: false, reason: 'unavailable' };
   }
-
-  if (signature.payload.epoch !== epoch) return { ok: false, reason: 'stale_epoch' };
-  return signature;
 }
 
-export function newSessionPayload(epoch: string, now = Date.now()): SessionPayload {
+/**
+ * Both cookie lifetimes come from the API's own answer, not from a constant repeated
+ * here. The auth routes return `expiresIn` alongside the sid, and it is exactly the
+ * Redis TTL they set, so deriving `exp` and `maxAge` from it means a cookie can never
+ * outlive the session record it points at — the failure that would otherwise show up as
+ * an endless signed-in-but-401 loop after a TTL change on the other service. It also
+ * means the operator and client lifetimes can differ without this file knowing why.
+ */
+export function newOperatorSessionPayload(
+  input: {
+    operatorId: string;
+    sid: string;
+    epoch: string;
+    globalEpoch: string;
+    expiresIn: number;
+    name?: string;
+    email?: string;
+  },
+  now = Date.now(),
+): SessionPayload {
   const iat = Math.floor(now / 1000);
-  return { v: PAYLOAD_VERSION, kind: 'operator', iat, exp: iat + SESSION_TTL_SECONDS, epoch };
+  return {
+    v: PAYLOAD_VERSION,
+    kind: 'operator',
+    iat,
+    exp: iat + input.expiresIn,
+    epoch: input.epoch,
+    globalEpoch: input.globalEpoch,
+    operatorId: input.operatorId,
+    sid: input.sid,
+    name: input.name,
+    email: input.email,
+  };
 }
 
 export function newClientSessionPayload(
-  input: { clientId: string; sid: string; epoch: string; name?: string; email?: string },
+  input: { clientId: string; sid: string; epoch: string; expiresIn: number; name?: string; email?: string },
   now = Date.now(),
 ): SessionPayload {
   const iat = Math.floor(now / 1000);
@@ -162,7 +165,7 @@ export function newClientSessionPayload(
     v: PAYLOAD_VERSION,
     kind: 'client',
     iat,
-    exp: iat + SESSION_TTL_SECONDS,
+    exp: iat + input.expiresIn,
     epoch: input.epoch,
     clientId: input.clientId,
     sid: input.sid,
@@ -186,13 +189,13 @@ function secure(): boolean {
   return process.env.NODE_ENV === 'production';
 }
 
-export function sessionCookieOptions() {
+export function sessionCookieOptions(maxAge: number = SESSION_TTL_SECONDS) {
   return {
     httpOnly: true,
     secure: secure(),
     sameSite: 'lax' as const,
     path: '/',
-    maxAge: SESSION_TTL_SECONDS,
+    maxAge,
   };
 }
 

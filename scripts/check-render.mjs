@@ -303,12 +303,34 @@ if (web) {
   if ((web.envVars ?? []).every((e) => e.key !== 'SESSION_SECRET')) {
     problems.push('agent-web: SESSION_SECRET is required; without it every request is unauthenticated');
   }
-  // The proxy attaches this server-side on every upstream call, so a missing value
-  // fails each request inside requireApiKey() rather than at boot.
-  if ((web.envVars ?? []).every((e) => e.key !== 'ADMIN_API_KEY')) {
+  // The web service must NOT hold the install-wide admin key. The proxy forwards a
+  // verified session id and the API resolves the person behind it, so this value is
+  // unused — and an unused full-privilege credential sitting in a second service is
+  // exactly the thing this rewrite set out to remove. A stale copy is worse than none:
+  // it still looks like a working configuration to whoever reads the dashboard.
+  const webAdminKey = (web.envVars ?? []).find((e) => e.key === 'ADMIN_API_KEY');
+  if (webAdminKey) {
     problems.push(
-      'agent-web: ADMIN_API_KEY is required; the proxy attaches it to every upstream call, ' +
-        'so without it every data request fails',
+      'agent-web: ADMIN_API_KEY must be removed. Sessions are forwarded as a header the ' +
+        'API resolves per person; the proxy never sends this key (web/lib/server/upstream.ts), ' +
+        'so keeping it only leaves a second full-privilege copy to rotate and leak',
+    );
+  }
+  // The anon key lets the web server finish the browser-side flows; the service-role
+  // key would let it bypass RLS entirely, so its presence is a hard failure rather
+  // than a warning.
+  for (const required of ['SUPABASE_URL', 'SUPABASE_ANON_KEY']) {
+    if ((web.envVars ?? []).every((e) => e.key !== required)) {
+      problems.push(
+        `agent-web: ${required} is required; without it the OAuth callback and password-reset ` +
+          'flows cannot complete and sign-in dead-ends',
+      );
+    }
+  }
+  if ((web.envVars ?? []).some((e) => e.key === 'SUPABASE_SERVICE_ROLE_KEY')) {
+    problems.push(
+      'agent-web: SUPABASE_SERVICE_ROLE_KEY must never be set here. It bypasses RLS on every ' +
+        'table and can rewrite any auth user; the API service is the only one that needs it',
     );
   }
 }

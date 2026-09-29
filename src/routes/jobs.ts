@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { jobsRepo } from '../db/repos.js';
 import { resolveHandler } from '../workers/jobs.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey, requireDashboard } from '../lib/auth.js';
+import { requireOperator, requireDashboard } from '../lib/auth.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -49,7 +49,7 @@ export async function jobs(app: FastifyInstance) {
 
   app.post(
     '/api/jobs/run',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = z
         .object({

@@ -63,7 +63,16 @@ beforeEach(() => {
   createDashboardSupabaseClient.mockReset();
   createDashboardSupabaseClient.mockImplementation(() => ({ auth }));
   stubFetch(() =>
-    jsonResponse({ ok: true, clientId: 'client-1', sid: 'sid-1', epoch: 'epoch-1', name: 'Nadia', email: 'n@b.c' }),
+    jsonResponse({
+      ok: true,
+      kind: 'client',
+      clientId: 'client-1',
+      sid: 'sid-1',
+      epoch: 'epoch-1',
+      expiresIn: 3600,
+      name: 'Nadia',
+      email: 'n@b.c',
+    }),
   );
 });
 
@@ -114,6 +123,37 @@ describe('GET /auth/callback', () => {
 
     expect(cookieStore.written).toHaveLength(1);
     expect(cookieStore.written[0].name).toBe('aca_session');
+  });
+
+  it('writes an operator cookie when that is who the token turned out to be', async () => {
+    // One Google button, two kinds of person. The callback never asks which, so the
+    // API's answer has to be enough — and it has to be honoured rather than rejected
+    // for arriving on the operator surface.
+    auth.exchangeCodeForSession.mockResolvedValue({ data: { session: { access_token: 'pkce-token' } }, error: null });
+    auth.getSession.mockResolvedValue({ data: { session: { access_token: 'pkce-token' } }, error: null });
+    stubFetch(() =>
+      jsonResponse({
+        ok: true,
+        kind: 'operator',
+        operatorId: 'op-1',
+        sid: 'op-sid-1',
+        epoch: 'op-epoch-1',
+        globalEpoch: 'global-epoch-1',
+        expiresIn: 3600,
+        name: 'Youssef',
+      }),
+    );
+
+    const res = await GET(callbackUrl(['code=code-1']));
+    expect(res.status).toBe(307);
+    expect(res.headers.get('location')).toBe('http://app.test/dashboard');
+    const payload = JSON.parse(Buffer.from(cookieStore.written[0].value.split('.')[0], 'base64url').toString('utf8'));
+    expect(payload).toMatchObject({
+      kind: 'operator',
+      operatorId: 'op-1',
+      epoch: 'op-epoch-1',
+      globalEpoch: 'global-epoch-1',
+    });
   });
 
   it('honors a same-origin redirect_to after signing in', async () => {

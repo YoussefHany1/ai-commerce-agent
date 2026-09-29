@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { automationRepo } from '../db/repos.js';
 import { runAllAutomation } from '../services/automation.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey, requireDashboard } from '../lib/auth.js';
+import { requireOperator, requireDashboard } from '../lib/auth.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -62,7 +62,7 @@ export async function automation(app: FastifyInstance) {
 
   app.post(
     '/api/automation/run',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = z
         .object({ storeIds: z.array(z.string()).optional(), ruleIds: z.array(z.string()).optional() })

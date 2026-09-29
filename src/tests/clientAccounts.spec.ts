@@ -1,5 +1,10 @@
 import { describe, expect, it, vi, beforeEach, beforeAll, afterAll } from 'vitest';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
+
+// Both session stores key their records on the sid's hash, so the assertions below read
+// the same key the production code wrote rather than trusting the sid is meaningful.
+const sha256 = (input: string) => createHash('sha256').update(input).digest('hex');
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -76,6 +81,17 @@ const mocks = vi.hoisted(() => {
     assignClient: vi.fn(async () => {}),
     listForClient: vi.fn(async () => []),
   };
+  // The unified `/api/auth/exchange` resolves an operator before falling through to a
+  // client, so the mock needs the operator side too. Default: nobody administers this
+  // install, which is what every client-focused case below assumes.
+  const operatorRepo = {
+    get: vi.fn(),
+    findByEmail: vi.fn<(...args: any[]) => Promise<any>>(async () => null),
+    getBySupabaseUid: vi.fn<(...args: any[]) => Promise<any>>(async () => null),
+    setSupabaseUid: vi.fn(async () => true),
+    list: vi.fn(async () => []),
+  };
+  const operatorToPublic = vi.fn((o: any) => o);
   const clientToPublic = vi.fn((c: any) => ({
     id: c.id,
     name: c.name,
@@ -107,7 +123,7 @@ const mocks = vi.hoisted(() => {
     supabaseAdmin: vi.fn(),
     findSupabaseUserByEmail: vi.fn(),
   };
-  return { clientRepo, storeRepo, clientToPublic, storeToPublic, supabase };
+  return { clientRepo, storeRepo, operatorRepo, operatorToPublic, clientToPublic, storeToPublic, supabase };
 });
 vi.mock('../db/repos.js', () => ({ ...mocks }));
 vi.mock('../lib/supabase.js', () => ({
@@ -142,6 +158,7 @@ async function buildApp() {
   vi.resetModules();
   const { default: Fastify } = await import('fastify');
   const { clientAuth } = await import('../routes/clientAuth.js');
+  const { authExchange } = await import('../routes/authExchange.js');
   const { clients } = await import('../routes/clients.js');
   const app = Fastify({ logger: false });
   app.setErrorHandler((error: any, _req, reply) => {
@@ -154,6 +171,7 @@ async function buildApp() {
     reply.code(500).send({ error: 'internal_error' });
   });
   await clientAuth(app);
+  await authExchange(app);
   await clients(app);
   return app;
 }
@@ -226,6 +244,13 @@ describe('client auth: login lockout', () => {
   beforeEach(async () => {
     redisStore.clear();
     vi.clearAllMocks();
+    // `clearAllMocks` keeps implementations, so the operator lookups have to be reset
+    // by hand — otherwise a case that seeds an operator leaks into the next one and the
+    // unified exchange keeps resolving a client token to an operator.
+    mocks.operatorRepo.getBySupabaseUid.mockReset();
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.operatorRepo.findByEmail.mockReset();
+    mocks.operatorRepo.findByEmail.mockResolvedValue(null);
     defaultSupabaseMocks();
     app = await buildApp();
   });
@@ -353,11 +378,19 @@ describe('client auth: Supabase-managed login', () => {
   });
 });
 
-describe('client auth: register / forgot / reset-complete / exchange', () => {
+describe('client auth: register / forgot / exchange', () => {
   let app: App;
   beforeEach(async () => {
     redisStore.clear();
     vi.clearAllMocks();
+    // `clearAllMocks` keeps implementations, so the operator lookups are reset by
+    // hand. Without this, a case that seeds an operator row leaks into the next one
+    // and every later exchange resolves its client token to an operator — or to a
+    // suspended one, which is a 401.
+    mocks.operatorRepo.getBySupabaseUid.mockReset();
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.operatorRepo.findByEmail.mockReset();
+    mocks.operatorRepo.findByEmail.mockResolvedValue(null);
     defaultSupabaseMocks();
     app = await buildApp();
   });
@@ -419,7 +452,7 @@ describe('client auth: register / forgot / reset-complete / exchange', () => {
 
   it('forgot always answers ok and hands the email to Supabase', async () => {
     mocks.clientRepo.findByEmail.mockResolvedValue(null);
-    const res = await app.inject(post('/api/auth/client/forgot', { email: 'owner@ace.com' }));
+    const res = await app.inject(post('/api/auth/forgot', { email: 'owner@ace.com' }));
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ ok: true });
     expect(mocks.supabase.anon.auth.resetPasswordForEmail).toHaveBeenCalledWith('owner@ace.com', {
@@ -429,11 +462,14 @@ describe('client auth: register / forgot / reset-complete / exchange', () => {
 
   it('forgot fails closed when Supabase is unconfigured', async () => {
     mocks.supabase.supabaseAnon.mockReturnValue(null);
-    const res = await app.inject(post('/api/auth/client/forgot', { email: 'owner@ace.com' }));
+    const res = await app.inject(post('/api/auth/forgot', { email: 'owner@ace.com' }));
     expect(res.statusCode).toBe(503);
   });
 
-  it('reset-complete bumps the epoch so pre-reset sessions die', async () => {
+  it('exchange with rotate moves the epoch so pre-reset sessions die', async () => {
+    // The reset flow's whole revocation requirement, now folded into the exchange
+    // itself: bump and mint in one call, so a completed reset cannot leave a window
+    // where a pre-reset session is still valid because the bump call failed.
     seedSupabaseClient();
     mocks.supabase.admin.auth.getUser.mockResolvedValue({
       data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
@@ -441,13 +477,122 @@ describe('client auth: register / forgot / reset-complete / exchange', () => {
     });
     await app.inject(login('owner@ace.com', 'x'.repeat(10)));
     const before = redisStore.get(`cli:sess:epoch:${CLIENT_ID}`);
-    const res = await app.inject(post('/api/auth/client/reset-complete', { accessToken: 'jwt-1' }));
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({ ok: true, clientId: CLIENT_ID });
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1', rotate: true }));    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, kind: 'client', clientId: CLIENT_ID });
     const after = redisStore.get(`cli:sess:epoch:${CLIENT_ID}`);
     expect(after?.value).toBeTruthy();
     expect(after?.value).not.toBe(before?.value);
     expect(mocks.supabase.admin.auth.getUser).toHaveBeenCalledWith('jwt-1');
+  });
+
+  it('exchange without rotate leaves the epoch alone, so a plain sign-in does not evict devices', async () => {
+    seedSupabaseClient();
+    supabasePasswordOk();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    await app.inject(login('owner@ace.com', PASSWORD));
+    const before = redisStore.get(`cli:sess:epoch:${CLIENT_ID}`);
+    expect(before?.value).toBeTruthy();
+    await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    expect(redisStore.get(`cli:sess:epoch:${CLIENT_ID}`)?.value).toBe(before?.value);
+  });
+
+  it('refuses an identity linked to both an operator and a client', async () => {
+    // The schema permits this: `supabase_uid` is unique per table, not across them.
+    // Preferring either side would silently give one of two real people the other's
+    // privileges, so the conflict is refused and the caller is told nothing.
+    seedSupabaseClient();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue({
+      id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      name: 'Youssef',
+      email: 'youssef@example.com',
+      status: 'active',
+      supabaseUid: SUPABASE_UID,
+    });
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    expect(res.statusCode).toBe(401);
+    // The same answer as an unknown identity: the refusal must not confirm that either
+    // account exists.
+    expect(res.json()).toEqual({ error: 'invalid_credentials' });
+  });
+
+  it('resolves an operator when no client row shares the identity', async () => {
+    seedSupabaseClient();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue({
+      id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      name: 'Youssef',
+      email: 'youssef@example.com',
+      status: 'active',
+      supabaseUid: SUPABASE_UID,
+    });
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ kind: 'operator', email: 'youssef@example.com' });
+    expect(typeof res.json().globalEpoch).toBe('string');
+  });
+
+  it('does not link a client by email when an operator holds that address', async () => {
+    // An operator whose Supabase identity was never linked is a real state. Falling back
+    // to the client row for the same address would make one person both, which is the
+    // split this check exists to keep closed.
+    await seedActiveClient(); // passwordHash set, supabaseUid null
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.operatorRepo.findByEmail.mockResolvedValue({
+      id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      name: 'Youssef',
+      email: 'owner@ace.com',
+      status: 'active',
+      supabaseUid: null,
+    });
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    expect(res.statusCode).toBe(401);
+    expect(mocks.clientRepo.setSupabaseUid).not.toHaveBeenCalled();
+  });
+
+  it('still links a legacy client by email when no operator holds the address', async () => {
+    await seedActiveClient();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ kind: 'client', clientId: CLIENT_ID });
+    expect(mocks.clientRepo.setSupabaseUid).toHaveBeenCalledWith(CLIENT_ID, SUPABASE_UID);
+  });
+
+  it('exchange refuses a token that reaches a suspended operator', async () => {
+    seedSupabaseClient();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue({
+      id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      name: 'Youssef',
+      email: 'youssef@example.com',
+      status: 'suspended',
+      supabaseUid: SUPABASE_UID,
+    });
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toEqual({ error: 'invalid_credentials' });
   });
 
   it('exchange mints a session for a verified token', async () => {
@@ -456,7 +601,7 @@ describe('client auth: register / forgot / reset-complete / exchange', () => {
       data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
       error: null,
     });
-    const res = await app.inject(post('/api/auth/client/exchange', { accessToken: 'jwt-google' }));
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-google' }));
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.ok).toBe(true);
@@ -471,7 +616,7 @@ describe('client auth: register / forgot / reset-complete / exchange', () => {
       error: null,
     });
     mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
-    const res = await app.inject(post('/api/auth/client/exchange', { accessToken: 'jwt-1' }));
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ clientId: CLIENT_ID });
     expect(mocks.clientRepo.setSupabaseUid).toHaveBeenCalledWith(CLIENT_ID, SUPABASE_UID);
@@ -484,7 +629,7 @@ describe('client auth: register / forgot / reset-complete / exchange', () => {
     });
     mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
     mocks.clientRepo.findByEmail.mockResolvedValue(null);
-    const res = await app.inject(post('/api/auth/client/exchange', { accessToken: 'jwt-nobody' }));
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-nobody' }));
     expect(res.statusCode).toBe(401);
     expect(res.json()).toMatchObject({ error: 'invalid_credentials' });
   });
@@ -496,15 +641,181 @@ describe('client auth: register / forgot / reset-complete / exchange', () => {
       data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
       error: null,
     });
-    const res = await app.inject(post('/api/auth/client/exchange', { accessToken: 'jwt-1' }));
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
     expect(res.statusCode).toBe(401);
-    expect(res.json()).toMatchObject({ error: 'invalid_session' });
+    // A suspended account is refused exactly like one that does not exist, so the
+    // endpoint cannot be used to ask which accounts are disabled.
+    expect(res.json()).toMatchObject({ error: 'invalid_credentials' });
   });
 
   it('exchange fails closed when Supabase is unconfigured', async () => {
     mocks.supabase.supabaseAdmin.mockReturnValue(null);
-    const res = await app.inject(post('/api/auth/client/exchange', { accessToken: 'jwt-1' }));
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
     expect(res.statusCode).toBe(503);
+  });
+
+  it('exchange requires an access token', async () => {
+    expect((await app.inject(post('/api/auth/exchange', {}))).statusCode).toBe(400);
+    expect((await app.inject(post('/api/auth/exchange', { accessToken: '' }))).statusCode).toBe(400);
+    expect((await app.inject(post('/api/auth/exchange', { accessToken: 7 }))).statusCode).toBe(400);
+    expect((await app.inject(post('/api/auth/exchange', { accessToken: 'x'.repeat(8193) }))).statusCode).toBe(400);
+  });
+
+  it('exchange takes rotate only as a strict boolean', async () => {
+    // A non-boolean is a malformed body, refused at the edge. That is stronger than
+    // coercing it: there is no way for a caller's truthy string or 1 to mean "rotate",
+    // so no untrusted input can bump somebody's epoch and sign every other one of their
+    // devices out.
+    seedSupabaseClient();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    for (const rotate of ['true', 1, 'yes', {}, null]) {
+      const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1', rotate }));
+      expect(res.statusCode).toBe(400);
+    }
+    // Only an explicit true rotates, and it is the only thing that does.
+    const plain = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    expect(plain.statusCode).toBe(200);
+    const rotated = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1', rotate: true }));
+    expect(rotated.statusCode).toBe(200);
+  });
+
+  it('exchange mints a client session whose sid is usable against the API', async () => {
+    // The sid has to be a real session, not just a string: it is what the BFF forwards
+    // in `x-client-session` on every later request.
+    seedSupabaseClient();
+    supabasePasswordOk();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    const { sid, epoch, expiresIn } = res.json();
+    const stored = JSON.parse(redisStore.get(`cli:sess:${sha256(sid)}`)!.value);
+    expect(stored).toMatchObject({ clientId: CLIENT_ID, epoch });
+    expect(redisStore.get(`cli:sess:epoch:${CLIENT_ID}`)?.value).toBe(epoch);
+    expect(expiresIn).toBeGreaterThan(0);
+  });
+
+  it('exchange mints an operator session carrying both epochs', async () => {
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue({
+      id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      name: 'Youssef',
+      email: 'youssef@example.com',
+      status: 'active',
+      supabaseUid: SUPABASE_UID,
+    });
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+    const { sid, epoch, globalEpoch } = res.json();
+    const stored = JSON.parse(redisStore.get(`op:sess:${sha256(sid)}`)!.value);
+    expect(stored).toMatchObject({
+      operatorId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      epoch,
+      globalEpoch,
+    });
+    // Both are live keys, because a per-person bump and a blanket bump are two different
+    // events and neither may be invisible to a session minted here.
+    expect(redisStore.get('op:sess:epoch')?.value).toBe(globalEpoch);
+    expect(redisStore.get('op:sess:epoch:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee')?.value).toBe(epoch);
+  });
+
+  it('exchange does not mint a session when the session store is unreachable', async () => {
+    // A 200 with a sid that no request will ever honour is worse than a clear failure:
+    // the browser would hold a cookie that 401s on every call.
+    seedSupabaseClient();
+    supabasePasswordOk();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    const realGet = redisStore.get;
+    redisStore.get = () => {
+      throw new Error('redis down');
+    };
+    try {
+      const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-1' }));
+      expect(res.statusCode).toBe(503);
+      expect(res.json()).toEqual({ error: 'auth_unavailable' });
+    } finally {
+      // Restored, or every later test in the file inherits the outage and fails for an
+      // unrelated reason.
+      redisStore.get = realGet;
+    }
+  });
+});
+
+describe('POST /api/auth/logout', () => {
+  let app: App;
+  beforeEach(async () => {
+    redisStore.clear();
+    vi.clearAllMocks();
+    mocks.operatorRepo.getBySupabaseUid.mockReset();
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.operatorRepo.findByEmail.mockReset();
+    mocks.operatorRepo.findByEmail.mockResolvedValue(null);
+    defaultSupabaseMocks();
+    app = await buildApp();
+  });
+
+  function post(url: string, headers: Record<string, string> = {}) {
+    return { method: 'POST' as const, url, headers: { 'content-type': 'application/json', ...headers }, payload: '{}' };
+  }
+
+  function exchange(accessToken: string) {
+    return {
+      method: 'POST' as const,
+      url: '/api/auth/exchange',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({ accessToken }),
+    };
+  }
+
+  it('refuses a logout with no credential rather than pretending it worked', async () => {
+    // A 200 here would tell the user they are signed out when nothing was revoked.
+    const res = await app.inject(post('/api/auth/logout'));
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('revokes a client sid, so the same sid cannot be used again', async () => {
+    seedSupabaseClient();
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    const { sid } = (await app.inject(exchange('jwt-1'))).json();
+    expect(typeof sid).toBe('string');
+
+    const first = await app.inject(post('/api/auth/logout', { 'x-client-session': sid }));
+    expect(first.statusCode).toBe(200);
+    expect(redisStore.get(`cli:sess:${sha256(sid)}`)).toBeUndefined();
+  });
+
+  it('revokes an operator sid', async () => {
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: SUPABASE_UID, email: 'owner@ace.com' } },
+      error: null,
+    });
+    mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue({
+      id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      name: 'Youssef',
+      email: 'youssef@example.com',
+      status: 'active',
+      supabaseUid: SUPABASE_UID,
+    });
+    const { sid } = (await app.inject(exchange('jwt-1'))).json();
+    expect(typeof sid).toBe('string');
+
+    const res = await app.inject(post('/api/auth/logout', { 'x-operator-session': sid }));
+    expect(res.statusCode).toBe(200);
+    expect(redisStore.get(`op:sess:${sha256(sid)}`)).toBeUndefined();
   });
 });
 

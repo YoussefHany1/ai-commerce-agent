@@ -26,6 +26,7 @@ export async function dbPing(): Promise<boolean> {
  */
 const RLS_TABLES = [
   'clients',
+  'operators',
   'stores',
   'platform_connections',
   'products',

@@ -71,10 +71,20 @@ beforeEach(() => {
   };
   createDashboardSupabaseClient.mockReset();
   createDashboardSupabaseClient.mockImplementation(() => ({ auth }));
-  // Default upstream answers: reset-complete then exchange both succeed.
+  // One upstream call now: `/api/auth/exchange` with `rotate` both bumps the epoch and
+  // mints the session, so there is no window where a pre-reset session survives.
   stubFetch((url) => {
     if (url.endsWith('/exchange')) {
-      return jsonResponse({ ok: true, clientId: 'client-1', sid: 'sid-1', epoch: 'epoch-1', name: 'Nadia', email: 'n@b.c' });
+      return jsonResponse({
+        ok: true,
+        kind: 'client',
+        clientId: 'client-1',
+        sid: 'sid-1',
+        epoch: 'epoch-1',
+        expiresIn: 3600,
+        name: 'Nadia',
+        email: 'n@b.c',
+      });
     }
     return jsonResponse({ ok: true });
   });
@@ -111,7 +121,7 @@ describe('POST /api/auth/reset', () => {
     expect(auth.updateUser).not.toHaveBeenCalled();
   });
 
-  it('verifies, rotates the password, bumps the epoch, exchanges and signs in', async () => {
+  it('verifies, rotates the password, then exchanges with rotate in one call', async () => {
     auth.verifyOtp.mockResolvedValue({
       data: { session: { access_token: 'verify-token', user: { id: 'u1' } } },
       error: null,
@@ -125,7 +135,7 @@ describe('POST /api/auth/reset', () => {
 
     const res = await post(VALID);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, kind: 'client' });
 
     expect(auth.verifyOtp).toHaveBeenCalledWith({
       type: 'recovery',
@@ -134,24 +144,71 @@ describe('POST /api/auth/reset', () => {
     });
     expect(auth.updateUser).toHaveBeenCalledWith({ password: VALID.password });
 
-    // The stalest token must not be used: reset-complete and exchange both got the
-    // token read *after* the rotation, and in visit order.
+    // One call, carrying the token read *after* the rotation and asking for the bump.
+    // The epoch change and the new session are the same transaction upstream, so a
+    // pre-reset cookie cannot survive a completed reset.
     const fetchMock = vi.mocked(globalThis.fetch);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const [bump, exchange] = fetchMock.mock.calls.map(([url, init]) => ({
-      url: String(url),
-      body: JSON.parse(String((init as RequestInit).body)),
-    }));
-    expect(bump.url.endsWith('/api/auth/client/reset-complete')).toBe(true);
-    expect(bump.body).toEqual({ accessToken: 'rotated-token' });
-    expect(exchange.url.endsWith('/api/auth/client/exchange')).toBe(true);
-    expect(exchange.body).toEqual({ accessToken: 'rotated-token' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url).endsWith('/api/auth/exchange')).toBe(true);
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+      accessToken: 'rotated-token',
+      rotate: true,
+    });
 
     expect(cookieStore.written).toHaveLength(1);
     expect(cookieStore.written[0].name).toBe('aca_session');
     const payload = JSON.parse(Buffer.from(cookieStore.written[0].value.split('.')[0], 'base64url').toString('utf8'));
     expect(payload.kind).toBe('client');
     expect(payload.epoch).toBe('epoch-1');
+  });
+
+  it('signs an operator in on the same link, with both of its epochs', async () => {
+    // The route does not know or care which kind the recovery token resolves to; the
+    // API decides, and the cookie has to carry whatever that kind requires.
+    auth.verifyOtp.mockResolvedValue({
+      data: { session: { access_token: 'verify-token' } },
+      error: null,
+    });
+    auth.updateUser.mockResolvedValue({ error: null });
+    auth.getSession.mockResolvedValue({ data: { session: { access_token: 'rotated-token' } }, error: null });
+    stubFetch((url) =>
+      url.endsWith('/exchange')
+        ? jsonResponse({
+            ok: true,
+            kind: 'operator',
+            operatorId: 'op-1',
+            sid: 'op-sid-1',
+            epoch: 'op-epoch-1',
+            globalEpoch: 'global-epoch-1',
+            expiresIn: 3600,
+            name: 'Youssef',
+          })
+        : jsonResponse({ ok: true }),
+    );
+
+    const res = await post(VALID);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, kind: 'operator' });
+    const payload = JSON.parse(Buffer.from(cookieStore.written[0].value.split('.')[0], 'base64url').toString('utf8'));
+    expect(payload).toMatchObject({
+      kind: 'operator',
+      operatorId: 'op-1',
+      epoch: 'op-epoch-1',
+      globalEpoch: 'global-epoch-1',
+    });
+  });
+
+  it('issues no cookie when the answer is not a complete session', async () => {
+    auth.verifyOtp.mockResolvedValue({ data: { session: { access_token: 'verify-token' } }, error: null });
+    auth.updateUser.mockResolvedValue({ error: null });
+    auth.getSession.mockResolvedValue({ data: { session: { access_token: 'rotated-token' } }, error: null });
+    // A 200 with no sid/epoch: the password was rotated, but nothing can be signed in.
+    stubFetch(() => jsonResponse({ ok: true }));
+
+    const res = await post(VALID);
+    expect(res.status).toBe(503);
+    expect(cookieStore.written).toHaveLength(0);
   });
 
   it('uses the verified session token when rotation returns no new session', async () => {
@@ -165,10 +222,11 @@ describe('POST /api/auth/reset', () => {
     const res = await post(VALID);
     expect(res.status).toBe(200);
     const fetchMock = vi.mocked(globalThis.fetch);
-    const [, exchange] = fetchMock.mock.calls.map(([, init]) =>
-      JSON.parse(String((init as RequestInit).body)),
-    );
-    expect(exchange).toEqual({ accessToken: 'verify-token' });
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+      accessToken: 'verify-token',
+      rotate: true,
+    });
   });
 
   it('returns 400 invalid_link when the password rotate fails', async () => {
@@ -180,14 +238,11 @@ describe('POST /api/auth/reset', () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
-  it('relays a reset-complete rejection without issuing a cookie', async () => {
+  it('relays an exchange rejection without issuing a cookie', async () => {
     auth.verifyOtp.mockResolvedValue({ data: { session: { access_token: 'verify-token' } }, error: null });
     auth.updateUser.mockResolvedValue({ error: null });
     auth.getSession.mockResolvedValue({ data: { session: null }, error: null });
-    stubFetch((url) => {
-      if (url.endsWith('/reset-complete')) return jsonResponse({ error: 'invalid_credentials' }, 401);
-      return jsonResponse({ ok: true });
-    });
+    stubFetch(() => jsonResponse({ error: 'invalid_credentials' }, 401));
 
     const res = await post(VALID);
     expect(res.status).toBe(401);

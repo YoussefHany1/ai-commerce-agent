@@ -1,4 +1,4 @@
-import { test, expect, describe, vi, beforeAll } from 'vitest';
+import { test, expect, describe, vi } from 'vitest';
 import { loadConfig } from './config.js';
 
 vi.mock('../integrations/shopify.js', () => ({
@@ -71,17 +71,14 @@ describe('config', () => {
   describe('production DATABASE_URL', () => {
     // Satisfies the other three production gates so each case below fails (or
     // passes) on DATABASE_URL alone.
-    let OPERATOR_HASH = '';
-    beforeAll(async () => {
-      const { hashOperatorPassword } = await import('./lib/passwordHash.js');
-      OPERATOR_HASH = await hashOperatorPassword('correct horse battery staple');
-    });
-
     const prod = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
       ...base(),
       NODE_ENV: 'production',
       ADMIN_API_KEY: 'k'.repeat(32),
-      OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
+      // Every human credential is Supabase's, so production cannot boot without them.
+      SUPABASE_URL: 'https://project.supabase.co',
+      SUPABASE_ANON_KEY: 'anon-key',
+      SUPABASE_SERVICE_ROLE_KEY: 'service-role-key',
       TRUST_PROXY: '1',
       ...over,
     });
@@ -107,6 +104,37 @@ describe('config', () => {
 
     test('stays optional outside production so local compose and CI are unaffected', () => {
       expect(loadConfig(base()).DATABASE_URL).toBeTruthy();
+    });
+  });
+
+  describe('production Supabase credentials', () => {
+    const prod = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+      ...base(),
+      NODE_ENV: 'production',
+      ADMIN_API_KEY: 'k'.repeat(32),
+      DATABASE_URL: 'postgres://agent_app:pw@db:5432/app',
+      TRUST_PROXY: '1',
+      SUPABASE_URL: 'https://project.supabase.co',
+      SUPABASE_ANON_KEY: 'anon-key',
+      SUPABASE_SERVICE_ROLE_KEY: 'service-role-key',
+      ...over,
+    });
+
+    test('refuses to boot without them, since no credential could be verified', () => {
+      expect(() => loadConfig(prod({ SUPABASE_URL: undefined }))).toThrow(
+        /SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY/,
+      );
+      expect(() => loadConfig(prod({ SUPABASE_ANON_KEY: undefined }))).toThrow(
+        /SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY/,
+      );
+      expect(() => loadConfig(prod({ SUPABASE_SERVICE_ROLE_KEY: undefined }))).toThrow(
+        /SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY/,
+      );
+    });
+
+    test('stays optional outside production so an all-local run still boots', () => {
+      const cfg = loadConfig(base());
+      expect(cfg.SUPABASE_URL).toBeUndefined();
     });
   });
 });

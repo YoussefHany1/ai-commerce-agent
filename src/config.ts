@@ -1,20 +1,20 @@
 import { z } from 'zod';
-import { isOperatorHashFormat } from './lib/passwordHash.js';
 
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   APP_BASE_URL: z.string().url().default('http://localhost:3000'),
   OAUTH_REDIRECT_ALLOWLIST: z.string().optional(),
   CORS_ORIGINS: z.string().optional(),
-  // Supabase Auth + Postgres. Required once client credentials move to Supabase;
-  // optional until then so the API still boots in an all-local setup.
+  // Supabase Auth + Postgres. Every human credential in this system now belongs to
+  // Supabase — there is no password here to compare — so these are required in
+  // production: the anon key verifies sign-ins, the service role key resolves
+  // OAuth tokens and manages identities. Optional only to keep an all-local,
+  // no-login setup bootable for tests and scripts.
   SUPABASE_URL: z.string().url().optional(),
   SUPABASE_ANON_KEY: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   ADMIN_API_KEY: z.string().min(32).optional(),
   ADMIN_API_KEY_PREVIOUS: z.string().min(32).optional(),
-  OPERATOR_PASSWORD_HASH: z.string().optional(),
-  OPERATOR_PASSWORD_HASH_PREVIOUS: z.string().optional(),
   SENTRY_DSN: z.string().optional(),
   TRUST_PROXY: z.enum(['1', '0', 'true', 'false', 'none']).default('false'),
   DATABASE_URL: z
@@ -50,6 +50,10 @@ const schema = z.object({
   RATE_LIMIT_CHAT_PER_MIN: z.coerce.number().int().positive().default(20),
   SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
   CLIENT_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(8 * 60 * 60),
+  // Operator sessions are longer-lived than the legacy shared password ever implied:
+  // each one now belongs to a person, who is expected to use Google so there is no
+  // password to type, and who should not be signed out mid-task.
+  OPERATOR_SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(12 * 60 * 60),
   WEBHOOK_BODY_LIMIT: z.coerce.number().int().positive().default(5 * 1024 * 1024),
   RETENTION_CONVERSATIONS_DAYS: z.coerce.number().int().positive().default(365),
   RETENTION_ATTRIBUTIONS_DAYS: z.coerce.number().int().positive().default(365),
@@ -108,10 +112,10 @@ export function loadConfig(raw: NodeJS.ProcessEnv = process.env) {
   if (isProd && !parsed.ADMIN_API_KEY) {
     throw new Error('ADMIN_API_KEY is required in production — set a key of at least 32 characters');
   }
-  if (isProd && !isOperatorHashFormat(raw.OPERATOR_PASSWORD_HASH)) {
+  if (isProd && !(raw.SUPABASE_URL && raw.SUPABASE_ANON_KEY && raw.SUPABASE_SERVICE_ROLE_KEY)) {
     throw new Error(
-      'OPERATOR_PASSWORD_HASH must be a scrypt hash in production (scrypt$N$r$p$salt$hash) — ' +
-        'generate one with `npm run hash-operator-password` rather than storing a plaintext password',
+      'SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY are all required in production — ' +
+        'operator and client credentials are verified by Supabase, so without them nobody can sign in',
     );
   }
   if (isProd) {

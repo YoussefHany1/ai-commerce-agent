@@ -37,8 +37,10 @@ jobs:
           # Compose interpolation validates these for every service, so the web
           # image's runtime contract has to be satisfied even though only the build
           # runs here. These are throwaway values, never used to serve traffic.
-          ADMIN_API_KEY: ci-admin-key-0123456789abcdef0123456789
+          # No ADMIN_API_KEY: the dashboard no longer takes one.
           SESSION_SECRET: ci-session-secret-0123456789abcdef0123456789
+          SUPABASE_URL: https://ci-placeholder.supabase.co
+          SUPABASE_ANON_KEY: ci-anon-placeholder-key
         run: |
           docker compose build migrate
           docker compose build app
@@ -49,10 +51,11 @@ jobs:
       # network could not reach, and the image built cleanly every time.
       - name: Boot the web image and check it is reachable off-loopback
         env:
-          ADMIN_API_KEY: ci-admin-key-0123456789abcdef0123456789
           SESSION_SECRET: ci-session-secret-0123456789abcdef0123456789
           API_URL: http://api.invalid:3000
           REDIS_URL: redis://redis:6379
+          SUPABASE_URL: https://ci-placeholder.supabase.co
+          SUPABASE_ANON_KEY: ci-anon-placeholder-key
         run: |
           set -euo pipefail
           # Resolved from compose so this does not depend on the project-name prefix
@@ -62,7 +65,7 @@ jobs:
           # Deliberately no -e HOSTNAME: this must exercise whatever the image
           # and the Docker daemon supply on their own, which is the production case.
           docker run -d --name web-reachability -p 18081:3001 \
-            -e ADMIN_API_KEY -e SESSION_SECRET -e API_URL -e REDIS_URL \
+            -e SESSION_SECRET -e API_URL -e REDIS_URL -e SUPABASE_URL -e SUPABASE_ANON_KEY \
             "$WEB_IMAGE"
           trap 'docker logs web-reachability; docker rm -f web-reachability' EXIT
 
@@ -111,7 +114,7 @@ jobs:
       - name: Audit the client bundle for leaked credentials
         working-directory: web
         run: |
-          if grep -rlE 'ADMIN_API_KEY|SESSION_SECRET|OPERATOR_PASSWORD_HASH|REDIS_URL|redis://' .next/static; then
+          if grep -rlE 'ADMIN_API_KEY|SESSION_SECRET|SUPABASE_|OPERATOR_PASSWORD_HASH|REDIS_URL|redis://' .next/static; then
             echo "::error::a privileged identifier reached the client bundle"
             exit 1
           fi
@@ -176,10 +179,13 @@ jobs:
       APP_DB_PASSWORD: ci-agent-app
       ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       ADMIN_API_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef
-      # Production mode refuses to boot without a well-formed operator hash; the
-      # throwaway value below is scrypt-shaped so config validation is genuinely
-      # exercised rather than skipped.
-      OPERATOR_PASSWORD_HASH: scrypt$16384$8$1$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000
+      # Production mode refuses to boot without Supabase, because every human
+      # credential is verified there. Well-formed throwaway values, so config
+      # validation is genuinely exercised rather than skipped. No operator hash:
+      # there is no password in this service to compare any more.
+      SUPABASE_URL: https://ci-placeholder.supabase.co
+      SUPABASE_ANON_KEY: ci-anon-placeholder-key
+      SUPABASE_SERVICE_ROLE_KEY: ci-service-role-placeholder-key
       TRUST_PROXY: "none"
       WORKERS_ENABLED: "false"
       NODE_ENV: production

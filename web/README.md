@@ -14,52 +14,64 @@ Premium SaaS dashboard for the AI Commerce Agent backend (Fastify API in the rep
 ## Getting started
 
 ```bash
-cp .env.local.example .env.local   # the proxy cannot authenticate without ADMIN_API_KEY
+cp .env.local.example .env.local   # needs SESSION_SECRET, REDIS_URL and the Supabase anon key
 npm install
 npm run dev                        # http://localhost:3001
 ```
 
-Then sign in at `/login` with the operator password. In local dev over plain http,
-set `SESSION_COOKIE_SECURE=false`, or the browser will refuse to store the cookie.
+Then sign in at `/login` with an operator's **email and password** — there is no shared
+install-wide operator password any more. In local dev over plain http, set
+`SESSION_COOKIE_SECURE=false`, or the browser will refuse to store the cookie.
 
 ## How authentication works
 
-The browser never holds a credential. It posts the password once to this app's own
-`/api/auth/login`, which forwards to the API: the operator branch hits
-`/api/auth/operator/verify` (scrypt hash + Redis attempt counter → session epoch), the store
-(merchant client) branch hits `/api/auth/client/login` and receives a `sid` bound to the
-account's epoch. This app mints an `HttpOnly` `aca_session` cookie (8h, `Secure`,
-`SameSite=Lax`) carrying the credential type (`operator` | `client`), the matching epoch, and
-— for clients — the sid and account identity.
+The browser never holds a credential. It posts email and password once to this app's own
+`/api/auth/login`, which forwards to the API's `/api/auth/operator/login` or
+`/api/auth/client/login`. Supabase verifies the credential — there is no password hash
+in this codebase for a human any more — and the API answers with a `sid`. This app mints
+an `HttpOnly` `aca_session` cookie (`Secure`, `SameSite=Lax`) carrying the credential
+kind (`operator` | `client`), the session id, and the epochs that session is bound to.
 
-Every data call goes to this app's own `/api/*` route handlers, which verify the cookie and
-check the epoch against Redis, then call the API:
+Every data call goes to this app's own `/api/*` route handlers, which verify the cookie
+and check the epochs against Redis, then forward exactly one of:
 
-- **operator**: attaches `ADMIN_API_KEY`.
-- **client**: attaches `x-client-session: <sid>` and **never** `x-api-key`.
+- **operator**: `x-operator-session: <sid>`
+- **client**: `x-client-session: <sid>`
 
-Client accounts (merchant login/register/forgot/reset, Google OAuth) sign in through
-**Supabase Auth**, served by dedicated BFF routes (`/api/auth/client/login`,
-`/register`, `/forgot`, `/reset`, `/auth/callback`): the email/password form, the PKCE
-OAuth exchange, and the password-reset OTP all happen against Supabase in the server
-runtime, and the browser only ever receives this app's own `aca_session` cookie. Leave
-`SUPABASE_URL`/`SUPABASE_ANON_KEY` unset and the client branch stays closed (fail-closed
+Never `x-api-key`. This service does not have `ADMIN_API_KEY` at all — it is a machine
+credential for the CLI, and a session is resolvable to a person without it, so there is
+nothing here for it to authenticate.
+
+Both branches of the login form, the Google button, and the password-recovery link are
+one flow now. The OAuth callback cannot know which kind of person is arriving — it is one
+redirect either way — so it hands the token to `/api/auth/exchange` and mints whichever
+session the API says that token earned. The API resolves a Supabase token to exactly one
+local row; a uid bound to both `operators` and `clients` is refused as a conflict.
+
+Client accounts (merchant login/register/forgot/reset, Google OAuth) and operators use
+the same Supabase identities and the same BFF routes (`/api/auth/login`, `/register`,
+`/forgot`, `/reset`, `/auth/callback`): the email/password form, the PKCE OAuth
+exchange, and the password-reset OTP all happen against Supabase in the server runtime,
+and the browser only ever receives this app's own `aca_session` cookie. Leave
+`SUPABASE_URL`/`SUPABASE_ANON_KEY` unset and both branches stay closed (fail-closed
 `503`s on the web side).
 
-The API is still the source of truth: it re-resolves the sid, re-reads the account status and
-store ownership on every guarded call, and its epoch keys are what make revocation instant.
-Consequences worth knowing:
+The API is still the source of truth: it re-resolves the sid, re-reads the account status
+and store ownership on every guarded call, and its epoch keys are what make revocation
+instant. Consequences worth knowing:
 
 - `NEXT_PUBLIC_ADMIN_API_KEY` does not exist and must not be reintroduced. Any
   `NEXT_PUBLIC_`-prefixed value is inlined into the public bundle.
 - `REDIS_URL` must point at the same Redis as the API. It is what makes
-  `npm run revoke-operator-sessions` on the API take effect here, and what lets client
+  `npm run operator:revoke-sessions` on the API take effect here, and what lets client
   suspension/password resets log every live client out (`cli:sess:epoch:{clientId}`).
-- The client cookie is minted for the lifetime the API returns (`expiresIn` =
-  `CLIENT_SESSION_TTL_SECONDS` on the API), so that one knob governs both sides.
+- Operator revocation has two scopes, and this service can only honour the install-wide
+  one: a per-operator epoch bump happens on the API's Redis, and the cookie carries that
+  per-person epoch, so one person can be signed out without the rest being disturbed.
+- The cookie is minted for the lifetime the API returns (`expiresIn` =
+  `CLIENT_SESSION_TTL_SECONDS` or `OPERATOR_SESSION_TTL_SECONDS`), so those knobs govern
+  both sides.
 - The API no longer needs to be CORS-reachable from a browser.
-- When a request would carry both a client session and the admin key, the API treats it as
-  the client (a possession cannot upgrade to operator scope).
 
 `web/proxy.ts` redirects signed-out visitors away from `/dashboard` on the Edge
 runtime, where neither `node:crypto` nor Redis is available, so it checks cookie
@@ -100,12 +112,16 @@ runtime.
 | ----------------------- | ------ | ----------------------- | -------------------------------------------------------------- |
 | `NEXT_PUBLIC_API_URL`   | yes    | `http://localhost:3000` | Public API origin. Inlined at build time. OAuth link + webhook display only |
 | `API_URL`               | no     | —                       | Server-side upstream target for the proxy                       |
-| `ADMIN_API_KEY`         | no     | —                       | Operator credential the proxy attaches; must match the API       |
 | `SESSION_SECRET`        | no     | —                       | HMAC key for the session cookie, min 32 chars                    |
-| `SUPABASE_URL`          | no     | —                       | Supabase project URL for client auth (BFF-side)                  |
+| `SUPABASE_URL`          | no     | —                       | Supabase project URL; must match the API's                     |
 | `SUPABASE_ANON_KEY`     | no     | —                       | Anon (public) key, not the service-role key; never inlined       |
-| `REDIS_URL`             | no     | —                       | Same Redis as the API, for the session epoch                     |
+| `REDIS_URL`             | no     | —                       | Same Redis as the API, for the session epochs                    |
 | `SESSION_COOKIE_SECURE` | no     | `Secure` in production  | Set `false` for local http                                       |
+
+`SUPABASE_SERVICE_ROLE_KEY` must never appear here. It bypasses RLS on every table and can
+rewrite any auth user; `scripts/check-render.mjs` fails the build if the web service is
+given it. `ADMIN_API_KEY` is likewise not needed and should be removed if it is still
+present — the checker rejects that too.
 
 ## Commands
 

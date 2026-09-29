@@ -52,10 +52,8 @@ The server refuses to start in `NODE_ENV=production` if any of these are missing
 malformed, rather than degrading into an unauthenticated or unrevocable state.
 
 - `ENCRYPTION_KEY` — required; `openssl rand -hex 32`.
-- `ADMIN_API_KEY` — required to enable API-key auth on all admin routes; `openssl rand -hex 32`.
-- `OPERATOR_PASSWORD_HASH` — required, in `scrypt$N$r$p$salt$hash` form. Generate with
-  `npm run hash-operator-password`, which prompts without echoing and prints the value
-  to put here. The plaintext password is never stored or logged.
+- `ADMIN_API_KEY` — required for machine callers (CLI, scripts) on the admin routes; `openssl rand -hex 32`. It is **not** a browser or dashboard credential: the dashboard authenticates with a signed session cookie, and `scripts/check-render.mjs` fails the build if the web service is given this key.
+- `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` — all three required. Every human credential, operator and client alike, is verified by Supabase, so without them nobody can sign in and the server refuses to start rather than serving an unauthenticated dashboard.
 - `TRUST_PROXY` — required, and must be explicit. Set `true` (or `1`) when a reverse
   proxy or PaaS edge sets `X-Forwarded-For`; set `none` when nothing does. Guessing
   wrong is not cosmetic: with it wrongly off, every request appears to come from the
@@ -65,28 +63,58 @@ malformed, rather than degrading into an unauthenticated or unrevocable state.
 - `WORKERS_ENABLED` — defaults to `true`. Set `false` on a replica that should only
   serve traffic; see "Scaling out" below.
 
-Optional rotation values: `ADMIN_API_KEY_PREVIOUS` and `OPERATOR_PASSWORD_HASH_PREVIOUS`
-are accepted alongside their current counterparts so a secret can be rotated across two
-deploys. Clear the `_PREVIOUS` value on the deploy after the rotation.
+There is **no `OPERATOR_PASSWORD_HASH`**. An operator is a row in `operators` bound to a
+Supabase identity; their password lives in Supabase, not here. See "Provisioning the
+first operator" below.
 
-Optional: `CLIENT_SESSION_TTL_SECONDS` (seconds, default `28800` = 8h) — how long a merchant
-client stays signed in. The API returns it as `expiresIn` and the dashboard mints its cookie
-for the same lifetime, so it is a single knob.
+`ADMIN_API_KEY_PREVIOUS` is accepted alongside `ADMIN_API_KEY` so the key can be rotated
+across two deploys. Clear the `_PREVIOUS` value on the deploy after the rotation. It is
+the only `_PREVIOUS` left: a shared password could be rotated the same way, but there is
+no shared password left to rotate.
+
+Optional: `CLIENT_SESSION_TTL_SECONDS` (seconds, default `28800` = 8h) and
+`OPERATOR_SESSION_TTL_SECONDS` (default `43200` = 12h) — how long a merchant client or an
+operator stays signed in. The API returns the lifetime as `expiresIn` and the dashboard
+mints its cookie for the same value, so each is a single knob.
+
+## Provisioning the first operator
+
+Apply migration `0012_operators` **before** deploying the new code: `/api/health` queries
+the `operators` table, so the API will not pass its health check without it.
+
+```bash
+PGADMIN_URL=postgres://agent_owner:...@host/db?sslmode=require npm run db:bootstrap
+npm run operator:create -- --name "Your Name" --email you@example.com
+```
+
+The script creates the Supabase identity, inserts the `operators` row, and prints a
+single-use sign-in link. Send that to the operator over a channel you trust; opening it
+lets them set their own password. It is the only credential path, so do not treat the
+link as disposable mail.
+
+There is no default password and no recovery fallback: if you lose the link, run the
+script again with `--link` to re-print one for an operator that already exists.
 
 ## Operator access and session revocation
 
 The dashboard (`web/`) is a separate service that authenticates with a signed session
-cookie. Three things follow, and all three are easy to get wrong:
+cookie. Four things follow, and all four are easy to get wrong:
 
-- The web service needs the **same Redis** as the API. The operator session epoch lives
-  in the key `op:sess:epoch`, and it is what makes revocation take effect immediately.
-- To sign every operator out right now — after a suspected password leak, say:
+- The web service needs the **same Redis** as the API. Both session epochs live there,
+  and they are what make revocation take effect immediately.
+- To sign every operator out right now — after a suspected leak, say:
   ```bash
-  npm run revoke-operator-sessions   # bumps op:sess:epoch; existing cookies stop working
+  npm run operator:revoke-sessions                      # bumps op:sess:epoch
+  npm run operator:revoke-sessions -- --email a@b.c     # just that one person
   ```
-  This is instant and needs no redeploy. It does not invalidate the API key itself.
-- Rotating `SESSION_SECRET` on the web service also signs everyone out, by making every
-  issued cookie unverifiable.
+  The install-wide form is instant and needs no redeploy. The per-person form is the
+  operation you usually want: a stolen laptop should not sign your whole team out.
+  Neither invalidates the API key.
+- Revoking a session does not revoke the *credential*. Bumping an epoch stops the current
+  sessions but leaves the password working, so someone can sign in again. For a real
+  compromise, suspend the account or reset its Supabase password as well.
+- Rotating `SESSION_SECRET` on the web service signs everyone out, operator and client
+  alike, by making every issued cookie unverifiable.
 
 Failed operator logins are counted in Redis: five failures triggers a lockout starting at
 30 seconds, doubling on each further failure up to 15 minutes. If Redis is unreachable the
@@ -229,20 +257,25 @@ When unset the server still logs errors and proceeds without Sentry.
 1. Provision a VM + reverse proxy (Nginx/Caddy above), Postgres, and Redis.
 2. Generate secrets and write `.env`:
    ```bash
-   npm run hash-operator-password   # OPERATOR_PASSWORD_HASH (prompts, does not echo)
    openssl rand -hex 32   # ENCRYPTION_KEY
    openssl rand -hex 32   # ADMIN_API_KEY
    openssl rand -hex 32   # SESSION_SECRET (dashboard)
    openssl rand -hex 32   # POSTGRES_PASSWORD / REDIS_PASSWORD (compose)
    ```
-   Then set `TRUST_PROXY` explicitly — see "Required environment variables" above.
+   Then set `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` (copy the
+   first two to the dashboard's env, and **not** the third), and set `TRUST_PROXY`
+   explicitly — see "Required environment variables" above.
 3. Start infra, migrate, and apply RLS once (migrations job uses `PGADMIN_URL`):
    ```bash
    docker compose up -d postgres redis
    npm run db:setup && npm run db:bootstrap
    ```
-4. Build and start the app (see README — Docker or `npm run build && npm run start:prod`).
-5. Wire platform credentials (`SHOPIFY_CLIENT_ID/SECRET`, Salla/Zid, `WHATSAPP_*`,
+4. Provision the first operator and send them the printed link:
+   ```bash
+   npm run operator:create -- --name "Your Name" --email you@example.com
+   ```
+5. Build and start the app (see README — Docker or `npm run build && npm run start:prod`).
+6. Wire platform credentials (`SHOPIFY_CLIENT_ID/SECRET`, Salla/Zid, `WHATSAPP_*`,
    `STRIPE_*`) and verify `GET /api/health` → `200`.
 6. Create stores via `POST /api/stores` (operator key) and issue per-store keys:
    ```bash
@@ -275,12 +308,17 @@ When unset the server still logs errors and proceeds without Sentry.
 - **Store key rotation**: `POST /api/stores/<storeId>/keys` replaces the key atomically.
   Old key is invalid the moment the new one is stored; coordinate with the merchant's dashboard.
 - **Admin key rotation**: deploy with the new key in `ADMIN_API_KEY` and the old one in
-  `ADMIN_API_KEY_PREVIOUS`, point the dashboard at the new key, then clear
-  `ADMIN_API_KEY_PREVIOUS` on the next deploy. Two deploys, no lockout.
-- **Operator password rotation**: `npm run hash-operator-password`, deploy with the new
-  hash in `OPERATOR_PASSWORD_HASH` and the old one in `OPERATOR_PASSWORD_HASH_PREVIOUS`,
-  then clear the `_PREVIOUS` value. To invalidate every existing session as well, run
-  `npm run revoke-operator-sessions` in the same window.
+  `ADMIN_API_KEY_PREVIOUS`, then clear `ADMIN_API_KEY_PREVIOUS` on the next deploy. Two
+  deploys, no lockout. Nothing to repoint: the dashboard does not hold this key.
+- **Operator compromise**: revoke that person's sessions and stop the credential, in this
+  order — reset the password, then `npm run operator:revoke-sessions -- --email …`. Doing
+  it the other way round leaves a working password with no sessions, which is a smaller
+  incident but still an open one. To end access without touching the password, suspend the
+  account instead; a suspended operator is refused on every call and their live sessions
+  stop verifying.
+- **Suspending the last active operator is refused.** If you have suspended yourself, the
+  install is reachable only by resuming your row in `operators` directly, or via
+  `ADMIN_API_KEY` on the API. Plan the second operator before you need it.
 - **Restore from backup**:
   ```bash
   gunzip -c backups/backup-*.sql.gz | psql "$DATABASE_URL"

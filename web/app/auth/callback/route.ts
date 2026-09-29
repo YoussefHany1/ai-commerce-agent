@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createDashboardSupabaseClient } from '@/lib/server/supabase';
-import { callClientAuth, mintClientSessionCookie, safeNext } from '@/lib/server/clientExchange';
+import { callAuthApi, mintSessionCookie, safeNext } from '@/lib/server/authExchange';
 
 export const dynamic = 'force-dynamic';
 
@@ -12,6 +12,12 @@ export const dynamic = 'force-dynamic';
  * immediately traded for this app's own session id and dropped; the browser never
  * holds it. Any failure redirects to /login rather than rendering an error body,
  * which keeps the failed attempt unrevealing.
+ *
+ * This is the route where the operator/client question is settled, and it is settled
+ * upstream. The same Google button serves both — an operator is a person, and people
+ * arrive with the provider's session, not with a password typed into a second form —
+ * so the callback cannot ask which one to mint. It exchanges the code, hands the token
+ * to `/api/auth/exchange`, and writes whichever cookie the API says that token earned.
  */
 export async function GET(request: Request): Promise<NextResponse> {
   const login = (error: string) => NextResponse.redirect(new URL(`/login?error=${error}`, request.url));
@@ -34,10 +40,10 @@ export async function GET(request: Request): Promise<NextResponse> {
   const accessToken = data.session?.access_token;
   if (getError || !accessToken) return login('auth_callback');
 
-  const out = await callClientAuth('exchange', { accessToken });
+  const out = await callAuthApi('exchange', { accessToken });
   if (out.status !== 200) return login('auth_unavailable');
 
-  const minted = await mintClientSessionCookie(out.payload);
+  const minted = await mintSessionCookie(out.payload);
   if (!minted) return login('auth_unavailable');
 
   return NextResponse.redirect(new URL(safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard', request.url));

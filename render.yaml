@@ -8,15 +8,23 @@
 #    `vector(1536)` column. Create the database at a provider that does (Neon,
 #    Supabase, Timescale) and set DATABASE_URL / PGADMIN_URL to it.
 # 2. Set the secrets marked `sync: false`:
-#      openssl rand -hex 32     # ADMIN_API_KEY — the SAME value on agent-api and
-#                               #   agent-web; ENCRYPTION_KEY
-#      npm run hash-operator-password   # OPERATOR_PASSWORD_HASH
+#      openssl rand -hex 32     # ADMIN_API_KEY — on agent-api only now, not agent-web;
+#                               # ENCRYPTION_KEY
 #    SESSION_SECRET is the one secret left on `generateValue`, because only
 #    agent-web reads it and so there is no second copy to drift out of sync with.
-# 3. Set API_URL on the web service to the API's private origin (http://agent-api:10000)
+# 3. Set SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY on agent-api.
+#    Every human credential — operator and client — is verified by Supabase, so the
+#    API refuses to boot in production without them. agent-web needs SUPABASE_URL
+#    and SUPABASE_ANON_KEY only, and must NOT get the service-role key.
+# 4. Set API_URL on the web service to the API's private origin (http://agent-api:10000)
 #    and OAUTH_REDIRECT_ALLOWLIST to the dashboard's public URL, otherwise the Shopify
 #    install dead-ends on a raw JSON response.
-# 4. Confirm pgvector is available:  psql $DATABASE_URL -c 'CREATE EXTENSION IF NOT EXISTS vector'
+# 5. Confirm pgvector is available:  psql $DATABASE_URL -c 'CREATE EXTENSION IF NOT EXISTS vector'
+# 6. Apply migration 0012_operators BEFORE the first deploy of the new code — health
+#    checks query `operators` — then provision the first one:
+#      npm run db:bootstrap      # with PGADMIN_URL pointed at the database
+#      npm run operator:create -- --name "Your Name" --email you@example.com
+#    There is no OPERATOR_PASSWORD_HASH any more, and no `npm run hash-operator-password`.
 
 # No `databases:` block on purpose. The database must come from a provider that
 # ships pgvector, which Render's managed PostgreSQL does not, so it cannot be
@@ -103,10 +111,21 @@ services:
       # Every operator-guarded route then 401s, and the dashboard reads that as an
       # expired session and bounces the operator back to /login in a loop.
       # scripts/check-render.mjs rejects that generateValue + fromService pairing.
+      # Machine callers only (CLI, scripts). The dashboard authenticates with a
+      # signed session cookie and never forwards this, so the API key and the
+      # browser's credentials are now separate concerns: a leaked browser session
+      # is one person's, a leaked API key is the whole install.
       - key: ADMIN_API_KEY
         sync: false
-      - key: OPERATOR_PASSWORD_HASH
-        sync: false # set to the output of `npm run hash-operator-password`
+      # Every human credential is verified by Supabase, so production refuses to
+      # boot without these three.
+      - key: SUPABASE_URL
+        sync: false # https://<project-ref>.supabase.co
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      # Privileged. Stays on this service and must never be copied to agent-web.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
       - key: ENCRYPTION_KEY
         # NOT generateValue: true. Render generates an alphanumeric string, but
         # aes-256-gcm needs 32 bytes of hex — Buffer.from(key, 'hex') silently
@@ -180,20 +199,31 @@ services:
           name: agent-api
           envVarKey: RENDER_EXTERNAL_URL
       # Server-side proxy target. Use the private-network origin so proxied calls
-      # skip the public edge and never carry the admin key over the internet:
+      # skip the public edge:
       #     http://agent-api:10000
       # 10000 is Render's default PORT, which src/server.ts binds to. A Blueprint
       # cannot compose `host` and `port` into one value, so this one is set by hand.
       - key: API_URL
         sync: false
-      # Must equal agent-api's ADMIN_API_KEY. Deliberately not a fromService copy
-      # of that value: a synced copy refreshes only when this service is
-      # redeployed, so rotating or regenerating the source silently leaves the
-      # proxy holding a key the API no longer accepts.
-      - key: ADMIN_API_KEY
-        sync: false
+      # Deliberately NO ADMIN_API_KEY here any more. The proxy forwards a verified
+      # session id in a header and the API resolves the person behind it, so the web
+      # service has no install-wide credential to leak or to drift out of sync.
+      # Removing it is the point: two copies of that key across two services is one
+      # too many places for a full-privilege secret to live.
       - key: SESSION_SECRET
         generateValue: true
+      # The web server completes the flows the browser cannot (PKCE callback,
+      # password-reset OTP) and immediately trades the token for a local session id.
+      # The public anon key is enough for that. Both are set by hand to match
+      # agent-api rather than copied with fromService: a synced copy of a
+      # `sync: false` source is an empty value, and scripts/check-render.mjs
+      # rejects that pairing for the same reason it did for ADMIN_API_KEY.
+      - key: SUPABASE_URL
+        sync: false # same value as agent-api's
+      - key: SUPABASE_ANON_KEY
+        sync: false # same value as agent-api's
+      # SUPABASE_SERVICE_ROLE_KEY is deliberately absent and must stay that way: it
+      # would let this service read every table and write every auth user.
       # Must be the same Redis the API uses, or a revoked session keeps working.
       - key: REDIS_URL
         fromService:

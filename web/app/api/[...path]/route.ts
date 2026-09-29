@@ -99,12 +99,14 @@ async function handler(request: Request, ctx: { params: Promise<{ path?: string[
     return json({ error: 'session_expired' }, 401);
   }
 
-  // The cookie's kind decides which credential the upstream sees. A client
-  // forwards its sid (`x-client-session`) and never the operator key.
-  const principal: UpstreamPrincipal =
-    session.payload.kind === 'client'
-      ? { kind: 'client', sid: session.payload.sid! }
-      : { kind: 'operator' };
+  // The cookie's kind decides which credential the upstream sees, and both are the
+  // session id from the cookie — the proxy holds no wider credential for either. An
+  // operator's `sid` is forwarded in `x-operator-session`, not as the admin key, so the
+  // API resolves a person and the browser session stays revocable on its own.
+  const principal: UpstreamPrincipal = {
+    kind: session.payload.kind,
+    sid: session.payload.sid!,
+  };
 
   const { path } = await ctx.params;
   const apiPath = normalizeApiPath(path);

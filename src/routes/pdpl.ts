@@ -2,7 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eraseCustomer, getCustomerData, purgeStorePii } from '../services/pdpl.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey } from '../lib/auth.js';
+import { requireOperator } from '../lib/auth.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -16,7 +16,7 @@ const customerRefSchema = z.object({
 export async function pdpl(app: FastifyInstance) {
   app.post(
     '/api/pdpl/access',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = customerRefSchema.parse(req.body);
       const data = await getCustomerData(body.storeId, body);
@@ -27,7 +27,7 @@ export async function pdpl(app: FastifyInstance) {
 
   app.post(
     '/api/pdpl/erase',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = customerRefSchema.parse(req.body);
       const ok = await eraseCustomer(body.storeId, body);
@@ -38,7 +38,7 @@ export async function pdpl(app: FastifyInstance) {
 
   app.post(
     '/api/pdpl/purge',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req) => {
       const body = z.object({ storeId: z.string() }).parse(req.body ?? {});
       const counts = await purgeStorePii(body.storeId);

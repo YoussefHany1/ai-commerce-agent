@@ -43,13 +43,22 @@ const ALLOWLIST: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   { method: 'POST', pattern: /^\/automation\/run$/ },
   { method: 'GET', pattern: /^\/jobs\/[^/]+$/ },
   { method: 'POST', pattern: /^\/jobs\/[^/]+\/retry$/ },
-  // Operator account admin. The API still enforces the admin key on these, so a
-  // client session proxied here gets the API's own 401 `unauthorized` rather than
-  // any data.
+  // Operator account admin. Enforced by the API against the operator session id
+  // forwarded above, so a client session proxied here gets the API's own 401 rather
+  // than any data. Listed explicitly rather than by prefix: these are the routes that
+  // can grant and revoke access, so they are exactly the ones that must stay visible
+  // in a reviewed list.
   { method: 'GET', pattern: /^\/clients$/ },
   { method: 'POST', pattern: /^\/clients$/ },
   { method: 'PATCH', pattern: /^\/clients\/[^/]+\/status$/ },
   { method: 'POST', pattern: /^\/clients\/[^/]+\/reset-password$/ },
+  { method: 'GET', pattern: /^\/operators$/ },
+  { method: 'POST', pattern: /^\/operators$/ },
+  { method: 'GET', pattern: /^\/operators\/[^/]+$/ },
+  { method: 'PATCH', pattern: /^\/operators\/[^/]+\/status$/ },
+  { method: 'POST', pattern: /^\/operators\/[^/]+\/reset-password$/ },
+  { method: 'POST', pattern: /^\/operators\/[^/]+\/revoke-sessions$/ },
+  { method: 'POST', pattern: /^\/operators\/revoke-all$/ },
 ];
 
 /**
@@ -126,30 +135,32 @@ export function normalizeApiPath(segments: string[] | undefined): string | null 
 /**
  * Which credential the proxy presents to the API for this request.
  *
- * The operator presentation is the admin API key, attached server-side and never
- * seen by the browser. A client session presents the raw session id it holds in
- * its signed cookie, forwarded as `x-client-session`; the API is authoritative
- * for it (Redis liveness + account status), so the proxy hands over only enough
- * to authenticate, never a credential with wider scope than the cookie's owner.
- * A client must never be proxied with the admin key, so the two presentations
- * are mutually exclusive by construction.
+ * Both kinds forward a raw session id and nothing else — `x-client-session` or
+ * `x-operator-session` — and the API is authoritative for each (Redis liveness,
+ * account/operator status, epoch). The proxy hands over exactly enough to say "this
+ * is the session in the cookie" and never a credential with wider scope.
+ *
+ * The admin key is deliberately absent from this type. It used to be attached here for
+ * operator requests, which meant the browser's operator session was really a shared
+ * machine credential wearing a cookie: the cookie's identity was cosmetic, and every
+ * operator request was indistinguishable at the API. It is still configured for
+ * server-to-server calls elsewhere, but the proxy no longer has a path to it, so a
+ * stolen `aca_session` cannot be turned into the install-wide key.
  */
 export type UpstreamPrincipal =
-  | { kind: 'operator' }
+  | { kind: 'operator'; sid: string }
   | { kind: 'client'; sid: string };
 
 /**
  * Builds the upstream request headers.
  *
- * The operator's API key is attached here and nowhere else — it is read from a
- * server-only environment variable and never reaches the browser. A client
- * request swaps it for `x-client-session`, so a client's every data call is
- * scoped by the API to exactly the account it belongs to. Any inbound
- * `x-api-key`, `x-client-session` or `cookie` is dropped so a caller cannot
- * inject or override credentials. `authorization` is forwarded because the
- * customer-facing chat and session endpoints authenticate with a bearer token
- * rather than the operator key; no operator-guarded route in the allowlist reads
- * that header.
+ * Every inbound credential header is dropped rather than forwarded: `x-api-key`,
+ * `x-client-session`, `x-operator-session` and `cookie` are all replaced by the single
+ * one derived from the verified cookie, so a caller cannot inject or override a
+ * credential — including upgrading a client cookie to an operator presentation.
+ * `authorization` is forwarded because the customer-facing chat and session endpoints
+ * authenticate with a bearer token rather than a dashboard session; no
+ * operator-guarded route in the allowlist reads that header.
  *
  * `x-forwarded-for` is deliberately not forwarded. A Next route handler has no
  * trustworthy socket address, so any value available here is client-asserted, and
@@ -164,7 +175,7 @@ export function buildUpstreamHeaders(
 ): Headers {
   const headers = new Headers();
   if (principal.kind === 'operator') {
-    headers.set('x-api-key', requireApiKey());
+    headers.set('x-operator-session', principal.sid);
   } else {
     headers.set('x-client-session', principal.sid);
   }
@@ -175,12 +186,4 @@ export function buildUpstreamHeaders(
   if (authorization) headers.set('authorization', authorization);
 
   return headers;
-}
-
-function requireApiKey(): string {
-  const key = process.env.ADMIN_API_KEY;
-  if (!key) {
-    throw new Error('ADMIN_API_KEY is not configured on the web service — the proxy cannot authenticate');
-  }
-  return key;
 }

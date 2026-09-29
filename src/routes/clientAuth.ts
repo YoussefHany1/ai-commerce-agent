@@ -20,7 +20,6 @@ import {
   revokeClientSession,
   createClientSession,
   bumpClientSessionAndKeep,
-  bumpClientSessionEpoch,
   resolveClientSession,
 } from '../lib/clientSession.js';
 import { supabaseAdmin, supabaseAnon, findSupabaseUserByEmail } from '../lib/supabase.js';
@@ -34,22 +33,24 @@ import { config } from '../config.js';
  * Redis `sid` bound to the account's session epoch, via src/lib/clientSession.ts).
  *
  * Mirrors `operatorAuth` structurally — uniform failures, escalating per-bucket
- * lockout keyed per IP *and* per account — with three ways into a session:
+ * lockout keyed per IP *and* per account — with three ways in:
  *
  *   - `login`     checks email/password (scrypt for legacy accounts still holding a
  *                 local hash; Supabase `signInWithPassword` once an account has a
  *                 `supabase_uid`), then mints a session.
- *   - `exchange`  trades a Supabase session token (Google OAuth, password-reset
- *                 completion) for one of our sids, linking the auth user to the
- *                 account by `supabase_uid` (or by email, when a pre-migration
- *                 invite left the link unset).
- *   - `register`  Self-service invite path: the operator's invitation is confirmed
- *                 on Supabase's side and this API only records her row.
+ *   - `register`  Self-service invite path: the confirmation mail is Supabase's and
+ *                 this API only records her row.
+ *   - `password`  Rotates the credential and re-mints this sid against a new epoch,
+ *                 so she stays signed in here and nowhere else.
+ *
+ * Signing in *with* a Supabase token (Google OAuth, a completed reset) is not here:
+ * `authExchange.ts` owns it, because that route resolves an operator and a client
+ * from the same token and picking between them must not be the caller's choice.
  *
  * On success the caller receives a session id (`sid`) bound to the account's
  * session epoch. The sid is the only thing that unlocks the account's data: the
- * web BFF stores it in the `aca_session` cookie and forwards it per request in
- * the `x-client-session` header, and `resolveClientSession` (src/lib/clientSession.ts)
+ * web BFF stores it in the `aca_session` cookie and forwards it per request in the
+ * `x-client-session` header, and `resolveClientSession` (src/lib/clientSession.ts)
  * is the authoritative check on every guarded API call.
  */
 
@@ -83,8 +84,6 @@ const registerBody = z.object({
 });
 
 const emailBody = z.object({ email: z.string().trim().min(1).max(320) });
-
-const accessTokenBody = z.object({ accessToken: z.string().min(1).max(8192) });
 
 /**
  * A fixed scrypt digest to burn CPU against when the email does not exist, so a
@@ -206,6 +205,10 @@ export async function clientAuth(app: FastifyInstance) {
 
     return {
       ok: true,
+      // Stated rather than left to the caller to assume: the BFF writes a different
+      // cookie per kind, and a response missing the field that tells them apart must
+      // fail closed rather than be inferred.
+      kind: 'client' as const,
       clientId: client.id,
       name: client.name,
       email: client.email,
@@ -278,8 +281,18 @@ export async function clientAuth(app: FastifyInstance) {
     return rep.code(200).send({ ok: true });
   });
 
-  /** Uniform no-enumeration recovery: the Supabase email template owns the UX. */
-  app.post('/api/auth/client/forgot', async (req, rep) => {
+  /**
+   * Starts password recovery. Uniform no-enumeration: the Supabase email template
+   * owns the UX, and the answer is the same whether or not the address is registered.
+   *
+   * Kind-neutral by design, and registered without the `/client` prefix it used to
+   * carry. It never touches a local row — it hands an address to Supabase and lets the
+   * provider decide — so an operator with a forgotten password uses this same route,
+   * and a path named for merchants would be a small lie about who it serves. The
+   * callback it points at is the BFF's `/login/reset`, which finishes through the
+   * unified `/api/auth/exchange`, so the same link works for either principal.
+   */
+  app.post('/api/auth/forgot', async (req, rep) => {
     const parsed = emailBody.safeParse(req.body ?? {});
     if (!parsed.success) return rep.code(400).send({ error: 'validation_error', issues: parsed.error.issues });
     const email = normalizeEmail(parsed.data.email);
@@ -304,58 +317,12 @@ export async function clientAuth(app: FastifyInstance) {
   });
 
   /**
-   * After a password reset the pre-reset session epoch must die: several of the
-   * operator's session-killing actions key off it, and a reset is the one case
-   * where the user herself rotated credentials without going through a route that
-   * bumps it. The caller (web /login/reset) hits this after `verifyOtp`, then
-   * `exchange` to mint the fresh session that supersedes everything the epoch
-   * just invalidated.
+   * Revokes the sid that authenticated the request. Best-effort by design.
+   *
+   * The dashboard calls the unified `/api/auth/logout` instead, which handles either
+   * principal; this stays because it is the narrower statement of intent for a client
+   * session and costs one route.
    */
-  app.post('/api/auth/client/reset-complete', async (req, rep) => {
-    const { accessToken } = accessTokenBody.parse(req.body ?? {});
-    const client = await resolveByAccessToken(accessToken, rep);
-    if (!client) return;
-    try {
-      await bumpClientSessionEpoch(client.id);
-    } catch {
-      return rep.code(503).send({ error: 'auth_unavailable' });
-    }
-    return { ok: true, clientId: client.id };
-  });
-
-  /**
-   * Trades a Supabase session token (Google OAuth callback, email-confirmation or
-   * password-reset completion) for one of our sids. The identity is resolved by
-   * `supabase_uid`; a pre-migration account that still has only a scrypt hash is
-   * linked by email on first exchange, which is also the moment a legacy delegate
-   * becomes fully Supabase-managed.
-   */
-  app.post('/api/auth/client/exchange', async (req, rep) => {
-    const { accessToken } = accessTokenBody.parse(req.body ?? {});
-    const client = await resolveByAccessToken(accessToken, rep);
-    if (!client) return;
-    if (client.status !== 'active') {
-      return rep.code(401).send({ error: 'invalid_session' });
-    }
-
-    let session: { sid: string; expiresIn: number; epoch: string };
-    try {
-      session = await createClientSession(client.id);
-    } catch {
-      return rep.code(503).send({ error: 'auth_unavailable' });
-    }
-    return {
-      ok: true,
-      clientId: client.id,
-      name: client.name,
-      email: client.email,
-      sid: session.sid,
-      epoch: session.epoch,
-      expiresIn: session.expiresIn,
-    };
-  });
-
-  /** Revokes the sid that authenticated the request. Best-effort by design. */
   app.post(
     '/api/auth/client/logout',
     { preHandler: [requireClient] },
@@ -439,55 +406,6 @@ export async function clientAuth(app: FastifyInstance) {
       return { client };
     },
   );
-}
-
-/**
- * Resolves a Supabase session token to a client account, treating an account that
- * was invited before the migration as linkable by email. Sends a 503 on Supabase
- * outages, a 401 here for a token that verifies but reaches no account — both are
- * deliberately unrevealing, and both mean "no session".
- */
-async function resolveByAccessToken(
-  accessToken: string,
-  rep: FastifyReply,
-): Promise<{ id: string; name: string; email: string; status: string } | null> {
-  const admin = supabaseAdmin();
-  if (!admin) {
-    rep.code(503).send({ error: 'auth_unavailable' });
-    return null;
-  }
-  let userId: string;
-  let userEmail: string | undefined;
-  try {
-    const { data, error } = await admin.auth.getUser(accessToken);
-    if (error || !data.user) {
-      rep.code(401).send({ error: 'invalid_credentials' });
-      return null;
-    }
-    userId = data.user.id;
-    userEmail = data.user.email ?? undefined;
-  } catch {
-    rep.code(503).send({ error: 'auth_unavailable' });
-    return null;
-  }
-  try {
-    let client = await clientRepo.getBySupabaseUid(userId);
-    if (!client && userEmail) {
-      const byEmail = await clientRepo.findByEmail(normalizeEmail(userEmail));
-      if (byEmail) {
-        await clientRepo.setSupabaseUid(byEmail.id, userId);
-        client = byEmail;
-      }
-    }
-    if (!client) {
-      rep.code(401).send({ error: 'invalid_credentials' });
-      return null;
-    }
-    return { id: client.id, name: client.name, email: client.email, status: client.status };
-  } catch {
-    rep.code(503).send({ error: 'auth_unavailable' });
-    return null;
-  }
 }
 
 /** Links a Supabase auth user to an existing account row; no-op when it misses. */

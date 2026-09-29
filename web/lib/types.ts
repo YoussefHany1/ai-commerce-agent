@@ -174,12 +174,21 @@ export interface HealthResponse {
 /**
  * The account behind the current cookie, per `/api/auth/session`.
  *
- * Unlike the operator (who is a person operating the install), a client is a
- * tenant account: an invited merchant with a name and contact the dashboard
- * shell shows instead of a store name.
+ * A client is a tenant account: an invited merchant with a name and contact the
+ * dashboard shell shows instead of a store name. An operator is a named person who
+ * runs the install, so it reports who is signed in rather than merely that somebody
+ * is — an operator session is a person's identity now, not a shared password, and the
+ * UI needs it to label actions and to know whether it may manage other operators.
  */
 export type SessionInfo =
-  | { authenticated: true; kind: 'operator' }
+  | {
+      authenticated: true;
+      kind: 'operator';
+      operatorId: string;
+      /** Null on a cookie minted before a rename reached this install. */
+      name: string | null;
+      email: string | null;
+    }
   | {
       authenticated: true;
       kind: 'client';

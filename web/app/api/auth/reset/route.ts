@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createDashboardSupabaseClient } from '@/lib/server/supabase';
-import { callClientAuth, mintClientSessionCookie } from '@/lib/server/clientExchange';
+import { callAuthApi, mintSessionCookie } from '@/lib/server/authExchange';
 
 export const dynamic = 'force-dynamic';
 
@@ -13,12 +13,17 @@ const PASSWORD_MAX = 1024;
  *
  * Body {email, token, password}: the `token`/`type=recovery` parameters out of
  * the Supabase email link, plus the new password. The BFF verifies the one-time
- * token with `verifyOtp` and rotates the password (`updateUser`), then finishes
- * the two API calls the reset needs:
- *   - reset-complete  bumps the account epoch, killing every pre-reset session;
- *   - exchange        mints a fresh session against the moved epoch.
- * The fresh access token is read *after* updateUser — password rotation can roll
- * the session tokens, and using a stale token would bounce off the API.
+ * token with `verifyOtp` and rotates the password (`updateUser`), then hands the fresh
+ * access token to `/api/auth/exchange` with `rotate: true`. The API moves that
+ * account's epoch and mints a new session in one call, so every pre-reset session is
+ * dead and the person completing the reset stays signed in.
+ *
+ * The fresh access token is read *after* updateUser — password rotation can roll the
+ * session tokens, and using a stale token would bounce off the API.
+ *
+ * The account is not named here either. An operator resetting a forgotten password
+ * follows the same link a merchant does, and `rotate` reaches whichever epoch belongs
+ * to whoever the token resolved to.
  */
 export async function POST(request: Request): Promise<NextResponse> {
   let body: { email?: unknown; token?: unknown; password?: unknown };
@@ -67,13 +72,10 @@ export async function POST(request: Request): Promise<NextResponse> {
   const { data: after } = await supabase.auth.getSession();
   const accessToken = after.session?.access_token ?? verified.session.access_token;
 
-  const bump = await callClientAuth('reset-complete', { accessToken });
-  if (bump.status !== 200) return NextResponse.json(bump.payload, { status: bump.status });
+  const out = await callAuthApi('exchange', { accessToken, rotate: true });
+  if (out.status !== 200) return NextResponse.json(out.payload, { status: out.status });
 
-  const exchange = await callClientAuth('exchange', { accessToken });
-  if (exchange.status !== 200) return NextResponse.json(exchange.payload, { status: exchange.status });
-
-  const minted = await mintClientSessionCookie(exchange.payload);
+  const minted = await mintSessionCookie(out.payload);
   if (!minted) return NextResponse.json({ error: 'auth_unavailable' }, { status: 503 });
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, kind: out.payload.kind });
 }

@@ -7,7 +7,7 @@
  * is enough to send a signed-out visitor to the login page instead of rendering a
  * dashboard that will immediately fail its first data request.
  *
- * The authoritative check — HMAC signature and operator session epoch — lives in
+ * The authoritative check — HMAC signature and session epoch — lives in
  * `lib/server/session.ts` and runs on the Node runtime in the proxy route, which
  * every data request must pass through. Nothing is served on the strength of this
  * check alone.
@@ -20,7 +20,7 @@
  * by checking it here is nil because the proxy re-checks anyway.
  */
 
-const PAYLOAD_VERSION = 2;
+import { isSessionPayload } from './sessionShape';
 
 export type EdgeVerifyFailure = 'malformed' | 'expired';
 
@@ -35,23 +35,17 @@ export function verifySessionCookieShape(
   const dot = token.indexOf('.');
   if (dot <= 0 || dot === token.length - 1) return { ok: false, reason: 'malformed' };
 
-  let payload: { v?: unknown; exp?: unknown; kind?: unknown; epoch?: unknown; clientId?: unknown; sid?: unknown };
+  let payload: unknown;
   try {
     payload = JSON.parse(decodeBase64Url(token.slice(0, dot)));
   } catch {
     return { ok: false, reason: 'malformed' };
   }
 
-  if (payload.v !== PAYLOAD_VERSION) return { ok: false, reason: 'malformed' };
-  if (typeof payload.exp !== 'number') return { ok: false, reason: 'malformed' };
-  if (payload.kind !== 'operator' && payload.kind !== 'client') return { ok: false, reason: 'malformed' };
-  if (typeof payload.epoch !== 'string' || !payload.epoch) return { ok: false, reason: 'malformed' };
-  if (payload.kind === 'client' && (typeof payload.clientId !== 'string' || !payload.clientId)) {
-    return { ok: false, reason: 'malformed' };
-  }
-  if (payload.kind === 'client' && (typeof payload.sid !== 'string' || !payload.sid)) {
-    return { ok: false, reason: 'malformed' };
-  }
+  // The same predicate the Node reader applies, imported rather than restated: the two
+  // runtimes must never disagree about which cookies exist, or middleware sends people
+  // to /login while the proxy is willing to serve them, or the reverse.
+  if (!isSessionPayload(payload)) return { ok: false, reason: 'malformed' };
   if (payload.exp * 1000 <= now) return { ok: false, reason: 'expired' };
 
   return { ok: true };

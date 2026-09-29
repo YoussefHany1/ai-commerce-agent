@@ -10,6 +10,13 @@ const EPOCH_KEY = 'op:sess:epoch';
  * closed rather than resurrecting revoked client sessions.
  */
 const CLIENT_EPOCH_PREFIX = 'cli:sess:epoch:';
+/**
+ * Per-operator session epoch, mirroring `src/lib/operatorSession.ts`. Distinct from
+ * {@link EPOCH_KEY}: that one is the install-wide kill switch, this one is per person,
+ * so suspending one operator or evicting their devices leaves everyone else signed in.
+ * Both must match, which is why an operator cookie carries two epochs.
+ */
+const OPERATOR_EPOCH_PREFIX = 'op:sess:epoch:';
 
 const GENERATED_BYTES = 16;
 
@@ -71,6 +78,18 @@ export async function currentEpoch(): Promise<string> {
 /** Client analogue of {@link currentEpoch}, keyed per dashboard account. */
 export async function currentClientEpoch(clientId: string): Promise<string> {
   const key = `${CLIENT_EPOCH_PREFIX}${clientId}`;
+  const redis = await getRedis();
+  const existing = await redis.get(key);
+  if (existing) return existing;
+
+  const fresh = randomHex(GENERATED_BYTES);
+  await redis.set(key, fresh, { NX: true });
+  return (await redis.get(key)) ?? fresh;
+}
+
+/** Per-person operator epoch, keyed by operator id. */
+export async function currentOperatorEpoch(operatorId: string): Promise<string> {
+  const key = `${OPERATOR_EPOCH_PREFIX}${operatorId}`;
   const redis = await getRedis();
   const existing = await redis.get(key);
   if (existing) return existing;

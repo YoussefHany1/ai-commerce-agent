@@ -3,6 +3,7 @@ import { withClient, withOperator, withTenant, type Db } from './client.js';
 import { encryptPii, decryptPii } from '../services/pii.js';
 import {
   clients,
+  operators,
   stores,
   platformConnections,
   products,
@@ -32,6 +33,7 @@ import {
   type AutomationAction,
   type AutomationRule,
   type Client,
+  type Operator,
 } from './schema.js';
 import { decryptKey, encryptKey, keyVersionOf, isEncrypted } from '../lib/encryption.js';
 import { refreshProviderToken } from '../integrations/refresh.js';
@@ -166,6 +168,90 @@ export const clientRepo = {
         .set({ passwordHash, updatedAt: new Date() })
         .where(eq(clients.id, clientId))
         .returning({ id: clients.id });
+      return !!r;
+    });
+    return done;
+  },
+};
+
+/** One row of the operator directory, safe to hand to an HTTP response. */
+export function operatorToPublic(o: Operator) {
+  return {
+    id: o.id,
+    name: o.name,
+    email: o.email,
+    status: o.status,
+    /** Whether a Supabase Auth identity is linked, and so whether sign-in can work. */
+    linked: o.supabaseUid !== null,
+    createdAt: o.createdAt,
+    updatedAt: o.updatedAt,
+  };
+}
+
+type OperatorCreateInput = {
+  name: string;
+  email: string;
+  supabaseUid?: string | null;
+};
+
+export const operatorRepo = {
+  async create(input: OperatorCreateInput): Promise<string> {
+    return withOperator(async (tx) => {
+      const [r] = await tx.insert(operators).values(input).returning({ id: operators.id });
+      return r?.id ?? '';
+    });
+  },
+
+  /** Operator view — any row, active or suspended. */
+  async get(id: string): Promise<Operator | null> {
+    const [row] = await withOperator((tx) => tx.select().from(operators).where(eq(operators.id, id)));
+    return row ?? null;
+  },
+
+  async findByEmail(email: string): Promise<Operator | null> {
+    const [row] = await withOperator((tx) =>
+      tx.select().from(operators).where(eq(operators.email, email)),
+    );
+    return row ?? null;
+  },
+
+  /** The operator bound to a Supabase auth user, resolved in operator scope. */
+  async getBySupabaseUid(uid: string): Promise<Operator | null> {
+    const [row] = await withOperator((tx) =>
+      tx.select().from(operators).where(eq(operators.supabaseUid, uid)),
+    );
+    return row ?? null;
+  },
+
+  /**
+   * Links a Supabase auth user to an existing operator row. Returns false when it
+   * misses, so the caller can treat "no operator for this identity" as a refusal
+   * rather than silently creating one — auto-provisioning on sign-in would turn
+   * "anyone who can sign up at this Supabase project" into an administrator.
+   */
+  async setSupabaseUid(operatorId: string, uid: string): Promise<boolean> {
+    const done = await withOperator(async (tx) => {
+      const [r] = await tx
+        .update(operators)
+        .set({ supabaseUid: uid, updatedAt: new Date() })
+        .where(eq(operators.id, operatorId))
+        .returning({ id: operators.id });
+      return !!r;
+    });
+    return done;
+  },
+
+  async list(): Promise<Operator[]> {
+    return withOperator((tx) => tx.select().from(operators).orderBy(desc(operators.createdAt)));
+  },
+
+  async setStatus(operatorId: string, status: 'active' | 'suspended'): Promise<boolean> {
+    const done = await withOperator(async (tx) => {
+      const [r] = await tx
+        .update(operators)
+        .set({ status, updatedAt: new Date() })
+        .where(eq(operators.id, operatorId))
+        .returning({ id: operators.id });
       return !!r;
     });
     return done;

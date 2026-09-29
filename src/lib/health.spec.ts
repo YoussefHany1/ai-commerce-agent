@@ -7,7 +7,7 @@ import { test, expect, describe, vi, beforeEach } from 'vitest';
  *
  * The behaviour under test is the one that was missing before: `relrowsecurity`
  * alone passed for a table owner, who bypasses RLS unless it is also FORCED, and
- * only `stores` was inspected, so the other 15 tables could be unprotected.
+ * only `stores` was inspected, so the other 16 tables could be unprotected.
  */
 
 const TABLE_COUNT = 17;
@@ -16,6 +16,7 @@ type Row = { name: string; relrowsecurity: boolean; relforcerowsecurity: boolean
 
 const ALL_TABLES = [
   'clients',
+  'operators',
   'stores',
   'platform_connections',
   'products',

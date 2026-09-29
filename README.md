@@ -15,6 +15,12 @@ npm run db:apply-rls          # create the non-owner app role + grants + RLS pol
 npm run dev
 ```
 
+Then provision the first operator. There is no default password to guess or reset:
+```bash
+npm run operator:create -- --name "Your Name" --email you@example.com
+```
+It prints a single-use link; open it to set your own password.
+
 ### Docker (production)
 ```bash
 docker compose up -d postgres redis      # infra requires POSTGRES_PASSWORD, REDIS_PASSWORD
@@ -125,11 +131,15 @@ GitHub Actions (`.github/workflows/ci.yml`) on push/PR runs:
 - Pure aggregation helpers exported for tests; plan-gated + rate-limited like the other analytics endpoints
 - The operator dashboard is the separate `web/` service (Next.js), not a file served by this API. It reads the same analytics endpoints through its own authenticated proxy, so no page served here ever holds the admin key. See `web/README.md`.
 
-## Operator access (added in the production-readiness pass)
-- `POST /api/auth/operator/verify` — exchanges the shared operator password for a session epoch. The dashboard calls this server-to-server; the browser never sees the password hash or the admin key.
-- Password stored as a scrypt hash (`OPERATOR_PASSWORD_HASH`), generated with `npm run hash-operator-password`; the previous hash is accepted during a rotation.
-- Lockout after 5 failed attempts: 30s, doubling to 15m, keyed per IP in Redis so it survives restarts and applies across replicas. Fails closed with `503` if Redis is unreachable.
-- `npm run revoke-operator-sessions` bumps the epoch in Redis, immediately invalidating every issued session cookie.
+## Operator access (named operators, Supabase-backed)
+An operator is a person with a name, an email, and their own password. It used to be one shared password per install: knowing it made you an administrator, and changing it logged out every operator at once.
+- Operators live in the `operators` table (migration `0012_operators`), each bound to a Supabase Auth identity via `supabase_uid`. **There is no password in this database to compare** — Supabase verifies the credential and this service only decides which local row that identity may act as.
+- `POST /api/auth/operator/login` takes `{email, password}`, checks the Supabase identity against `operators`, and mints a session id. `POST /api/auth/exchange` is the same handshake for the browser, and resolves a token to a client **or** an operator in one call.
+- `npm run operator:create -- --name "…" --email …` provisions one and prints a single-use link for them to set their own password. Self-signup does not exist: a Supabase identity with no operator row is refused, so "anyone who can sign up at this Supabase project" is not an administrator.
+- **Two epochs, not one.** A per-operator epoch revokes one person's sessions (`--email`/`--id` on `npm run operator:revoke-sessions`); the install-wide epoch still revokes everyone at once. The shared password had no way to mean "log out just that person", which is the operation you actually want when a laptop is stolen.
+- Lockout after 5 failed attempts: 30s doubling to 15m, keyed per IP in Redis so it survives restarts and applies across replicas. Fails closed with `503` if Redis is unreachable.
+- A Supabase uid bound to both `operators` and `clients` is refused as a data-integrity conflict rather than resolved by a guess.
+- `ADMIN_API_KEY` remains for machine callers (CLI, scripts). It is no longer a browser or dashboard credential — see `web/README.md`.
 
 ## Phase 9e (Agent retrieval evaluation harness)
 - `npm run eval` — scores the retrieval pipeline against a curated dataset (`eval/queries.json`)
@@ -273,7 +283,8 @@ what the migration is engineered for.
 - **Webhook signatures per platform** (`src/lib/webhooks.ts`): Shopify `x-shopify-hmac-sha256`, Salla `x-salla-signature`, Zid `x-zid-signature`, plus the shared `x-hub-signature-256` fallback — all verified from the raw body, fail closed when the secret is unset
 - **Zid secret at rest**: the `authorization` JWT is stored in `store.settings` via `updateSettingsEncrypted` (AES-256-GCM) and read back decrypted by the adapter (`storeRepo.getSecret`); never plaintext
 - **Admin endpoints on the admin key**: `GET/POST /api/stores`, `DELETE /api/stores/:storeId` (cascading delete of all tenant rows), `POST /api/session`, plus every analytics/metrics/automation/pdpl/jobs route
-- **No credential in the browser**: the dashboard authenticates with an `HttpOnly` session cookie and calls its own server-side proxy, which attaches `ADMIN_API_KEY`. The `X-Api-Key` input page that used to live at `GET /dashboard` is gone, along with the localStorage credential path. `NEXT_PUBLIC_ADMIN_API_KEY` no longer exists; CI fails the build if any privileged identifier reaches the client bundle.
+- **No credential in the browser**: the dashboard authenticates with an `HttpOnly` session cookie and calls its own server-side proxy, which verifies the cookie and forwards the session id for the API to resolve. No page served here ever holds a privileged value. The `X-Api-Key` input page that used to live at `GET /dashboard` is gone, along with the localStorage credential path. `NEXT_PUBLIC_ADMIN_API_KEY` no longer exists; CI fails the build if any privileged identifier reaches the client bundle.
+- **The dashboard holds no `ADMIN_API_KEY` at all**: it is a machine credential for the CLI, and keeping a second copy in a second service is a full-privilege secret one leak away from being unnecessary. `scripts/check-render.mjs` now fails the build if the web service is given it.
 - **Infra**: Postgres/Redis bound to `127.0.0.1` with required `REDIS_PASSWORD` (`redis-server --requirepass`), pinned image digests, `restart: unless-stopped`, memory limits, and a separate `migrate` image that runs `db:migrate` + `db:apply-rls`
 
 ## Production next steps already defined in docs/ARCHITECTURE.md

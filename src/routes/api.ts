@@ -13,7 +13,7 @@ import { answerWithTools, toChatHistory } from '../services/agent.js';
 import { retrieve, embedMissingCatalog } from '../services/retrieval.js';
 import { dbPing, redisPing, rlsPing } from '../lib/health.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
-import { requireApiKey, requireDashboard, sha256Hex, type Principal } from '../lib/auth.js';
+import { requireOperator, requireDashboard, sha256Hex, type Principal } from '../lib/auth.js';
 import { requireSession, type CustomerSession } from '../lib/session.js';
 import { config } from '../config.js';
 
@@ -106,7 +106,7 @@ export async function api(app: FastifyInstance) {
 
   app.post(
     '/api/stores/:storeId/keys',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);
@@ -119,7 +119,7 @@ export async function api(app: FastifyInstance) {
 
   app.get(
     '/api/stores/:storeId/keys',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);
@@ -130,7 +130,7 @@ export async function api(app: FastifyInstance) {
 
   app.delete(
     '/api/stores/:storeId/keys',
-    { preHandler: [requireApiKey, storeRateLimitWindow('api', apiWindow)] },
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
     async (req, rep) => {
       const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);

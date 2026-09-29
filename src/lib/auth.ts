@@ -8,6 +8,7 @@ import { withTenant } from '../db/client.js';
 import { stores } from '../db/schema.js';
 import { storeRepo } from '../db/repos.js';
 import { CLIENT_SESSION_HEADER, resolveClientSession } from './clientSession.js';
+import { OPERATOR_SESSION_HEADER, resolveOperatorSession } from './operatorSession.js';
 
 const BRUTE_WINDOW = 60;
 const BRUTE_LIMIT = 30;
@@ -44,34 +45,6 @@ function matchesAdminKey(provided: string): boolean {
   return false;
 }
 
-export async function requireApiKey(req: FastifyRequest, reply: FastifyReply): Promise<void> {
-  if (!config.ADMIN_API_KEY) {
-    reply.code(503).send({ error: 'auth_not_configured' });
-    return;
-  }
-  const provided = headerValue(req, 'x-api-key');
-  const valid = typeof provided === 'string' && matchesAdminKey(provided);
-  if (valid) {
-    await resetApiKeyBruteCounter(reqIp(req));
-    return;
-  }
-
-  try {
-    const redis = await getRedis();
-    const key = `rl:apikey:${reqIp(req)}`;
-    const used = await redis.incr(key);
-    if (used === 1) await redis.expire(key, BRUTE_WINDOW);
-    if (used > BRUTE_LIMIT) {
-      reply.code(429).send({ error: 'rate_limit_exceeded' });
-      return;
-    }
-  } catch {
-    // never block on Redis failures; the key check above already failed
-  }
-
-  reply.code(401).send({ error: 'unauthorized' });
-}
-
 export function sha256Hex(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -93,15 +66,44 @@ async function verifyStoreApiKey(storeId: string, token: string): Promise<boolea
 }
 
 /**
- * Who the current request is acting as. `operator` and `store` are the two
- * pre-existing presentation stocks (admin key, store API key); `client` is the
- * dashboard account introduced by the tenancy work. Attached to `(req as any).principal`
- * by guards, read by the routes that must branch their data access on it.
+ * Who the current request is acting as.
+ *
+ * `operator` is deliberately the widest type of the three, because an operator now
+ * has two ways to prove it: a Supabase-backed session (a person, with an identity
+ * worth putting in a log) or the shared admin key (a machine — a CLI, a script, a
+ * cron job — which has no user behind it). `via` says which, and `operatorId` is
+ * null for the key, so a route that wants to attribute an action to a person can
+ * tell "nobody in particular" from "the operator whose name is on the invite".
+ *
+ * `store` is a merchant's API key, and `client` a dashboard account. Attached as
+ * `(req as any).principal` by guards, read by the routes that must branch their
+ * data access on it.
  */
 export type Principal =
+  | {
+      kind: 'operator';
+      /** The Supabase Auth user id behind a session, or null for the admin key. */
+      operatorId: string | null;
+      email: string | null;
+      name: string | null;
+      via: 'session' | 'admin_key';
+    }
   | { kind: 'client'; clientId: string; name: string; email: string }
-  | { kind: 'operator' }
   | { kind: 'store'; storeId: string };
+
+/** How an operator was authenticated, for the routes that need to tell them apart. */
+export function isMachineOperator(principal: Principal | undefined): boolean {
+  return principal?.kind === 'operator' && principal.via === 'admin_key';
+}
+
+function attachOperator(
+  req: FastifyRequest,
+  operator: { operatorId: string; email: string; name: string } | null,
+): void {
+  (req as any).principal = operator
+    ? { kind: 'operator', operatorId: operator.operatorId, email: operator.email, name: operator.name, via: 'session' }
+    : { kind: 'operator', operatorId: null, email: null, name: null, via: 'admin_key' };
+}
 
 export type DashboardOptions = {
   /**
@@ -113,25 +115,87 @@ export type DashboardOptions = {
 };
 
 /**
+ * Admin-key brute-force counter, shared by the two operator guards. Deliberately
+ * best-effort: it is a backstop behind the escalating lockout the auth routes
+ * apply, so a Redis outage must not turn a wrong key into a 500 — and must not
+ * become a bypass either, since the credential check already failed.
+ */
+async function countApiKeyFailure(ip: string, reply: FastifyReply): Promise<void> {
+  try {
+    const redis = await getRedis();
+    const key = `rl:apikey:${ip}`;
+    const used = await redis.incr(key);
+    if (used === 1) await redis.expire(key, BRUTE_WINDOW);
+    if (used > BRUTE_LIMIT) {
+      reply.code(429).send({ error: 'rate_limit_exceeded' });
+      return;
+    }
+  } catch {
+    // never block on Redis failures; there is no credential to fall back on
+  }
+  reply.code(401).send({ error: 'unauthorized' });
+}
+
+/**
+ * The guard for operator-administered routes.
+ *
+ * Accepts either an operator session (a person, signed in through Supabase) or the
+ * shared admin key (a machine). The key is no longer how the dashboard signs in —
+ * `web/lib/server/upstream.ts` forwards a session id instead — so what the key is
+ * for now is scripting: `npm run client:create`, the runbook's curl examples, and
+ * anything else that needs admin without a browser. Keeping it accepted here is
+ * what makes that possible without a second set of routes.
+ */
+export async function requireOperator(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const session = await resolveOperatorSession(req, reply);
+  if (session === undefined) return; // replied already
+  if (session) {
+    attachOperator(req, session);
+    return;
+  }
+
+  const provided = headerValue(req, 'x-api-key') ?? bearerToken(req);
+  if (provided && matchesAdminKey(provided)) {
+    await resetApiKeyBruteCounter(reqIp(req));
+    attachOperator(req, null);
+    return;
+  }
+
+  if (!config.ADMIN_API_KEY) {
+    reply.code(503).send({ error: 'auth_not_configured' });
+    return;
+  }
+  await countApiKeyFailure(reqIp(req), reply);
+}
+
+function bearerToken(req: FastifyRequest): string | undefined {
+  const bearer = headerValue(req, 'authorization');
+  return bearer?.startsWith('Bearer ') ? bearer.slice('Bearer '.length) : undefined;
+}
+
+/**
  * The dashboard guard. Accepts, in order:
  *
- *   1. the admin key                    -> `operator`
- *   2. a valid client session           -> `client`
- *   3. (optionally) a store API key     -> `store`
+ *   1. a valid client session           -> `client`
+ *   2. a valid operator session          -> `operator` (a person)
+ *   3. the admin key                     -> `operator` (a machine)
+ *   4. (optionally) a store API key     -> `store`
  *
- * Precedence is deliberate. A request that carries both an admin key and a
- * (possibly hostile) client session is treated as the session: the client scope
- * is the least privilege, so it wins rather than the highest certificate. A
- * client that proves ownership of `storeIdRef(req)` (404 `store_not_found` when it
- * does not — never 403, so a caller cannot enumerate stores) is then trusted to
- * drive exactly that store's data paths, which remain tenant-scoped by `app.store_id`.
+ * Precedence is deliberate: the narrowest credential wins. A request that carries
+ * both a client session and an admin key is treated as the client, so a hostile or
+ * stale session cannot ride the widest credential; a request carrying a dead
+ * operator session is refused rather than falling through to the key, for the same
+ * reason. A client that proves ownership of `storeIdRef(req)` (404
+ * `store_not_found` when it does not — never 403, so a caller cannot enumerate
+ * stores) is then trusted to drive exactly that store's data paths, which remain
+ * tenant-scoped by `app.store_id`.
  *
- * Redis failure inside a client-session check rejects the request (503), mirroring
+ * Redis failure inside a session check rejects the request (503), mirroring
  * `resolveClientSession`: an outage must not become a bypass.
  */
 export function requireDashboard(storeIdRef?: StoreIdRef, opts: DashboardOptions = {}) {
   return async function preHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
-    // The client session is checked before the admin key: least privilege wins.
+    // Client session first: least privilege wins over every operator credential.
     // The BFF presents exactly one credential per request (a session header xor
     // the admin key), so a request carrying both is ambiguous and must be
     // resolved towards the narrower scope — a dead or hostile session fails the
@@ -150,18 +214,28 @@ export function requireDashboard(storeIdRef?: StoreIdRef, opts: DashboardOptions
       return;
     }
 
-    const apiKey = headerValue(req, 'x-api-key');
-    const bearer = headerValue(req, 'authorization');
-    const bearerToken = bearer?.startsWith('Bearer ') ? bearer.slice('Bearer '.length) : undefined;
-    const adminCandidate = apiKey ?? bearerToken;
+    // An operator session is the human credential. A dead one is a 401 and must not
+    // degrade into the machine key, or revoking a person would silently promote the
+    // browser to admin-by-key.
+    if (headerValue(req, OPERATOR_SESSION_HEADER)) {
+      const operator = await resolveOperatorSession(req, reply);
+      if (operator === undefined) return;
+      if (operator) {
+        attachOperator(req, operator);
+        return;
+      }
+      return reply.code(401).send({ error: 'invalid_session' });
+    }
+
+    const adminCandidate = headerValue(req, 'x-api-key') ?? bearerToken(req);
     if (adminCandidate && matchesAdminKey(adminCandidate)) {
       await resetApiKeyBruteCounter(reqIp(req));
-      (req as any).principal = { kind: 'operator' };
+      attachOperator(req, null);
       return;
     }
 
     if (opts.allowStoreKey) {
-      const token = bearerToken ?? apiKey;
+      const token = bearerToken(req) ?? headerValue(req, 'x-api-key');
       if (token) {
         const storeIdFromRef = storeIdRef ? storeIdRef(req) : undefined;
         const storeId = storeIdFromRef ?? headerValue(req, 'x-store-id');
@@ -178,19 +252,6 @@ export function requireDashboard(storeIdRef?: StoreIdRef, opts: DashboardOptions
       reply.code(503).send({ error: 'auth_not_configured' });
       return;
     }
-    try {
-      const redis = await getRedis();
-      const key = `rl:apikey:${reqIp(req)}`;
-      const used = await redis.incr(key);
-      if (used === 1) await redis.expire(key, BRUTE_WINDOW);
-      if (used > BRUTE_LIMIT) {
-        reply.code(429).send({ error: 'rate_limit_exceeded' });
-        return;
-      }
-    } catch {
-      // never block on Redis failures; there is no credential to fall back on
-    }
-
-    reply.code(401).send({ error: 'unauthorized' });
+    await countApiKeyFailure(reqIp(req), reply);
   };
 }

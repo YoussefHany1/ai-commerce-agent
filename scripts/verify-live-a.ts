@@ -48,6 +48,9 @@ try {
   const { data: linkData, error: linkErr } = await admin.auth.admin.generateLink({
     type: 'signup',
     email: emailA,
+    // The API never reads this — the link is verified as a signup OTP, not used as a
+    // password — but supabase-js requires a password on a signup link to be valid.
+    password: pw1,
     options: { redirectTo },
   });
   const signupToken = linkData?.properties?.hashed_token ?? null;
@@ -58,7 +61,7 @@ try {
   mark('verifyOtp(signup) confirms identity + session', !!signupAccessToken);
 
   if (signupAccessToken) {
-    const ex = await api('/api/auth/client/exchange', { body: { accessToken: signupAccessToken } });
+    const ex = await api('/api/auth/exchange', { body: { accessToken: signupAccessToken } });
     mark('exchange trades confirmed session for sid', ex.status === 200 && !!ex.body.sid, `HTTP ${ex.status}`);
   }
 
@@ -119,12 +122,37 @@ try {
   if (recoveryToken && uidB) {
     const otp = await anon.auth.verifyOtp({ email: emailB, token: recoveryToken, type: 'recovery' });
     if (otp.data.session?.access_token) {
+      // A session minted *before* the password rotation, so the checks below have a
+      // stale credential to prove dead rather than only asserting the new one works.
+      const pre = await api('/api/auth/exchange', { body: { accessToken: otp.data.session.access_token } });
+      const sidBefore = pre.body.sid ?? null;
+      mark('recovery link: pre-reset exchange mints a session', pre.status === 200 && !!sidBefore, `HTTP ${pre.status}`);
+
       const up = await anon.auth.updateUser({ password: newPw });
       if (!up.error) {
-        const rc = await api('/api/auth/client/reset-complete', { body: { accessToken: otp.data.session.access_token } });
-        const ex = await api('/api/auth/client/exchange', { body: { accessToken: otp.data.session.access_token } });
-        recoveryOk = rc.status === 200 && ex.status === 200 && !!ex.body.sid;
-        mark('recovery link: verifyOtp -> reset-complete -> exchange', recoveryOk, `reset-complete ${rc.status}, exchange ${ex.status}`);
+        // Password rotation can roll the session tokens, so the fresh one is read back
+        // from the live client rather than reused from before updateUser.
+        const { data: afterRot } = await anon.auth.getSession();
+        const fresh = afterRot.session?.access_token ?? otp.data.session.access_token;
+
+        // One call now does the whole job: the API moves the epoch and mints together,
+        // so a second exchange is neither needed nor wanted.
+        const ex = await api('/api/auth/exchange', { body: { accessToken: fresh, rotate: true } });
+        const sidAfter = ex.body.sid ?? null;
+        recoveryOk = ex.status === 200 && !!sidAfter;
+        mark('recovery: single exchange with rotate:true mints a session', recoveryOk, `HTTP ${ex.status}`);
+
+        // The point of rotate: every pre-reset session is dead, and the person who
+        // completed the reset is not logged out of the session they just made.
+        if (sidBefore) {
+          const stale = await api('/api/auth/client/me', { sid: sidBefore });
+          mark('recovery: pre-reset session is revoked by rotate', stale.status === 401, `HTTP ${stale.status}`);
+        }
+        if (sidAfter) {
+          const live = await api('/api/auth/client/me', { sid: sidAfter });
+          mark('recovery: post-rotate session works', live.status === 200 && live.body.client?.email === emailB, `HTTP ${live.status}`);
+        }
+
         const lnf = await api('/api/auth/client/login', { body: { email: emailB, password: newPw } });
         mark('login with new password (Supabase path)', lnf.status === 200 && !!lnf.body.sid, `HTTP ${lnf.status}`);
       } else {
@@ -136,7 +164,7 @@ try {
     const lold = await api('/api/auth/client/login', { body: { email: emailB, password: legacyPw } });
     mark('legacy scrypt password now rejected (hash withdrawn)', lold.status === 401, `HTTP ${lold.status}`);
   } else {
-    mark('recovery link: verifyOtp -> reset-complete -> exchange', false, 'no recovery token');
+    mark('recovery link: verifyOtp -> rotate exchange', false, 'no recovery token');
   }
 
   // ---- Cleanup ----
