@@ -6,6 +6,7 @@ import { config } from '../config.js';
 
 export const sql = postgres(config.DATABASE_URL, {
   max: 10,
+  prepare: false,
   onnotice: () => {},
 });
 

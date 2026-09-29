@@ -31,9 +31,12 @@ export async function createDashboardSupabaseClient() {
 
   return createServerClient(url, anonKey, {
     cookies: {
-      // @supabase/ssr calls getAll() synchronously; it must return the array directly,
-      // not a Promise. Closing over the already-resolved cookieStore satisfies this.
-      getAll: () => cookieStore.getAll(),
+      getAll: () => {
+        const all = cookieStore.getAll();
+        // DEBUG: log cookie names so we can verify the PKCE verifier is arriving
+        console.log('[supabase-client] getAll() returning cookies:', all.map(c => c.name));
+        return all;
+      },
       setAll: (list) => {
         for (const { name, value, options } of list) {
           cookieStore.set(name, value, options);
