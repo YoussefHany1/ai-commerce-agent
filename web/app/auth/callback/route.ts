@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
 import { createDashboardSupabaseClient } from '@/lib/server/supabase';
 import { buildPayload, callAuthApi, safeNext } from '@/lib/server/authExchange';
 import { SESSION_COOKIE, serializeSession, sessionCookieOptions } from '@/lib/server/session';
@@ -83,8 +84,11 @@ export async function GET(request: Request): Promise<NextResponse> {
   // reliably propagated to the redirect's Set-Cookie header in all Next.js versions,
   // which would leave the browser cookieless and trigger another /login redirect.
   const redirectTo = safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard';
+  
+  const cookieStore = await cookies();
+  cookieStore.set(SESSION_COOKIE, serializeSession(built.payload), sessionCookieOptions(built.expiresIn));
+  
   const response = NextResponse.redirect(new URL(redirectTo, request.url));
-  response.cookies.set(SESSION_COOKIE, serializeSession(built.payload), sessionCookieOptions(built.expiresIn));
 
   console.log('[auth/callback] success — session minted, kind:', built.payload.kind, 'redirect:', redirectTo);
   return response;

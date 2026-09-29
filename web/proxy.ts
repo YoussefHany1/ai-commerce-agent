@@ -125,6 +125,8 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   url.search = '';
   // Preserved so the login page can return the operator to where they were headed.
   if (request.nextUrl.pathname !== '/') url.searchParams.set('next', request.nextUrl.pathname);
+  
+  console.log('[proxy] redirecting to /login, token present:', !!token, 'valid shape:', token ? verifySessionCookieShape(token).ok : false);
   return applyHeaders(NextResponse.redirect(url), request, policy);
 }
 

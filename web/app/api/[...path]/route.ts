@@ -90,6 +90,7 @@ async function handler(request: Request, ctx: { params: Promise<{ path?: string[
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
   const session = await verifySession(token);
   if (!session.ok) {
+    console.log('[api-proxy] session validation failed:', session.reason, 'for path:', apiPath);
     if (session.reason === 'unavailable') return json({ error: 'auth_unavailable' }, 503);
     // `session_expired`, not `unauthorized`: the upstream's own key rejection uses
     // the same `unauthorized` body (src/lib/auth.ts), and a relayed upstream 401

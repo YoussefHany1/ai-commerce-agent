@@ -40,7 +40,9 @@ export async function GET(): Promise<NextResponse> {
     });
   }
   if (session.reason === 'unavailable') {
+    console.log('[auth-session] session unavailable');
     return NextResponse.json({ authenticated: false, error: 'auth_unavailable' }, { status: 503 });
   }
+  console.log('[auth-session] session invalid or missing, reason:', session.reason);
   return NextResponse.json({ authenticated: false });
 }
