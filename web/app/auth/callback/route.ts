@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { createDashboardSupabaseClient } from '@/lib/server/supabase';
-import { callAuthApi, mintSessionCookie, safeNext } from '@/lib/server/authExchange';
+import { buildPayload, callAuthApi, safeNext } from '@/lib/server/authExchange';
+import { SESSION_COOKIE, serializeSession, sessionCookieOptions } from '@/lib/server/session';
 
 export const dynamic = 'force-dynamic';
 
@@ -18,12 +19,26 @@ export const dynamic = 'force-dynamic';
  * arrive with the provider's session, not with a password typed into a second form —
  * so the callback cannot ask which one to mint. It exchanges the code, hands the token
  * to `/api/auth/exchange`, and writes whichever cookie the API says that token earned.
+ *
+ * IMPORTANT: The session cookie is set directly on the NextResponse.redirect() object
+ * rather than via next/headers cookies(). In Next.js Route Handlers, cookies written
+ * via next/headers are not reliably transferred to a redirect response — the Set-Cookie
+ * header can be lost, leaving the browser with no session cookie and the middleware
+ * sending the user straight back to /login. Setting the cookie on the response directly
+ * guarantees it is included in the redirect's Set-Cookie header.
  */
 export async function GET(request: Request): Promise<NextResponse> {
   const login = (error: string) => NextResponse.redirect(new URL(`/login?error=${error}`, request.url));
 
   const url = new URL(request.url);
   const code = url.searchParams.get('code');
+
+  // DEBUG: log cookies present so we can verify the PKCE verifier arrived
+  const cookieHeader = request.headers.get('cookie') ?? '';
+  const cookieNames = cookieHeader.split(';').map(c => c.trim().split('=')[0]).filter(Boolean);
+  console.log('[auth/callback] cookies present:', cookieNames);
+  console.log('[auth/callback] has code:', !!code);
+
   if (!code) {
     console.error('[auth/callback] No code in callback URL');
     return login('auth_callback');
@@ -43,7 +58,7 @@ export async function GET(request: Request): Promise<NextResponse> {
     return login('auth_unavailable');
   }
   if (exchangeResult.error || !exchangeResult.data.session?.access_token) {
-    console.error('[auth/callback] exchangeCodeForSession failed:', exchangeResult.error?.message);
+    console.error('[auth/callback] exchangeCodeForSession failed:', exchangeResult.error?.message, exchangeResult.error);
     return login('auth_callback');
   }
   const accessToken = exchangeResult.data.session.access_token;
@@ -54,12 +69,23 @@ export async function GET(request: Request): Promise<NextResponse> {
     return login('auth_unavailable');
   }
 
-  const minted = await mintSessionCookie(out.payload);
-  if (!minted) {
-    console.error('[auth/callback] mintSessionCookie failed — incomplete payload:', out.payload);
+  // Build the session payload from the API response. buildPayload validates that every
+  // required field is present; a partial or unexpected answer returns null instead of
+  // producing a cookie that the proxy would then reject on the first request.
+  const built = buildPayload(out.payload);
+  if (!built) {
+    console.error('[auth/callback] buildPayload failed — incomplete payload:', out.payload);
     return login('auth_unavailable');
   }
 
+  // Write the session cookie directly onto the redirect response rather than via
+  // next/headers. Cookies set through next/headers in a Route Handler are not
+  // reliably propagated to the redirect's Set-Cookie header in all Next.js versions,
+  // which would leave the browser cookieless and trigger another /login redirect.
   const redirectTo = safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard';
-  return NextResponse.redirect(new URL(redirectTo, request.url));
+  const response = NextResponse.redirect(new URL(redirectTo, request.url));
+  response.cookies.set(SESSION_COOKIE, serializeSession(built.payload), sessionCookieOptions(built.expiresIn));
+
+  console.log('[auth/callback] success — session minted, kind:', built.payload.kind, 'redirect:', redirectTo);
+  return response;
 }
