@@ -44,7 +44,7 @@ export async function GET(request: Request): Promise<NextResponse> {
     return login('auth_callback');
   }
 
-  const supabase = createDashboardSupabaseClient();
+  const supabase = await createDashboardSupabaseClient();
   if (!supabase) {
     console.error('[auth/callback] Supabase client unavailable (missing env vars)');
     return login('auth_unavailable');

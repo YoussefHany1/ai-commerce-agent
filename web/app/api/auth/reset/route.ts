@@ -47,7 +47,7 @@ export async function POST(request: Request): Promise<NextResponse> {
   }
 
   const email = body.email.trim();
-  const supabase = createDashboardSupabaseClient();
+  const supabase = await createDashboardSupabaseClient();
   if (!supabase) return NextResponse.json({ error: 'auth_unavailable' }, { status: 503 });
 
   let verified: { session: { access_token: string } } | null = null;

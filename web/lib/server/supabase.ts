@@ -12,22 +12,31 @@ import { cookies } from 'next/headers';
  * they are traded for this app's own session id via the API's `exchange` route,
  * which is what mints the `aca_session` cookie.
  *
- * `getAll`/`setAll` cover the async `cookies()` API in Next 16. The Supabase auth
- * cookies (sb-…) are set on the response exactly where the SDK needs them —
- * primarily the PKCE verifier — and are short-lived by design.
+ * IMPORTANT: `@supabase/ssr` expects `getAll` and `setAll` to be SYNCHRONOUS
+ * functions returning/accepting the cookie list directly. Passing async functions
+ * (even ones that resolve immediately) causes `getAll` to return a Promise object
+ * instead of a cookie array — Supabase then sees zero cookies, cannot find the
+ * PKCE code verifier, and `exchangeCodeForSession` fails with
+ * `AuthPKCECodeVerifierMissingError`. The fix is to resolve `cookies()` once
+ * before constructing the client and capture the store in a variable that the
+ * synchronous callbacks close over.
  */
-export function createDashboardSupabaseClient() {
+export async function createDashboardSupabaseClient() {
   const url = process.env.SUPABASE_URL?.trim();
   const anonKey = process.env.SUPABASE_ANON_KEY?.trim();
   if (!url || !anonKey) return null;
+
+  // Resolve the Next.js cookie store ONCE, synchronously accessible to both callbacks.
+  const cookieStore = await cookies();
+
   return createServerClient(url, anonKey, {
     cookies: {
-      // `getAll` returns {name, value}[] — the shape @supabase/ssr expects.
-      getAll: async () => (await cookies()).getAll(),
-      setAll: async (list) => {
-        const store = await cookies();
+      // @supabase/ssr calls getAll() synchronously; it must return the array directly,
+      // not a Promise. Closing over the already-resolved cookieStore satisfies this.
+      getAll: () => cookieStore.getAll(),
+      setAll: (list) => {
         for (const { name, value, options } of list) {
-          store.set(name, value, options);
+          cookieStore.set(name, value, options);
         }
       },
     },
