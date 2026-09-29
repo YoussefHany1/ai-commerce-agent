@@ -24,28 +24,41 @@ export async function GET(request: Request): Promise<NextResponse> {
 
   const url = new URL(request.url);
   const code = url.searchParams.get('code');
-  if (!code) return login('auth_callback');
+  if (!code) {
+    console.error('[auth/callback] No code in callback URL');
+    return login('auth_callback');
+  }
 
   const supabase = createDashboardSupabaseClient();
-  if (!supabase) return login('auth_unavailable');
+  if (!supabase) {
+    console.error('[auth/callback] Supabase client unavailable (missing env vars)');
+    return login('auth_unavailable');
+  }
 
   let exchangeResult: Awaited<ReturnType<typeof supabase.auth.exchangeCodeForSession>>;
   try {
     exchangeResult = await supabase.auth.exchangeCodeForSession(code);
-  } catch {
+  } catch (e) {
+    console.error('[auth/callback] exchangeCodeForSession threw:', e);
     return login('auth_unavailable');
   }
   if (exchangeResult.error || !exchangeResult.data.session?.access_token) {
+    console.error('[auth/callback] exchangeCodeForSession failed:', exchangeResult.error?.message);
     return login('auth_callback');
   }
   const accessToken = exchangeResult.data.session.access_token;
 
-
   const out = await callAuthApi('exchange', { accessToken });
-  if (out.status !== 200) return login('auth_unavailable');
+  if (out.status !== 200) {
+    console.error('[auth/callback] API exchange failed with status', out.status, out.payload);
+    return login('auth_unavailable');
+  }
 
   const minted = await mintSessionCookie(out.payload);
-  if (!minted) return login('auth_unavailable');
+  if (!minted) {
+    console.error('[auth/callback] mintSessionCookie failed — incomplete payload:', out.payload);
+    return login('auth_unavailable');
+  }
 
   const redirectTo = safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard';
   return NextResponse.redirect(new URL(redirectTo, request.url));
