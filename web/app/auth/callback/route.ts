@@ -43,8 +43,19 @@ export async function GET(request: Request): Promise<NextResponse> {
   const out = await callAuthApi('exchange', { accessToken });
   if (out.status !== 200) return login('auth_unavailable');
 
-  const minted = await mintSessionCookie(out.payload);
-  if (!minted) return login('auth_unavailable');
+  const { buildPayload } = await import('@/lib/server/authExchange');
+  const { serializeSession, sessionCookieOptions, SESSION_COOKIE } = await import('@/lib/server/session');
+  const parsed = buildPayload(out.payload as any);
+  if (!parsed) return login('auth_unavailable');
 
-  return NextResponse.redirect(new URL(safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard', request.url));
+  const redirectTo = safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard';
+  const response = NextResponse.redirect(new URL(redirectTo, request.url));
+  
+  response.cookies.set({
+    name: SESSION_COOKIE,
+    value: serializeSession(parsed.payload),
+    ...sessionCookieOptions(parsed.expiresIn)
+  });
+
+  return response;
 }

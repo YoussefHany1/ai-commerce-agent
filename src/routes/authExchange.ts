@@ -229,16 +229,20 @@ async function resolveIdentity(
       } else if (!byEmail && !operatorByEmail) {
         // Auto-provision a new client account for OAuth sign-ins
         const name = userName || email.split('@')[0];
+        req.log.info({ name, email, userId }, 'Auto-provisioning new client from OAuth');
         const newId = await clientRepo.create({ name, email, passwordHash: null, supabaseUid: userId });
         client = await clientRepo.get(newId);
+        req.log.info({ newId, client }, 'Auto-provisioned client result');
       }
     }
     if (!client || client.status !== 'active') {
+      req.log.error({ client, email: userEmail }, 'Client not found or not active after resolution');
       rep.code(401).send({ error: 'invalid_credentials' });
       return null;
     }
     return { kind: 'client', id: client.id, name: client.name, email: client.email };
-  } catch {
+  } catch (err) {
+    req.log.error({ err }, 'Error in identity resolution / auto-provisioning');
     rep.code(503).send({ error: 'auth_unavailable' });
     return null;
   }
