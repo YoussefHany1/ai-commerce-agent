@@ -85,11 +85,32 @@ export async function GET(request: Request): Promise<NextResponse> {
   // which would leave the browser cookieless and trigger another /login redirect.
   const redirectTo = safeNext(url.searchParams.get('redirect_to')) ?? '/dashboard';
   
-  const cookieStore = await cookies();
-  cookieStore.set(SESSION_COOKIE, serializeSession(built.payload), sessionCookieOptions(built.expiresIn));
+  const payloadStr = serializeSession(built.payload);
+  const setCookieHeader = `${SESSION_COOKIE}=${payloadStr}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${built.expiresIn}`;
   
-  const response = NextResponse.redirect(new URL(redirectTo, request.url));
-
-  console.log('[auth/callback] success — session minted, kind:', built.payload.kind, 'redirect:', redirectTo);
-  return response;
+  console.log('[auth/callback] success - session minted, kind:', built.payload.kind, 'redirect:', redirectTo);
+  
+  return new NextResponse(
+    `<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="0;url=${redirectTo}" />
+    <title>Redirecting...</title>
+</head>
+<body>
+    <script>window.location.href = "${redirectTo}";</script>
+    <p>Redirecting to <a href="${redirectTo}">dashboard</a>...</p>
+</body>
+</html>`,
+    {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html',
+        'Set-Cookie': setCookieHeader,
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
+    }
+  );
 }
