@@ -31,7 +31,7 @@ export const fetchCache = 'force-no-store';
  * sending the user straight back to /login. Setting the cookie on the response directly
  * guarantees it is included in the redirect's Set-Cookie header.
  */
-export async function GET(request: Request): Promise<NextResponse | void> {
+export async function GET(request: Request): Promise<NextResponse> {
   // Opt into dynamic rendering immediately
   const { headers: nextHeaders } = await import('next/headers');
   await nextHeaders();
