@@ -11,9 +11,42 @@ let cookieStore: { written: Array<{ name: string; value: string; options: Record
 
 vi.mock('next/headers', () => ({
   cookies: () => cookieStore,
+  // The route calls `headers()` to opt into dynamic rendering before it touches the
+  // session. Without this export the dynamic import throws "No 'headers' export is
+  // defined on the 'next/headers' mock" and every case fails before reaching an
+  // assertion — which is why the whole file went red at once.
+  headers: () => new Headers(),
 }));
 
-const { GET } = await import('./route');
+// Next implements `redirect()` by *throwing* a NEXT_REDIRECT carrying the target in
+// `digest`, and the framework catches it to emit the 307. The route relies on that:
+// the success path calls `redirect(redirectTo)` without returning it, after the cookie
+// has been written through next/headers. Reproducing the throw here is what lets the
+// route be exercised as written instead of being reshaped to suit the test.
+vi.mock('next/navigation', () => ({
+  redirect: (url: string) => {
+    const err = new Error('NEXT_REDIRECT') as Error & { digest: string };
+    err.digest = `307;${new URL(url, 'http://app.test').toString()}`;
+    throw err;
+  },
+}));
+
+const route = await import('./route');
+
+/** Calls the handler and renders a thrown NEXT_REDIRECT as the 307 Next would send. */
+const GET = async (request: Request): Promise<Response> => {
+  try {
+    return await route.GET(request);
+  } catch (e) {
+    const digest = (e as { digest?: unknown }).digest;
+    if (typeof digest !== 'string') throw e;
+    const sep = digest.indexOf(';');
+    return new Response(null, {
+      status: Number(digest.slice(0, sep)),
+      headers: { location: digest.slice(sep + 1) },
+    });
+  }
+};
 
 function makeStore() {
   const written: Array<{ name: string; value: string; options: Record<string, unknown> }> = [];

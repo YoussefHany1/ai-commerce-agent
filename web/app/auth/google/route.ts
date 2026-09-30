@@ -29,7 +29,8 @@ export async function GET(request: Request): Promise<NextResponse> {
     });
     if (error || !data.url) return NextResponse.json({ error: 'auth_unavailable', details: error?.message || 'no url returned' }, { status: 503 });
     return NextResponse.redirect(data.url);
-  } catch (e: any) {
-    return NextResponse.json({ error: 'auth_unavailable', exception: e?.message }, { status: 503 });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return NextResponse.json({ error: 'auth_unavailable', exception: message }, { status: 503 });
   }
 }

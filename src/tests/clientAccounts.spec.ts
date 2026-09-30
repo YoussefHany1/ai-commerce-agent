@@ -383,14 +383,24 @@ describe('client auth: register / forgot / exchange', () => {
   beforeEach(async () => {
     redisStore.clear();
     vi.clearAllMocks();
-    // `clearAllMocks` keeps implementations, so the operator lookups are reset by
-    // hand. Without this, a case that seeds an operator row leaks into the next one
-    // and every later exchange resolves its client token to an operator — or to a
-    // suspended one, which is a 401.
+    // `clearAllMocks` keeps implementations, so every mock that a case overrides with
+    // `mockResolvedValue`/`mockRejectedValue` has to be reset by hand. Without this, a
+    // case that seeds an operator row leaks into the next one and every later exchange
+    // resolves its client token to an operator — or to a suspended one, which is a 401.
     mocks.operatorRepo.getBySupabaseUid.mockReset();
     mocks.operatorRepo.getBySupabaseUid.mockResolvedValue(null);
     mocks.operatorRepo.findByEmail.mockReset();
     mocks.operatorRepo.findByEmail.mockResolvedValue(null);
+    // `create` is the one the race case rejects, and the auto-provision path in
+    // `resolveIdentity` calls it for *any* unknown-but-valid identity. Left rejected, it
+    // turned a stale expectation into an unrelated 503 several tests later, which is how
+    // this went unnoticed: the failure looked like an outage, not a leak.
+    mocks.clientRepo.create.mockReset();
+    mocks.clientRepo.get.mockReset();
+    mocks.clientRepo.getBySupabaseUid.mockReset();
+    mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.clientRepo.findByEmail.mockReset();
+    mocks.clientRepo.findByEmail.mockResolvedValue(null);
     defaultSupabaseMocks();
     app = await buildApp();
   });
@@ -622,16 +632,53 @@ describe('client auth: register / forgot / exchange', () => {
     expect(mocks.clientRepo.setSupabaseUid).toHaveBeenCalledWith(CLIENT_ID, SUPABASE_UID);
   });
 
-  it('exchange rejects a token that reaches no account', async () => {
+  it('exchange auto-provisions a client for a valid identity that reaches no account', async () => {
+    // This used to assert a 401, which was correct until 368ba3a added
+    // auto-provisioning to `resolveIdentity`. A Supabase identity that verifies but
+    // matches no row is no longer an error: it gets an account, because rejecting it
+    // meant a merchant who signed in with Google could never reach a dashboard. The
+    // genuine 401s are covered by the suspended-account, dual-identity and
+    // bad-token cases; the 503 when the write fails is the case below.
+    const GHOST_UID = '9b9b8c67-0f0a-4a1e-8c3d-000000000009';
     mocks.supabase.admin.auth.getUser.mockResolvedValue({
-      data: { user: { id: '9b9b8c67-...-unknown' as string, email: 'ghost@example.com' } },
+      data: { user: { id: GHOST_UID, email: 'ghost@example.com' } },
       error: null,
     });
     mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
     mocks.clientRepo.findByEmail.mockResolvedValue(null);
+    mocks.clientRepo.create.mockResolvedValue(NEW_CLIENT_ID);
+    mocks.clientRepo.get.mockImplementation(async (id: string) =>
+      id === NEW_CLIENT_ID ? clientRow({ id: NEW_CLIENT_ID, email: 'ghost@example.com' }) : null,
+    );
+
     const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-nobody' }));
-    expect(res.statusCode).toBe(401);
-    expect(res.json()).toMatchObject({ error: 'invalid_credentials' });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ clientId: NEW_CLIENT_ID });
+    // No password hash is ever persisted for a Supabase-managed account.
+    expect(mocks.clientRepo.create).toHaveBeenCalledWith({
+      name: 'ghost',
+      email: 'ghost@example.com',
+      passwordHash: null,
+      supabaseUid: GHOST_UID,
+    });
+  });
+
+  it('exchange reports 503 when auto-provisioning cannot write the account', async () => {
+    // The distinction that matters operationally: a rejected token is the user's problem
+    // (401), a failed write is ours (503), and the sign-in form reports them differently.
+    mocks.supabase.admin.auth.getUser.mockResolvedValue({
+      data: { user: { id: '9b9b8c67-0f0a-4a1e-8c3d-000000000009', email: 'ghost@example.com' } },
+      error: null,
+    });
+    mocks.clientRepo.getBySupabaseUid.mockResolvedValue(null);
+    mocks.clientRepo.findByEmail.mockResolvedValue(null);
+    mocks.clientRepo.create.mockRejectedValue(new Error('db unavailable'));
+
+    const res = await app.inject(post('/api/auth/exchange', { accessToken: 'jwt-nobody' }));
+
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toMatchObject({ error: 'auth_unavailable' });
   });
 
   it('exchange refuses a suspended account', async () => {
