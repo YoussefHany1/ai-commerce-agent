@@ -11,6 +11,8 @@ import { jobs as jobsRoutes } from './routes/jobs.js';
 import { session as sessionRoutes } from './routes/session.js';
 import { automation as automationRoutes } from './routes/automation.js';
 import { pdpl as pdplRoutes } from './routes/pdpl.js';
+import { widget as widgetRoutes } from './routes/widget.js';
+import { widgetCorsHook } from './lib/widget.js';
 import { favicon } from './routes/favicon.js';
 import { operatorAuth } from './routes/operatorAuth.js';
 import { clientAuth } from './routes/clientAuth.js';
@@ -43,6 +45,10 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
+// Registered before @fastify/cors so it answers the widget's preflight itself; see
+// widgetCorsHook for why the global handler cannot.
+widgetCorsHook(app);
+
 await app.register(cors, {
   origin: config.CORS_ORIGINS
     ? config.CORS_ORIGINS === '*'
@@ -72,6 +78,7 @@ await analytics(app);
 await jobsRoutes(app);
 await automationRoutes(app);
 await pdplRoutes(app);
+await widgetRoutes(app);
 await favicon(app);
 
 await app.listen({ port: config.PORT, host: '0.0.0.0' });

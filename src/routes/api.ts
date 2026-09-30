@@ -9,12 +9,14 @@ import {
   jobsRepo,
 } from '../db/repos.js';
 import { getCommerceAdapter, verifyStoreCredentials } from '../integrations/factory.js';
+import { recordImpressions } from '../services/analytics.js';
 import { answerWithTools, toChatHistory } from '../services/agent.js';
 import { retrieve, embedMissingCatalog } from '../services/retrieval.js';
 import { dbPing, redisPing, rlsPing } from '../lib/health.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
 import { requireOperator, requireDashboard, sha256Hex, type Principal } from '../lib/auth.js';
 import { requireSession, type CustomerSession } from '../lib/session.js';
+import { generateEmbedKey } from '../lib/widget.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -175,6 +177,49 @@ export async function api(app: FastifyInstance) {
     },
   );
 
+  /**
+   * The widget's embed key.
+   *
+   * Readable by anyone who owns the store, not just the operator: the merchant is
+   * the one who has to paste it into their storefront, so making it operator-only
+   * would mean an operator acting as a helpdesk for every install. `requireDashboard`
+   * with a storeIdRef proves ownership and 404s a store that is not theirs, so this
+   * cannot be used to probe for other stores' keys.
+   */
+  app.get(
+    '/api/stores/:storeId/embed-key',
+    { preHandler: [requireDashboard((req) => (req.params as { storeId?: string }).storeId), storeRateLimitWindow('api', apiWindow)] },
+    async (req, rep) => {
+      const { storeId } = storeIdParam.parse(req.params);
+      const store = await storeRepo.get(storeId);
+      if (!store) return rep.code(404).send({ error: 'store_not_found' });
+      return { storeId, embedKey: store.embedKey ?? null };
+    },
+  );
+
+  /**
+   * Mints the key if absent, and rotates on demand.
+   *
+   * Rotation is the revoke path for a key that leaked — a merchant who pasted it
+   * somewhere they no longer controls can invalidate it without an operator. The
+   * old key stops resolving immediately, which also stops the storefront widget
+   * from minting sessions, so the widget degrades rather than silently persisting.
+   */
+  app.post(
+    '/api/stores/:storeId/embed-key',
+    { preHandler: [requireDashboard((req) => (req.params as { storeId?: string }).storeId), storeRateLimitWindow('api', apiWindow)] },
+    async (req, rep) => {
+      const { storeId } = storeIdParam.parse(req.params);
+      const store = await storeRepo.get(storeId);
+      if (!store) return rep.code(404).send({ error: 'store_not_found' });
+      const { rotate } = z.object({ rotate: z.boolean().optional() }).parse(req.body ?? {});
+      if (store.embedKey && !rotate) return { storeId, embedKey: store.embedKey, created: false };
+      const embedKey = generateEmbedKey();
+      await storeRepo.setEmbedKey(storeId, embedKey);
+      return { storeId, embedKey, created: true };
+    },
+  );
+
   app.get(
     '/api/products/:storeId',
     { preHandler: [requireDashboard((req) => (req.params as { storeId?: string }).storeId, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
@@ -209,6 +254,13 @@ export async function api(app: FastifyInstance) {
       await conversationRepo.addMessage({ storeId: sess.storeId, conversationId, role: 'user', content: body.message });
       const reply = await answerWithTools(sess.storeId, body.message, history);
       await conversationRepo.addMessage({ storeId: sess.storeId, conversationId, role: 'assistant', content: reply });
+      // Record the recommendation before returning it, so the funnel has a
+      // denominator even for a product the shopper never clicks. Best-effort: a
+      // failed analytics write must not cost the shopper their answer.
+      await recordImpressions(sess.storeId, {
+        conversationId,
+        productIds: list.map((p) => p.id),
+      }).catch(() => 0);
       return { reply, products: list };
     },
   );

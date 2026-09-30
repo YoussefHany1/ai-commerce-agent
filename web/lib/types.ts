@@ -227,6 +227,18 @@ export interface ChatResponse {
   }>;
 }
 
+/**
+ * A chat turn plus the guest session token it was made with.
+ *
+ * The token has to travel back to the caller because it is also the credential
+ * `POST /api/attributions/click` wants. Without it a recommendation rendered
+ * here could never be attributed, and the Analytics page stays empty no matter
+ * how much chatting happens on this screen.
+ */
+export interface ChatResult extends ChatResponse {
+  token: string;
+}
+
 export interface ApiErrorBody {
   error?: string;
   message?: string;

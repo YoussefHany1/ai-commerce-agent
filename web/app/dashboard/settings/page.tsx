@@ -1,9 +1,9 @@
 'use client';
 
-import { useState } from 'react';
-import { Activity, Database, MessageCircle, Radio, ServerCrash, Trash2 } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Activity, Code2, Database, MessageCircle, Radio, ServerCrash, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { format } from 'date-fns';
 import { useSelectedStore, STORES_KEY } from '@/hooks/useStores';
 import { useHealth } from '@/hooks/useMetrics';
@@ -19,6 +19,45 @@ export default function SettingsPage() {
   const { storeId, stores, setActiveStoreId } = useSelectedStore();
   const health = useHealth();
   const queryClient = useQueryClient();
+
+  const embed = useQuery({
+    queryKey: ['embed-key', storeId],
+    queryFn: () => api.embedKey(storeId!),
+    enabled: !!storeId,
+  });
+
+  const createKey = useMutation({
+    mutationFn: (rotate: boolean) => api.ensureEmbedKey(storeId!, rotate),
+    onSuccess: (data, rotate) => {
+      queryClient.setQueryData(['embed-key', storeId], { storeId: data.storeId, embedKey: data.embedKey });
+      toast.success(rotate ? 'Key rotated — update the snippet on your storefront' : 'Snippet ready');
+    },
+    onError: (err: unknown) =>
+      toast.error(err instanceof Error ? err.message : 'Could not create an embed key'),
+  });
+
+  const activeStore = stores.find((s) => s.id === storeId);
+
+  /**
+   * The widget is served from this app and talks to the API directly, because it
+   * runs on the merchant's origin and cannot use this app's same-origin proxy.
+   */
+  const snippet = useMemo(() => {
+    const key = embed.data?.embedKey;
+    if (!key) return '';
+    return [
+      `<script`,
+      `  src="${typeof window === 'undefined' ? '' : window.location.origin}/widget.js"`,
+      `  data-api="${API_BASE_URL}"`,
+      `  data-key="${key}"`,
+      `  data-store="${(activeStore?.name ?? 'Store').replace(/"/g, '&quot;')}"`,
+      `  defer></script>`,
+    ].join('\n');
+  }, [embed.data?.embedKey, activeStore?.name]);
+
+  const originsHint = activeStore?.shopDomain
+    ? `your storefront (${activeStore.shopDomain})`
+    : "the store's own domain";
 
   const [whatsapp, setWhatsapp] = useState({ phoneNumberId: '', wabaId: '', accessToken: '' });
 
@@ -102,6 +141,74 @@ export default function SettingsPage() {
               Inbound messages are verified with X-Hub-Signature-256 and trigger the agent loop
               automatically once the webhook is subscribed.
             </p>
+          </div>
+        </Card>
+
+        {/* Storefront widget */}
+        <Card
+          title="Storefront widget"
+          description="Put the AI agent on your own storefront. Clicks and purchases then land in Analytics."
+          action={<Code2 className="h-5 w-5 text-violet-500" />}
+        >
+          <div className="space-y-4">
+            {!embed.data?.embedKey ? (
+              <>
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                  Generate a snippet to paste into your theme. Without it, recommendations
+                  happen only inside this dashboard and never reach your customers.
+                </p>
+                <Button
+                  onClick={() => createKey.mutate(false)}
+                  loading={createKey.isPending}
+                  disabled={!storeId || embed.isLoading}
+                  className="w-full sm:w-auto"
+                >
+                  Generate embed snippet
+                </Button>
+              </>
+            ) : (
+              <>
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                    Paste this before <code className="rounded bg-slate-100 px-1 dark:bg-white/10">&lt;/body&gt;</code>:
+                  </p>
+                  <textarea
+                    readOnly
+                    rows={5}
+                    value={snippet}
+                    onFocus={(e) => e.currentTarget.select()}
+                    className="w-full resize-none rounded-xl border border-slate-200/60 bg-slate-50/70 px-3 py-2.5 font-mono text-[11px] leading-relaxed text-slate-700 dark:border-white/5 dark:bg-white/[0.03] dark:text-slate-300"
+                  />
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        navigator.clipboard
+                          ?.writeText(snippet)
+                          .then(() => toast.success('Snippet copied'))
+                          .catch(() => toast.error('Copy failed — select the text and copy manually'));
+                      }}
+                    >
+                      Copy snippet
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => createKey.mutate(true)}
+                      loading={createKey.isPending}
+                    >
+                      Rotate key
+                    </Button>
+                  </div>
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  The key is public — it can only start a chat with this store, and only from{' '}
+                  {originsHint}. On a custom domain, add that domain to{' '}
+                  <code className="rounded bg-slate-100 px-1 dark:bg-white/10">settings.widgetOrigins</code>{' '}
+                  or the widget will be refused. Rotating invalidates the old snippet immediately.
+                </p>
+              </>
+            )}
           </div>
         </Card>
 

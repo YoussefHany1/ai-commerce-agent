@@ -364,6 +364,28 @@ export const storeRepo = {
     return row?.hint ?? null;
   },
 
+  /**
+   * Resolves a widget embed key to its store.
+   *
+   * Operator-scoped because it crosses the tenant boundary: the caller supplies a
+   * bare key with no session, so this is the one lookup allowed to leave a tenant.
+   * The key is public by construction, so this grants nothing an attacker who read
+   * the storefront's source did not already have — which is exactly why the callers
+   * pair it with an origin check and a rate limit.
+   */
+  async getByEmbedKey(embedKey: string): Promise<Store | null> {
+    const [row] = await withOperator((tx) =>
+      tx.select().from(stores).where(eq(stores.embedKey, embedKey)).limit(1),
+    );
+    return row ?? null;
+  },
+
+  async setEmbedKey(storeId: string, embedKey: string): Promise<void> {
+    await withOperator((tx) =>
+      tx.update(stores).set({ embedKey }).where(eq(stores.id, storeId)),
+    );
+  },
+
   async updateSettings(storeId: string, patch: Record<string, unknown>): Promise<void> {
     await withOperator(async (tx) => {
       const [row] = await tx.select({ settings: stores.settings }).from(stores).where(eq(stores.id, storeId)).limit(1);

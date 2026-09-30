@@ -1,7 +1,7 @@
 import { jobsRepo, catalogRepo, storeRepo, orderRepo, connectionRepo } from '../db/repos.js';
 import { getCommerceAdapter } from '../integrations/factory.js';
 import { embedMissingCatalog } from '../services/retrieval.js';
-import { rollupDailyMetrics } from '../services/analytics.js';
+import { rollupDailyMetrics, markConversionsForOrder } from '../services/analytics.js';
 import { purgeStorePii } from '../services/pdpl.js';
 import { logger } from '../lib/logger.js';
 import { withLock } from '../lib/lock.js';
@@ -37,7 +37,7 @@ const ORDER_OVERLAP_MS = 5 * 60_000;
 // cursor advances to the last order actually read rather than to the wall clock.
 const ORDER_PAGE_LIMIT = 5_000;
 
-export type OrderSyncResult = { imported: number; cursor: string | null; truncated: boolean };
+export type OrderSyncResult = { imported: number; cursor: string | null; truncated: boolean; attributed: number };
 
 /**
  * Backfills `orders` from the platform for a store, then re-rolls the days it
@@ -58,8 +58,18 @@ export async function runOrderSync(storeId: string, opts: { since?: Date } = {})
   let maxPlacedAt: Date | null = cursor ?? null;
   let minPlacedAt: Date | null = null;
   let nextCursor: Date | null = null;
+  let attributed = 0;
   for (const o of fetched) {
     await orderRepo.upsert(storeId, o);
+    // Attribute here too, not just on the webhook. A manual-token store never gets
+    // an orders/create webhook at all, so without this its recommendations could
+    // collect clicks forever and never a single conversion. markConversionsForOrder
+    // is a no-op once a row is converted, so re-reading the overlap window is safe.
+    try {
+      attributed += await markConversionsForOrder(storeId, o);
+    } catch {
+      // One bad order must not abort the whole import; the next run retries it.
+    }
     if (o.placedAt) {
       if (!maxPlacedAt || o.placedAt > maxPlacedAt) maxPlacedAt = o.placedAt;
       if (!minPlacedAt || o.placedAt < minPlacedAt) minPlacedAt = o.placedAt;
@@ -103,7 +113,7 @@ export async function runOrderSync(storeId: string, opts: { since?: Date } = {})
     await rollupDailyMetrics(storeId, Math.min(Math.max(spanDays + 1, 3), 90));
   }
 
-  return { imported: fetched.length, cursor: nextCursor?.toISOString() ?? null, truncated };
+  return { imported: fetched.length, cursor: nextCursor?.toISOString() ?? null, truncated, attributed };
 }
 
 export const jobHandlers: Record<string, JobHandler> = {

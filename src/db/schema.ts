@@ -125,6 +125,19 @@ export const stores = pgTable(
     apiKeyHash: text('api_key_hash'),
     apiKeyHint: text('api_key_hint'),
     /**
+     * Public identifier for the storefront widget, e.g. `aca_pub_…`.
+     *
+     * Deliberately NOT a secret and deliberately stored in the clear: the merchant
+     * has to paste it into their own storefront, so it has to be readable. It grants
+     * exactly one capability — minting a customer session for its own store — and is
+     * not accepted by any operator or dashboard guard. The cost is that anyone who
+     * can read the storefront's source can mint guest sessions, which is why the
+     * widget's endpoints are additionally bound to the store's own origins and
+     * rate-limited per IP. Contrast `apiKeyHash`, which is the opposite trade: a
+     * real credential, so only its hash is kept.
+     */
+    embedKey: text('embed_key'),
+    /**
      * Owning account, or null for an operator-owned store.
      *
      * Nullable on purpose: it keeps every existing row, and every store created
@@ -380,7 +393,15 @@ export const attributions = pgTable(
     orderId: text('order_id'),
     channel: text('channel').notNull().default('web'),
     createdAt: ts(),
-    clickedAt: ts(),
+    /**
+     * Null until the recommendation is actually clicked.
+     *
+     * Nullable on purpose: a row is created when the agent *recommends* a product,
+     * and the click fills this in. It was `notNull().defaultNow()`, which made a
+     * click indistinguishable from an impression and forced click-through rate to
+     * 100% — the funnel had no first stage to measure against.
+     */
+    clickedAt: timestamp('clickedAt', { withTimezone: true }),
     convertedAt: timestamp('converted_at', { withTimezone: true }),
     revenue: doublePrecision('revenue').notNull().default(0),
   },

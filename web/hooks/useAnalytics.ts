@@ -3,10 +3,12 @@
 import { useQuery } from '@tanstack/react-query';
 import { api, isPaymentRequired } from '@/lib/api';
 
-export function useAttributions(storeId: string | null) {
+export function useAttributions(storeId: string | null, status?: 'recommended' | 'clicked' | 'converted') {
   return useQuery({
-    queryKey: ['attributions', storeId] as const,
-    queryFn: () => api.attributions(storeId!),
+    // `status` is in the key so switching a filter actually refetches. Without it the
+    // cached unfiltered list is served and the filter buttons do nothing visible.
+    queryKey: ['attributions', storeId, status ?? 'all'] as const,
+    queryFn: () => api.attributions(storeId!, status),
     enabled: !!storeId,
     staleTime: 30_000,
     retry: (failureCount, error) => !isPaymentRequired(error) && failureCount < 2,

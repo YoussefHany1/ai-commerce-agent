@@ -1,0 +1,15 @@
+-- Allow a recommendation to exist before it is clicked.
+--
+-- `attributions.clickedAt` was `notNull() default now()`, so every row looked
+-- clicked the moment it was written. `recordClick` was the only writer, which made
+-- `recommended` and `clicked` the same number in the channel funnel and pinned CTR
+-- at 100% — the grey "recommended, not clicked" segment of the bar could never be
+-- non-empty. Rows are now created at recommendation time with a NULL clickedAt and
+-- the click fills it in, which is what the funnel and the 'recommended' status have
+-- always assumed.
+--
+-- Safe to do live: existing rows keep their timestamps, and nothing reads this
+-- column through a NOT NULL assumption except the filters that already test
+-- `is not null` explicitly.
+--> statement-breakpoint
+ALTER TABLE "attributions" ALTER COLUMN "clickedAt" DROP NOT NULL;

@@ -42,6 +42,8 @@ const mocks = vi.hoisted(() => {
     setApiKey: vi.fn(async () => {}),
     clearApiKey: vi.fn(async () => {}),
     getApiKeyHint: vi.fn(async () => null),
+    getByEmbedKey: vi.fn(async () => null),
+    setEmbedKey: vi.fn(async () => {}),
   };
   const connectionRepo = { setTokens: vi.fn(), getTokens: vi.fn(), get: vi.fn() };
   const catalogRepo = { list: vi.fn() };
@@ -92,6 +94,7 @@ const services = vi.hoisted(() => {
       conversionLag: vi.fn(async () => ({ overall: {}, daily: [], distribution: [] })),
       topProducts: vi.fn(async () => []),
       recordClick: vi.fn(async () => true),
+      recordImpressions: vi.fn(async () => 0),
     },
     pdpl: { getCustomerData: vi.fn(), eraseCustomer: vi.fn(), purgeStorePii: vi.fn() },
     automation: { runAllAutomation: vi.fn(async () => ({ total: 0, executed: 0 })) },
@@ -193,6 +196,8 @@ async function buildApp() {
   const { session: sessionRoutes } = await import('../routes/session.js');
   const { automation: automationRoutes } = await import('../routes/automation.js');
   const { pdpl: pdplRoutes } = await import('../routes/pdpl.js');
+  const { widget } = await import('../routes/widget.js');
+  const { widgetCorsHook } = await import('../lib/widget.js');
 
   const app = Fastify({ logger: false });
   app.setErrorHandler((error: any, _req, reply) => {
@@ -205,10 +210,12 @@ async function buildApp() {
     }
     reply.code(500).send({ error: 'internal_error' });
   });
+  // Same ordering as src/server.ts: the widget hook must see preflights first.
+  widgetCorsHook(app);
   await app.register(cors, {
     origin: 'http://localhost',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'X-Api-Key', 'X-Store-Id'],
+    allowedHeaders: ['Content-Type', 'X-Api-Key', 'X-Store-Id', 'Authorization', 'X-Embed-Key'],
   });
   await app.register(formbody);
   await registerRawBody(app);
@@ -222,6 +229,7 @@ async function buildApp() {
   await jobsRoutes(app);
   await automationRoutes(app);
   await pdplRoutes(app);
+  await widget(app);
   return app;
 }
 
@@ -879,5 +887,190 @@ describe('routes: store-scoped api keys', () => {
       headers: { 'x-api-key': key, 'x-store-id': 's1' },
     });
     expect(res.statusCode).toBe(401);
+  });
+});
+
+const EMBED_KEY = 'aca_pub_0123456789abcdef0123456789abcdef';
+const WIDGET_ORIGIN = 'https://demo.myshopify.com';
+
+function embedStore(over: Record<string, unknown> = {}) {
+  return {
+    id: 's1',
+    name: 'Shop',
+    platform: 'shopify',
+    planStatus: 'active',
+    shopDomain: 'demo.myshopify.com',
+    settings: null,
+    ...over,
+  };
+}
+
+describe('routes: storefront widget', () => {
+  let app: App;
+
+  beforeEach(async () => {
+    infra.store.clear();
+    vi.clearAllMocks();
+    app = await buildApp();
+    mocks.customerRepo.upsert.mockResolvedValue('cust-widget');
+    mocks.conversationRepo.ensureOpen.mockResolvedValue('conv-widget');
+    mocks.storeRepo.getByEmbedKey.mockImplementation(async () => embedStore() as any);
+  });
+
+  const session = (headers: Record<string, string>, payload: Record<string, unknown> = {}) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/widget/session',
+      headers: { 'content-type': 'application/json', ...headers },
+      payload: JSON.stringify(payload),
+    });
+
+  it('mints a customer session for a valid key on the store’s own origin', async () => {
+    const res = await session({ 'x-embed-key': EMBED_KEY, origin: WIDGET_ORIGIN }, { email: 'a@b.co' });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(typeof body.token).toBe('string');
+    expect(body.token.length).toBeGreaterThan(20);
+    expect(body.conversationId).toBe('conv-widget');
+    // A customer session, never the store's API key or the admin key.
+    expect(JSON.stringify(body)).not.toContain(ADMIN_KEY);
+    expect(JSON.stringify(body)).not.toContain('sk_live_');
+    expect(mocks.customerRepo.upsert).toHaveBeenCalledWith('s1', { name: undefined, phone: undefined, email: 'a@b.co' });
+    expect(mocks.conversationRepo.ensureOpen).toHaveBeenCalledWith('s1', 'cust-widget', 'web');
+  });
+
+  it('rejects a request with no embed key', async () => {
+    const res = await session({ origin: WIDGET_ORIGIN });
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error).toBe('invalid_embed_key');
+    expect(mocks.customerRepo.upsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed or unknown embed key', async () => {
+    // A store API key must not be accepted here, and is asserted structurally rather
+    // than by pasting something shaped like a live credential into the repo.
+    const storeKey = `sk_live_${'0'.repeat(64)}`;
+    for (const key of ['nope', 'aca_pub_short', storeKey, `${EMBED_KEY}x`]) {
+      const res = await session({ 'x-embed-key': key, origin: WIDGET_ORIGIN });
+      expect(res.statusCode, `key ${key}`).toBe(401);
+    }
+    mocks.storeRepo.getByEmbedKey.mockImplementation(async () => null);
+    const unknown = await session({ 'x-embed-key': EMBED_KEY, origin: WIDGET_ORIGIN });
+    expect(unknown.statusCode).toBe(401);
+    expect(mocks.customerRepo.upsert).not.toHaveBeenCalled();
+  });
+
+  it('refuses a known key from a foreign origin, before touching the AI path', async () => {
+    const res = await session({ 'x-embed-key': EMBED_KEY, origin: 'https://evil.test' });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('origin_not_allowed');
+    expect(mocks.customerRepo.upsert).not.toHaveBeenCalled();
+  });
+
+  it('honours a configured custom domain as well as the shop domain', async () => {
+    mocks.storeRepo.getByEmbedKey.mockImplementation(async () =>
+      embedStore({ settings: { widgetOrigins: ['www.example.com'] } }) as any,
+    );
+    const ok = await session({ 'x-embed-key': EMBED_KEY, origin: 'https://www.example.com' });
+    expect(ok.statusCode).toBe(200);
+    const bad = await session({ 'x-embed-key': EMBED_KEY, origin: 'https://www.other.test' });
+    expect(bad.statusCode).toBe(403);
+  });
+
+  it('validates the body rather than storing junk as a contact', async () => {
+    const res = await session({ 'x-embed-key': EMBED_KEY, origin: WIDGET_ORIGIN }, { email: 'not-an-email' });
+    expect(res.statusCode).toBe(400);
+    expect(mocks.customerRepo.upsert).not.toHaveBeenCalled();
+  });
+
+  it('grants CORS to the store’s origin for the widget’s own paths', async () => {
+    const res = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/widget/session',
+      headers: { origin: WIDGET_ORIGIN, 'x-embed-key': EMBED_KEY, 'access-control-request-method': 'POST' },
+    });
+    expect(res.statusCode).toBe(204);
+    expect(res.headers['access-control-allow-origin']).toBe(WIDGET_ORIGIN);
+    expect(String(res.headers['access-control-allow-headers']).toLowerCase()).toContain('x-embed-key');
+    // Preflight must actually terminate the request, not fall through to a 404.
+    expect(res.body).toBe('');
+  });
+
+  it('does not grant CORS to a foreign origin even with a valid key', async () => {
+    const res = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/widget/session',
+      headers: { origin: 'https://evil.test', 'x-embed-key': EMBED_KEY, 'access-control-request-method': 'POST' },
+    });
+    // The global cors plugin answers 204 for every preflight (its `origin` is a
+    // fixed string), so the status code cannot distinguish the two handlers. The
+    // allow-origin header can: a browser only admits the request when it matches
+    // its own origin, so the key must not be able to make that happen.
+    expect(res.headers['access-control-allow-origin']).not.toBe('https://evil.test');
+  });
+
+  it('does not widen CORS for paths outside the widget’s surface', async () => {
+    const res = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/stores/s1/keys',
+      headers: { origin: WIDGET_ORIGIN, 'x-embed-key': EMBED_KEY, 'access-control-request-method': 'POST' },
+    });
+    expect(res.headers['access-control-allow-origin']).not.toBe(WIDGET_ORIGIN);
+  });
+
+  it('rate limits the mint, since it is the endpoint that spends money', async () => {
+    let last = 0;
+    for (let i = 0; i < 12; i += 1) {
+      last = (
+        await session({ 'x-embed-key': EMBED_KEY, origin: WIDGET_ORIGIN }, { email: `a${i}@b.co` })
+      ).statusCode;
+    }
+    expect(last).toBe(429);
+  });
+});
+
+describe('routes: embed key management', () => {
+  let app: App;
+
+  beforeEach(async () => {
+    infra.store.clear();
+    vi.clearAllMocks();
+    app = await buildApp();
+    mocks.storeRepo.get.mockImplementation(async () => store('s1'));
+  });
+
+  const read = (headers: Record<string, string>) =>
+    app.inject({ method: 'GET', url: '/api/stores/s1/embed-key', headers });
+
+  const create = (headers: Record<string, string>) =>
+    app.inject({ method: 'POST', url: '/api/stores/s1/embed-key', headers });
+
+  it('reports no key before one is minted', async () => {
+    mocks.storeRepo.get.mockImplementation(async () => ({ ...store('s1'), embedKey: null }));
+    const res = await read({ 'x-api-key': ADMIN_KEY });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ storeId: 's1', embedKey: null });
+  });
+
+  it('mints a key an operator can read back', async () => {
+    const res = await create({ 'x-api-key': ADMIN_KEY });
+    expect(res.statusCode).toBe(200);
+    const { embedKey } = res.json();
+    expect(embedKey).toMatch(/^aca_pub_[0-9a-f]{32}$/);
+    expect(mocks.storeRepo.setEmbedKey).toHaveBeenCalledWith('s1', embedKey);
+  });
+
+  it('rotates to a different key, invalidating the old one', async () => {
+    const first = (await create({ 'x-api-key': ADMIN_KEY })).json().embedKey;
+    const second = (await create({ 'x-api-key': ADMIN_KEY })).json().embedKey;
+    expect(second).not.toBe(first);
+  });
+
+  it('keeps key management behind the admin key', async () => {
+    // An operator managing keys should not be able to silently mint a widget key
+    // for a store they can only read.
+    const res = await create({});
+    expect(res.statusCode).toBe(401);
+    expect(mocks.storeRepo.setEmbedKey).not.toHaveBeenCalled();
   });
 });

@@ -4,6 +4,7 @@ import type {
   AutomationRulesResponse,
   BillingStatus,
   ChatResponse,
+  ChatResult,
   CheckoutResponse,
   ClientAccount,
   ClientCreateResult,
@@ -122,7 +123,7 @@ export const api = {
   metrics: (storeId: string, days = 14) =>
     request<MetricsResponse>(`/api/metrics/${storeId}`, { query: { days } }),
 
-  attributions: (storeId: string, status?: 'clicked' | 'converted') =>
+  attributions: (storeId: string, status?: 'recommended' | 'clicked' | 'converted') =>
     request<AttributionsResponse>(`/api/analytics/${storeId}/attributions`, {
       query: { status },
     }),
@@ -230,16 +231,19 @@ export const api = {
       body: { password },
     }),
 
-  chat: async (storeId: string, message: string): Promise<ChatResponse> => {
+  chat: async (storeId: string, message: string): Promise<ChatResult> => {
     const sessionRes = await request<{ token: string; conversationId: string }>('/api/session', {
       method: 'POST',
       body: { storeId },
     });
-    return request<ChatResponse>('/api/chat', {
+    const res = await request<ChatResponse>('/api/chat', {
       method: 'POST',
       headers: { Authorization: `Bearer ${sessionRes.token}` },
       body: { message },
     });
+    // Hand the token back so a recommendation click on this turn can be
+    // attributed. It is a short-lived guest token already in this tab's memory.
+    return { ...res, token: sessionRes.token };
   },
 
   attributionClick: (token: string, productId: string) =>
@@ -248,6 +252,20 @@ export const api = {
       headers: { Authorization: `Bearer ${token}` },
       body: { productId },
     }),
+
+  embedKey: (storeId: string) =>
+    request<{ storeId: string; embedKey: string | null }>(`/api/stores/${storeId}/embed-key`),
+
+  /**
+   * Returns the store's existing embed key, minting one on first call.
+   * `rotate` invalidates the old key immediately, which is the revoke path for a
+   * key that ended up somewhere the merchant no longer controls.
+   */
+  ensureEmbedKey: (storeId: string, rotate = false) =>
+    request<{ storeId: string; embedKey: string; created: boolean }>(
+      `/api/stores/${storeId}/embed-key`,
+      { method: 'POST', body: { rotate } },
+    ),
 
   /**
    * Clears the operator session cookie server-side.

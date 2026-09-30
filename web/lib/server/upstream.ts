@@ -23,6 +23,12 @@ const ALLOWLIST: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   { method: 'POST', pattern: /^\/stores$/ },
   { method: 'DELETE', pattern: /^\/stores\/[^/]+$/ },
   { method: 'GET', pattern: /^\/products\/[^/]+$/ },
+  // The widget's own session endpoint is deliberately absent: the widget runs on
+  // the merchant's storefront and calls the API directly, so proxying it here would
+  // give it a dashboard session it has no business holding. Only the two management
+  // calls — read the key, mint/rotate it — belong to the dashboard.
+  { method: 'GET', pattern: /^\/stores\/[^/]+\/embed-key$/ },
+  { method: 'POST', pattern: /^\/stores\/[^/]+\/embed-key$/ },
   { method: 'POST', pattern: /^\/session$/ },
   { method: 'POST', pattern: /^\/chat$/ },
   { method: 'POST', pattern: /^\/attributions\/click$/ },

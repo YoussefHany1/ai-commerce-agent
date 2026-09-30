@@ -13,7 +13,10 @@ vi.mock('../db/repos.js', async (importOriginal) => {
   };
 });
 vi.mock('../integrations/factory.js', () => ({ getCommerceAdapter: vi.fn() }));
-vi.mock('../services/analytics.js', () => ({ rollupDailyMetrics: vi.fn() }));
+vi.mock('../services/analytics.js', () => ({
+  rollupDailyMetrics: vi.fn(),
+  markConversionsForOrder: vi.fn(async () => 0),
+}));
 vi.mock('../services/retrieval.js', () => ({ embedMissingCatalog: vi.fn() }));
 vi.mock('../services/pdpl.js', () => ({ purgeStorePii: vi.fn() }));
 vi.mock('../lib/logger.js', () => ({ logger: { error: vi.fn(), info: vi.fn(), warn: vi.fn() } }));
@@ -47,6 +50,7 @@ async function load(opts: {
   vi.mocked(repos.connectionRepo.getOrdersCursor).mockResolvedValue(opts.cursor ?? null);
   vi.mocked(repos.connectionRepo.markOrdersSynced).mockResolvedValue(undefined);
   vi.mocked(analytics.rollupDailyMetrics).mockResolvedValue(undefined as never);
+  vi.mocked(analytics.markConversionsForOrder).mockResolvedValue(0 as never);
   const listOrders = vi.fn().mockResolvedValue(opts.orders ?? []);
   vi.mocked(factory.getCommerceAdapter).mockResolvedValue(
     (opts.adapter === null ? null : { listOrders: opts.adapter?.listOrders ?? listOrders }) as never,
@@ -164,6 +168,48 @@ describe('runOrderSync', () => {
     });
     await expect(runOrderSync('s1')).rejects.toThrow(/rate limited/);
     expect(repos.connectionRepo.markOrdersSynced).not.toHaveBeenCalled();
+  });
+});
+
+describe('runOrderSync attribution', () => {
+  test('attributes every imported order, so a manual-token store earns conversions', async () => {
+    const { runOrderSync, analytics } = await load({
+      orders: [order('o1', '2026-01-05T10:00:00Z'), order('o2', '2026-01-06T10:00:00Z')],
+    });
+    const res = await runOrderSync('s1');
+    const ids = vi.mocked(analytics.markConversionsForOrder).mock.calls.map((c) => (c[1] as Order).id);
+    expect(ids).toEqual(['o1', 'o2']);
+    expect(res.attributed).toBe(0);
+  });
+
+  test('reports how many rows were converted', async () => {
+    const { runOrderSync, analytics } = await load({ orders: [order('o1', null), order('o2', null)] });
+    vi.mocked(analytics.markConversionsForOrder).mockResolvedValue(2 as never);
+    expect((await runOrderSync('s1')).attributed).toBe(4);
+  });
+
+  test('isolates an attribution failure to its own order instead of aborting the import', async () => {
+    const { runOrderSync, analytics, repos } = await load({
+      orders: [order('o1', '2026-01-05T10:00:00Z'), order('o2', '2026-01-06T10:00:00Z')],
+    });
+    vi.mocked(analytics.markConversionsForOrder)
+      .mockRejectedValueOnce(new Error('join failed'))
+      .mockResolvedValue(3 as never);
+    const res = await runOrderSync('s1');
+    // Both orders still land, and the good one still attributes.
+    expect(repos.orderRepo.upsert).toHaveBeenCalledTimes(2);
+    expect(analytics.markConversionsForOrder).toHaveBeenCalledTimes(2);
+    expect(res.attributed).toBe(3);
+    expect(res.imported).toBe(2);
+  });
+
+  test('still advances the cursor when every attribution fails', async () => {
+    const { runOrderSync, analytics, repos } = await load({ orders: [order('o1', '2026-01-05T10:00:00Z')] });
+    vi.mocked(analytics.markConversionsForOrder).mockRejectedValue(new Error('down'));
+    const res = await runOrderSync('s1');
+    expect(res.attributed).toBe(0);
+    expect(res.cursor).not.toBeNull();
+    expect(repos.connectionRepo.markOrdersSynced).toHaveBeenCalled();
   });
 });
 

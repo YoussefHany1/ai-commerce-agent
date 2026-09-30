@@ -289,6 +289,58 @@ export async function getDailyMetrics(storeId: string, days: number): Promise<Da
   });
 }
 
+/**
+ * Records that the agent recommended a product, before any click.
+ *
+ * This is the first stage of the funnel and the reason `clickedAt` is nullable. A
+ * row created here has no `clickedAt`; `recordClick` finds it by
+ * (conversation, product) and fills the column in, so a recommendation that is
+ * never clicked is still visible as a recommendation — which is the only way CTR
+ * means anything.
+ *
+ * Idempotent per (conversation, product): re-recommending the same product in the
+ * same conversation does not inflate the denominator.
+ */
+export async function recordImpressions(
+  storeId: string,
+  input: { conversationId: string; productIds: string[] },
+): Promise<number> {
+  const ids = [...new Set(input.productIds.filter(Boolean))];
+  if (!ids.length) return 0;
+  return withTenant(storeId, async (tx) => {
+    const [conv] = await tx
+      .select({ id: conversations.id, channel: conversations.channel })
+      .from(conversations)
+      .where(and(eq(conversations.storeId, storeId), eq(conversations.id, input.conversationId)))
+      .limit(1);
+    if (!conv) return 0;
+
+    const existing = await tx
+      .select({ productId: attributions.productId })
+      .from(attributions)
+      .where(
+        and(
+          eq(attributions.storeId, storeId),
+          eq(attributions.conversationId, input.conversationId),
+          inArray(attributions.productId, ids),
+        ),
+      );
+    const seen = new Set(existing.map((r) => r.productId));
+    const fresh = ids.filter((id) => !seen.has(id));
+    if (!fresh.length) return 0;
+
+    await tx.insert(attributions).values(
+      fresh.map((productId) => ({
+        storeId,
+        conversationId: input.conversationId,
+        productId,
+        channel: conv.channel ?? 'web',
+      })),
+    );
+    return fresh.length;
+  });
+}
+
 export async function recordClick(storeId: string, input: { conversationId: string; productId: string }): Promise<boolean> {
   return withTenant(storeId, async (tx) => {
     const [conv] = await tx
@@ -362,6 +414,12 @@ export async function attributionRows(
     const conds = [eq(attributions.storeId, storeId)];
     if (status === 'converted') conds.push(isNotNull(attributions.convertedAt));
     if (status === 'clicked') conds.push(and(isNotNull(attributions.clickedAt), isNull(attributions.convertedAt)) as SQL);
+    // "Recommended" means surfaced to the shopper and not yet clicked. This is a real
+    // state now that rows are created at recommendation time, and it needs both
+    // halves: without `clickedAt is null` it would also match converted rows.
+    if (status === 'recommended') {
+      conds.push(and(isNull(attributions.clickedAt), isNull(attributions.convertedAt)) as SQL);
+    }
     const rows = await tx
       .select({
         channel: attributions.channel,

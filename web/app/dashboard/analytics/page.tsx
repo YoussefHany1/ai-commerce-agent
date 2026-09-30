@@ -31,6 +31,7 @@ const statusBadge: Record<AttributionStatus, { label: string; variant: BadgeVari
 
 const statusFilters = [
   { value: undefined, label: 'All' },
+  { value: 'recommended', label: 'Recommended' },
   { value: 'clicked', label: 'Clicked' },
   { value: 'converted', label: 'Converted' },
 ] as const;
@@ -65,7 +66,7 @@ export default function AnalyticsPage() {
   const lag = useConversionLag(storeId, days);
   const sources = useSources(storeId);
   const products = useTopProducts(storeId, 8);
-  const attributions = useAttributions(storeId);
+  const attributions = useAttributions(storeId, statusFilter);
 
   const locked = !!billing.data && !['trial', 'active'].includes(billing.data.planStatus);
   const loading = !!storeId && (lag.isLoading || sources.isLoading || products.isLoading || attributions.isLoading);
