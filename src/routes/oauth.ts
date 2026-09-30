@@ -7,6 +7,8 @@ import { storeRateLimitWindow, reqIp } from '../lib/rateLimit.js';
 import { fetchWithTimeout } from '../lib/http.js';
 import { storeRepo, connectionRepo, jobsRepo } from '../db/repos.js';
 import { logger } from '../lib/logger.js';
+import { resolveClientSession, getSid } from '../lib/clientSession.js';
+import type { FastifyRequest, FastifyReply } from 'fastify';
 
 const STATE_TTL = 600;
 const oauthWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
@@ -70,7 +72,26 @@ function verifyShopifyHmac(url: string, secret: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-type OAuthState = { platform: string; ref?: string; redirectAfter?: string | null };
+type OAuthState = { platform: string; ref?: string; redirectAfter?: string | null; clientId?: string };
+
+/**
+ * Resolves who is starting the install.
+ *
+ * `'handled'` means a session header was present but did not resolve, and
+ * `resolveClientSession` has already written the 401/503. The caller must return
+ * immediately — falling through to the operator path there would turn a revoked or
+ * expired client session into an operator-scoped install, which is exactly the
+ * escalation the session guard exists to prevent.
+ *
+ * A missing header is the operator flow (the install link is typed or opened
+ * directly), so it yields `null` rather than an error.
+ */
+async function installOwner(req: FastifyRequest, reply: FastifyReply): Promise<string | null | 'handled'> {
+  if (!getSid(req)) return null;
+  const client = await resolveClientSession(req, reply);
+  if (reply.sent) return 'handled';
+  return client?.clientId ?? null;
+}
 
 type SaveInstallInput = {
   platform: 'shopify' | 'salla' | 'zid';
@@ -81,10 +102,32 @@ type SaveInstallInput = {
   expiresAt?: Date;
   scopes?: string[];
   metadata?: Record<string, unknown>;
+  /**
+   * Owning account, from the session that started the install — never from a query
+   * parameter. `null` keeps the operator-scoped install, which is what an
+   * unauthenticated install link is for.
+   */
+  clientId?: string | null;
 };
 
+export class InstallConflictError extends Error {
+  constructor(public shopDomain: string) {
+    super(`shop ${shopDomain} is already connected to a different account`);
+    this.name = 'InstallConflictError';
+  }
+}
+
 export async function saveInstall(input: SaveInstallInput): Promise<string> {
-  const existing = input.shopDomain ? await storeRepo.byRef(input.shopDomain, input.platform) : null;
+  const shopDomain = input.shopDomain?.trim() || null;
+  const existing = shopDomain ? await storeRepo.byRef(shopDomain, input.platform) : null;
+  if (existing && shopDomain && input.clientId && existing.clientId !== input.clientId) {
+    // `byRef` reads under `withOperator`, so it sees every tenant's stores, and
+    // (platform, shopDomain) is not unique. Without this check a client that
+    // installs an already-registered shop would fall into the branch below and
+    // overwrite that store's access token — one tenant taking over another's
+    // store. An operator-owned store (`clientId === null`) is not claimable either.
+    throw new InstallConflictError(shopDomain);
+  }
   let storeId: string;
   if (existing) {
     storeId = existing.id;
@@ -103,6 +146,7 @@ export async function saveInstall(input: SaveInstallInput): Promise<string> {
       refreshToken: input.refreshToken,
       expiresAt: input.expiresAt,
       scopes: input.scopes,
+      clientId: input.clientId ?? undefined,
     });
   }
   if (input.metadata) await storeRepo.updateSettings(storeId, input.metadata);
@@ -218,12 +262,18 @@ export async function oauth(app: FastifyInstance) {
     const redirectAfter = sanitizeRedirect(rawRedirectAfter);
     if (rawRedirectAfter && !redirectAfter) return rep.code(400).send({ error: 'invalid_redirect_after' });
     if (!(await capStateCreation(reqIp(req)))) return rep.code(429).send({ error: 'rate_limit_exceeded' });
+    const owner = await installOwner(req, rep);
+    if (owner === 'handled') return rep;
     const clean = normalizeShop(shop);
     const state = randomBytes(24).toString('base64url');
     const redis = await getRedis();
-    await redis.set(`oauth:state:${state}`, JSON.stringify({ platform: 'shopify', shop: clean, redirectAfter }), {
-      EX: STATE_TTL,
-    });
+    await redis.set(
+      `oauth:state:${state}`,
+      JSON.stringify({ platform: 'shopify', shop: clean, redirectAfter, clientId: owner ?? undefined }),
+      {
+        EX: STATE_TTL,
+      },
+    );
     const url =
       `https://${clean}/admin/oauth/authorize?client_id=${encodeURIComponent(config.SHOPIFY_CLIENT_ID)}` +
       `&scope=${encodeURIComponent(SCOPES.join(','))}` +
@@ -260,13 +310,23 @@ export async function oauth(app: FastifyInstance) {
     });
     if (!tokenRes.ok) return rep.code(502).send({ error: 'token_exchange_failed' });
     const token = (await tokenRes.json()) as { access_token: string; scope?: string };
-    const id = await saveInstall({
-      platform: 'shopify',
-      name: stored.shop,
-      shopDomain: stored.shop,
-      accessToken: token.access_token,
-      scopes: token.scope ? token.scope.split(',') : SCOPES,
-    });
+    let id: string;
+    try {
+      id = await saveInstall({
+        platform: 'shopify',
+        name: stored.shop,
+        shopDomain: stored.shop,
+        accessToken: token.access_token,
+        scopes: token.scope ? token.scope.split(',') : SCOPES,
+        clientId: stored.clientId ?? null,
+      });
+    } catch (err) {
+      if (err instanceof InstallConflictError) {
+        logger.warn({ shop: stored.shop, clientId: stored.clientId }, 'shopify: install rejected — shop already connected elsewhere');
+        return rep.code(409).send({ error: 'shop_already_connected' });
+      }
+      throw err;
+    }
     const after = sanitizeRedirect(stored.redirectAfter ?? undefined);
     if (after) return rep.redirect(after);
     return { ok: true, storeId: id };
@@ -280,11 +340,17 @@ export async function oauth(app: FastifyInstance) {
     const redirectAfter = sanitizeRedirect(rawRedirectAfter);
     if (rawRedirectAfter && !redirectAfter) return rep.code(400).send({ error: 'invalid_redirect_after' });
     if (!(await capStateCreation(reqIp(req)))) return rep.code(429).send({ error: 'rate_limit_exceeded' });
+    const owner = await installOwner(req, rep);
+    if (owner === 'handled') return rep;
     const state = randomBytes(24).toString('base64url');
     const redis = await getRedis();
-    await redis.set(`oauth:state:${state}`, JSON.stringify({ platform: 'salla', redirectAfter } satisfies OAuthState), {
-      EX: STATE_TTL,
-    });
+    await redis.set(
+      `oauth:state:${state}`,
+      JSON.stringify({ platform: 'salla', redirectAfter, clientId: owner ?? undefined } satisfies OAuthState),
+      {
+        EX: STATE_TTL,
+      },
+    );
     const scopes = config.SALLA_SCOPES ?? SALLA_SCOPES_DEFAULT;
     const url =
       `https://accounts.salla.sa/oauth2/auth?client_id=${encodeURIComponent(config.SALLA_CLIENT_ID)}` +
@@ -346,15 +412,24 @@ export async function oauth(app: FastifyInstance) {
       // merchant profile is best-effort; store still installs
     }
 
-    const id = await saveInstall({
-      platform: 'salla',
-      name,
-      shopDomain,
-      accessToken: token.access_token,
-      refreshToken: token.refresh_token,
-      expiresAt: parseExpiry(token),
-      scopes: (config.SALLA_SCOPES ?? SALLA_SCOPES_DEFAULT).split(',').map((s) => s.trim()).filter(Boolean),
-    });
+    let id: string;
+    try {
+      id = await saveInstall({
+        platform: 'salla',
+        name,
+        shopDomain,
+        accessToken: token.access_token,
+        refreshToken: token.refresh_token,
+        expiresAt: parseExpiry(token),
+        scopes: (config.SALLA_SCOPES ?? SALLA_SCOPES_DEFAULT).split(',').map((s) => s.trim()).filter(Boolean),
+        clientId: stored.clientId ?? null,
+      });
+    } catch (err) {
+      if (err instanceof InstallConflictError) {
+        return rep.code(409).send({ error: 'shop_already_connected' });
+      }
+      throw err;
+    }
     const after = sanitizeRedirect(stored.redirectAfter ?? undefined);
     if (after) return rep.redirect(after);
     return { ok: true, storeId: id };
@@ -368,11 +443,17 @@ export async function oauth(app: FastifyInstance) {
     const redirectAfter = sanitizeRedirect(rawRedirectAfter);
     if (rawRedirectAfter && !redirectAfter) return rep.code(400).send({ error: 'invalid_redirect_after' });
     if (!(await capStateCreation(reqIp(req)))) return rep.code(429).send({ error: 'rate_limit_exceeded' });
+    const owner = await installOwner(req, rep);
+    if (owner === 'handled') return rep;
     const state = randomBytes(24).toString('base64url');
     const redis = await getRedis();
-    await redis.set(`oauth:state:${state}`, JSON.stringify({ platform: 'zid', redirectAfter } satisfies OAuthState), {
-      EX: STATE_TTL,
-    });
+    await redis.set(
+      `oauth:state:${state}`,
+      JSON.stringify({ platform: 'zid', redirectAfter, clientId: owner ?? undefined } satisfies OAuthState),
+      {
+        EX: STATE_TTL,
+      },
+    );
     const scopes = config.ZID_SCOPES ?? ZID_SCOPES_DEFAULT;
     const url =
       `https://oauth.zid.sa/oauth/authorize?client_id=${encodeURIComponent(config.ZID_CLIENT_ID)}` +
@@ -437,15 +518,24 @@ export async function oauth(app: FastifyInstance) {
       // profile is best-effort
     }
 
-    const id = await saveInstall({
-      platform: 'zid',
-      name,
-      shopDomain,
-      accessToken: token.access_token,
-      refreshToken: token.refresh_token,
-      expiresAt: parseExpiry(token),
-      scopes: (config.ZID_SCOPES ?? ZID_SCOPES_DEFAULT).split(',').map((s) => s.trim()).filter(Boolean),
-    });
+    let id: string;
+    try {
+      id = await saveInstall({
+        platform: 'zid',
+        name,
+        shopDomain,
+        accessToken: token.access_token,
+        refreshToken: token.refresh_token,
+        expiresAt: parseExpiry(token),
+        scopes: (config.ZID_SCOPES ?? ZID_SCOPES_DEFAULT).split(',').map((s) => s.trim()).filter(Boolean),
+        clientId: stored.clientId ?? null,
+      });
+    } catch (err) {
+      if (err instanceof InstallConflictError) {
+        return rep.code(409).send({ error: 'shop_already_connected' });
+      }
+      throw err;
+    }
     await storeRepo.updateSettingsEncrypted(id, 'zidAuthorization', token.authorization);
     const after = sanitizeRedirect(stored.redirectAfter ?? undefined);
     if (after) return rep.redirect(after);

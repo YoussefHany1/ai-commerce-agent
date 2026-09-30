@@ -175,6 +175,11 @@ export class ZidAdapter implements CommerceAdapter {
     return (body.success === true && body.data !== undefined ? body.data : j) as T;
   }
 
+  /** One product, one page: enough to prove the credentials authenticate, cheap enough to sit in a request path. */
+  async verify(): Promise<void> {
+    await this.api<unknown>('/products/', { page: 1, page_size: 1 });
+  }
+
   async listProducts(): Promise<Product[]> {
     const PAGE_SIZE = 100;
     const MAX_PAGES = 50;

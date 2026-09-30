@@ -8,7 +8,7 @@ import {
   storeToPublic,
   jobsRepo,
 } from '../db/repos.js';
-import { getCommerceAdapter } from '../integrations/factory.js';
+import { getCommerceAdapter, verifyStoreCredentials } from '../integrations/factory.js';
 import { answerWithTools, toChatHistory } from '../services/agent.js';
 import { retrieve, embedMissingCatalog } from '../services/retrieval.js';
 import { dbPing, redisPing, rlsPing } from '../lib/health.js';
@@ -18,6 +18,13 @@ import { requireSession, type CustomerSession } from '../lib/session.js';
 import { config } from '../config.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
+
+/** Actionable text per verification failure, keyed by the factory's `reason`. */
+const CREDENTIAL_FAILURE_MESSAGE = {
+  missing_shop_domain: 'Enter the shop domain, for example shop.myshopify.com.',
+  zid_requires_oauth: 'Zid stores can only be connected through the Zid OAuth flow.',
+  unreachable: 'Could not verify those credentials with the platform. Check the shop domain and that the token is valid.',
+} as const;
 const chatWindow = { limit: config.RATE_LIMIT_CHAT_PER_MIN, windowSec: 60 };
 const storeIdParam = z.object({ storeId: z.string().min(1) });
 
@@ -61,7 +68,7 @@ export async function api(app: FastifyInstance) {
         name: z.string().min(1),
         platform: z.enum(['shopify', 'salla', 'zid']),
         shopDomain: z.string().optional(),
-        accessToken: z.string().optional(),
+        accessToken: z.string().min(1, 'An access token is required to connect a store'),
       })
       .parse(req.body);
 
@@ -69,6 +76,28 @@ export async function api(app: FastifyInstance) {
     if (body.shopDomain) {
       const existing = await storeRepo.findByPlatformAndDomain(body.platform, body.shopDomain);
       if (existing) return rep.code(409).send({ error: 'store_already_exists' });
+    }
+
+    // Prove the credentials work *before* the row exists. A store written with an
+    // unusable or absent token can never build a commerce adapter, so every
+    // `catalog.sync` and `order.sync` job for it dies with `no_connection` and the
+    // dashboard shows an empty funnel with nothing in the console to explain why.
+    // Rejecting here turns that silent dead store into an actionable 422.
+    const check = await verifyStoreCredentials({
+      platform: body.platform,
+      shopDomain: body.shopDomain,
+      accessToken: body.accessToken,
+    });
+    if (!check.ok) {
+      return rep.code(422).send({
+        error: 'invalid_store_credentials',
+        reason: check.code,
+        // The dashboard toasts `message` verbatim, so it has to be something the
+        // merchant can act on. The platform's own text (a raw 401, or a GraphQL
+        // error blob) goes in `detail` for the logs instead of in their face.
+        message: CREDENTIAL_FAILURE_MESSAGE[check.code],
+        detail: check.message,
+      });
     }
 
     const principal = (req as any).principal as Principal;
@@ -82,11 +111,17 @@ export async function api(app: FastifyInstance) {
     // Manually added stores never went through saveInstall, so they miss the
     // install-time kick. Enqueue the order backfill here too, otherwise a store
     // added from the dashboard sits on zero revenue until the next 15-minute
-    // orderSync tick notices its null cursor.
-    try {
-      await jobsRepo.enqueue(id, 'order.sync', {}, { runAt: new Date() });
-    } catch (err) {
-      app.log.warn({ err, storeId: id }, 'order.sync enqueue failed for new store');
+    // orderSync tick notices its null cursor. The catalog is kicked for the same
+    // reason: without it the agent has an empty catalog and cannot recommend
+    // anything, so every analytics card stays empty until the next hourly tick.
+    // Both are best-effort — the store is already connected, and the periodic
+    // tick would eventually pick the work up regardless.
+    for (const type of ['order.sync', 'catalog.sync'] as const) {
+      try {
+        await jobsRepo.enqueue(id, type, {}, { runAt: new Date() });
+      } catch (err) {
+        app.log.warn({ err, storeId: id, type }, `${type} enqueue failed for new store`);
+      }
     }
 
     return { id };

@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => {
     get: vi.fn(),
     list: vi.fn(),
     byRef: vi.fn(),
+    findByPlatformAndDomain: vi.fn(async () => null),
     create: vi.fn(),
     remove: vi.fn(),
     updateSettings: vi.fn(),
@@ -95,7 +96,10 @@ const services = vi.hoisted(() => {
     pdpl: { getCustomerData: vi.fn(), eraseCustomer: vi.fn(), purgeStorePii: vi.fn() },
     automation: { runAllAutomation: vi.fn(async () => ({ total: 0, executed: 0 })) },
     webhookApply: { applyWebhook: vi.fn(async () => {}) },
-    factory: { getCommerceAdapter: vi.fn(async () => null) },
+    factory: {
+      getCommerceAdapter: vi.fn(async () => null),
+      verifyStoreCredentials: vi.fn(async () => ({ ok: true }) as { ok: true } | { ok: false; code: string; message: string }),
+    },
   };
 });
 
@@ -283,6 +287,95 @@ describe('routes: health', () => {
     expect(res.statusCode).toBe(503);
     // The 503 body spreads deps flat, unlike the 200 body which nests it.
     expect(res.json()).toMatchObject({ status: 'error', db: true, redis: true, rls: false });
+  });
+});
+
+describe('routes: POST /api/stores credential handling', () => {
+  let app: App;
+  beforeEach(async () => {
+    infra.store.clear();
+    vi.clearAllMocks();
+    services.factory.verifyStoreCredentials.mockResolvedValue({ ok: true });
+    mocks.storeRepo.findByPlatformAndDomain.mockResolvedValue(null);
+    mocks.storeRepo.create.mockResolvedValue('new-store');
+    app = await buildApp();
+  });
+
+  const post = (payload: Record<string, unknown>) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/stores',
+      headers: { 'x-api-key': ADMIN_KEY, 'content-type': 'application/json' },
+      payload: JSON.stringify(payload),
+    });
+
+  it('rejects a store with no access token, because it could never sync', async () => {
+    const res = await post({ name: 'Shop', platform: 'shopify', shopDomain: 'demo.myshopify.com' });
+    expect(res.statusCode).toBe(400);
+    expect(services.factory.verifyStoreCredentials).not.toHaveBeenCalled();
+    expect(mocks.storeRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects an empty access token', async () => {
+    const res = await post({ name: 'Shop', platform: 'shopify', shopDomain: 'demo.myshopify.com', accessToken: '' });
+    expect(res.statusCode).toBe(400);
+    expect(mocks.storeRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses to persist credentials the platform rejects', async () => {
+    services.factory.verifyStoreCredentials.mockResolvedValue({
+      ok: false,
+      code: 'unreachable',
+      message: 'Shopify 401',
+    });
+    const res = await post({
+      name: 'Shop',
+      platform: 'shopify',
+      shopDomain: 'demo.myshopify.com',
+      accessToken: 'shpat_bad',
+    });
+    expect(res.statusCode).toBe(422);
+    const body = res.json();
+    expect(body).toMatchObject({ error: 'invalid_store_credentials', reason: 'unreachable' });
+    // The raw platform text is kept for logs but must not be what the user is shown.
+    expect(body.detail).toBe('Shopify 401');
+    expect(body.message).not.toBe('Shopify 401');
+    expect(mocks.storeRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('reports a missing shop domain as its own actionable reason', async () => {
+    services.factory.verifyStoreCredentials.mockResolvedValue({
+      ok: false,
+      code: 'missing_shop_domain',
+      message: 'Shopify needs a shop domain',
+    });
+    const res = await post({ name: 'Shop', platform: 'shopify', accessToken: 'shpat_ok' });
+    expect(res.statusCode).toBe(422);
+    expect(res.json()).toMatchObject({ reason: 'missing_shop_domain' });
+  });
+
+  it('creates the store once the credentials verify', async () => {
+    const res = await post({
+      name: 'Shop',
+      platform: 'shopify',
+      shopDomain: 'demo.myshopify.com',
+      accessToken: 'shpat_ok',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ id: 'new-store' });
+    expect(services.factory.verifyStoreCredentials).toHaveBeenCalledWith({
+      platform: 'shopify',
+      shopDomain: 'demo.myshopify.com',
+      accessToken: 'shpat_ok',
+    });
+    expect(mocks.storeRepo.create).toHaveBeenCalledOnce();
+  });
+
+  it('kicks both catalog and order sync so analytics populate without waiting for a tick', async () => {
+    await post({ name: 'Shop', platform: 'shopify', shopDomain: 'demo.myshopify.com', accessToken: 'shpat_ok' });
+    const types = mocks.jobsRepo.enqueue.mock.calls.map((c) => c[1]);
+    expect(types).toContain('order.sync');
+    expect(types).toContain('catalog.sync');
   });
 });
 

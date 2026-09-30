@@ -594,7 +594,6 @@ async function main() {
 
     console.log('\nnot proxied');
     for (const path of [
-      '/api/oauth/shopify/start',
       '/api/pdpl/export',
       // Kept as a regression guard: the shared-password endpoint is gone, and nothing
       // should reintroduce a route that authenticates an operator by a bare password.
@@ -603,6 +602,16 @@ async function main() {
     ]) {
       check(`${path} -> 404`, (await call(`${base}${path}`, { headers: { cookie: good } })).status, 404);
     }
+    // `/api/oauth/shopify/start` was listed above as a path that must never be proxied.
+    // It is now a BFF route in its own right, so the dashboard can start an install
+    // through the same origin that holds the session cookie. The guard that still
+    // matters is the one underneath: unauthenticated, the BFF refuses it outright, so an
+    // install can never be started by an anonymous caller riding the proxy.
+    check(
+      '/api/oauth/shopify/start without a session -> 401',
+      (await call(`${base}/api/oauth/shopify/start`)).status,
+      401,
+    );
     check(
       'state change over GET -> 404',
       (await call(`${base}/api/automation/run`, { headers: { cookie: good } })).status,

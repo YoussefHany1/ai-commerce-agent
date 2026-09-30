@@ -102,6 +102,17 @@ export class ShopifyAdapter implements CommerceAdapter {
     }
   }
 
+  /**
+   * `{ shop { name } }` rather than a products query: it is a single round trip,
+   * it needs no scope beyond the app being installed, and it distinguishes the two
+   * failure modes that matter here — a bad token comes back as a GraphQL error
+   * from Shopify, while a wrong `shop` domain comes back as a transport/401,
+   * which is exactly the pair a merchant pasting credentials by hand gets wrong.
+   */
+  async verify(): Promise<void> {
+    await this.gql(`query{shop{name}}`);
+  }
+
   async listProducts(): Promise<Product[]> {
     const PAGE_SIZE = 100;
     const MAX_PAGES = 50;

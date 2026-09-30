@@ -131,6 +131,11 @@ export class SallaAdapter implements CommerceAdapter {
     return j.data;
   }
 
+  /** One product, one page: enough to prove the token authenticates, cheap enough to sit in a request path. */
+  async verify(): Promise<void> {
+    await this.api<unknown>('/products', { page: 1, per_page: 1 });
+  }
+
   async listProducts(): Promise<Product[]> {
     const PER_PAGE = 100;
     const MAX_PAGES = 50;

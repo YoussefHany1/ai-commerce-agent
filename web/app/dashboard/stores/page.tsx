@@ -16,7 +16,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { useSelectedStore, useCreateStore, STORES_KEY } from '@/hooks/useStores';
 import { useSession, isClient } from '@/hooks/useSession';
-import { API_BASE_URL, api, isSessionExpired } from '@/lib/api';
+import { api, isSessionExpired } from '@/lib/api';
 import type { Store } from '@/lib/types';
 
 const PLATFORM_OPTIONS = [
@@ -72,8 +72,12 @@ export default function StoresPage() {
     const next: Partial<FormState> = {};
     if (!form.name.trim()) next.name = 'Store name is required';
     if (!form.shopDomain.trim()) next.shopDomain = 'Shop domain is required';
-    if (form.platform !== 'shopify' && !form.accessToken.trim()) {
-      next.accessToken = 'Access token is required for this platform';
+    // Required for every platform, Shopify included. A store created without a token
+    // cannot build a commerce adapter, so every catalog/order sync for it dies with
+    // `no_connection` and the dashboard shows an empty funnel with no error anywhere.
+    // Operators who would rather not paste a token should use the OAuth button below.
+    if (!form.accessToken.trim()) {
+      next.accessToken = 'An access token is required — without it the store can never sync';
     }
     setErrors(next);
     return Object.keys(next).length === 0;
@@ -100,13 +104,16 @@ export default function StoresPage() {
    * dashboard once the callback completes — without it the API answers with raw
    * JSON, which is a dead end for the person installing. The API only honours it
    * for origins listed in OAUTH_REDIRECT_ALLOWLIST.
+   *
+   * Same-origin on purpose: `/api/oauth/shopify/start` is proxied by this app so the
+   * session cookie is attached and the API can scope the new store to the signed-in
+   * account. Navigating straight at the API would drop the cookie and install the
+   * store as operator-owned, which the client cannot then see.
    */
   const startShopifyOAuth = (shopDomain: string) => {
-    const url = new URL(`${API_BASE_URL}/api/oauth/shopify/start`);
+    const url = new URL('/api/oauth/shopify/start', window.location.origin);
     url.searchParams.set('shop', shopDomain);
-    if (typeof window !== 'undefined') {
-      url.searchParams.set('redirectAfter', `${window.location.origin}/dashboard/stores`);
-    }
+    url.searchParams.set('redirectAfter', `${window.location.origin}/dashboard/stores`);
     window.location.href = url.toString();
   };
 
@@ -207,6 +214,30 @@ export default function StoresPage() {
             onChange={(e) => setForm((f) => ({ ...f, platform: e.target.value }))}
           />
 
+          {form.platform === 'shopify' && (
+            <div className="flex flex-col gap-2 rounded-xl border border-violet-200/70 bg-violet-50/40 p-4 dark:border-violet-400/20 dark:bg-violet-500/[0.06]">
+              <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                Recommended: connect with Shopify
+              </p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Grants the app the scopes it needs and registers webhooks, so orders and
+                catalog updates arrive live. Paste a token below only if you cannot
+                install the app.
+              </p>
+              {form.shopDomain.trim() ? (
+                <Button
+                  variant="secondary"
+                  className="w-full"
+                  onClick={() => startShopifyOAuth(form.shopDomain.trim())}
+                >
+                  Connect with Shopify OAuth
+                </Button>
+              ) : (
+                <p className="text-xs text-slate-400">Enter your shop domain to enable OAuth.</p>
+              )}
+            </div>
+          )}
+
           <Input
             label="Shop domain"
             placeholder="shop.myshopify.com"
@@ -222,32 +253,13 @@ export default function StoresPage() {
             type="password"
             hint={
               clientSession
-                ? 'Required for Salla/Zid. For Shopify, paste a token from the admin so the agent can read products.'
-                : 'Required for Salla/Zid. Optional for Shopify — use OAuth below.'
+                ? 'Required. Create one in your platform admin and paste it here — it is checked against the platform before the store is saved.'
+                : 'Required when not using OAuth. It is checked against the platform before the store is saved.'
             }
             value={form.accessToken}
             onChange={(e) => setForm((f) => ({ ...f, accessToken: e.target.value }))}
             error={errors.accessToken}
           />
-
-          {!clientSession && form.platform === 'shopify' && (
-            <div className="flex flex-col gap-2 rounded-xl border border-slate-200/70 bg-slate-50/60 p-4 dark:border-white/5 dark:bg-white/[0.02]">
-              <p className="text-xs font-medium text-slate-500 dark:text-slate-400">
-                Prefer one-click setup?
-              </p>
-              {form.shopDomain.trim() ? (
-                <Button
-                  variant="secondary"
-                  className="w-full"
-                  onClick={() => startShopifyOAuth(form.shopDomain.trim())}
-                >
-                  Connect with Shopify OAuth
-                </Button>
-              ) : (
-                <p className="text-xs text-slate-400">Enter your shop domain to enable OAuth.</p>
-              )}
-            </div>
-          )}
         </div>
       </Modal>
 
