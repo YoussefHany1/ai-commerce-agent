@@ -42,6 +42,20 @@ describe('GET /api/oauth/[platform]/callback', () => {
     expect(res.headers.get('location')).toBe('http://localhost:3001/dashboard/stores');
   });
 
+  test('asks fetch not to follow the redirect, so the session cookie survives', async () => {
+    // Without this the mocked 302 above is unrepresentative: a real fetch follows it
+    // server-side, the browser receives neither the Location nor the Set-Cookie that
+    // mints the session, and the install silently ends up logged out.
+    fetchMock.mockResolvedValue(
+      new Response(null, { status: 302, headers: { location: 'http://localhost:3001/dashboard' } }),
+    );
+    await GET(
+      new Request('http://localhost:3001/api/oauth/shopify/callback?code=abc'),
+      params('shopify'),
+    );
+    expect(fetchMock.mock.calls[0]![1]).toMatchObject({ redirect: 'manual' });
+  });
+
   test('relays the code, state and hmac verbatim', async () => {
     fetchMock.mockResolvedValue(Response.json({ ok: true, storeId: 's' }));
     await GET(

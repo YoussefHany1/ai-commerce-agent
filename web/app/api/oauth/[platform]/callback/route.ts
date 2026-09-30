@@ -38,7 +38,11 @@ export async function GET(
 
   let res: Response;
   try {
-    res = await fetch(upstream, { cache: 'no-store' });
+    // `redirect: 'manual'` is load-bearing. The API callback answers a successful
+    // install with a 302 whose Set-Cookie mints the session; if the fetch follows it
+    // server-side, the browser never sees either the Location or that cookie, and the
+    // merchant lands on the callback URL with no session at all.
+    res = await fetch(upstream, { cache: 'no-store', redirect: 'manual' });
   } catch {
     return NextResponse.json({ error: 'oauth_callback_unreachable' }, { status: 502 });
   }
