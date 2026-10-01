@@ -126,17 +126,33 @@ export interface CheckoutResponse {
   sessionId: string;
 }
 
-export interface AutomationAction {
-  type: 'whatsapp_text';
-  text: string;
+export type AutomationAction =
+  | { type: 'whatsapp_text'; text: string }
+  | { type: 'whatsapp_number'; phone: string; text: string }
+  | { type: 'template'; templateId: string; text: string };
+
+export type AutomationTriggerType =
+  | 'clicked_no_conversion'
+  | 'inactive_conversation'
+  | 'keyword'
+  | 'new_conversation'
+  | 'order_placed';
+
+export interface AutomationTriggerConfig {
+  keywords?: string[];
 }
 
-export type AutomationTriggerType = 'clicked_no_conversion' | 'inactive_conversation';
+export interface MessageTemplate {
+  id: string;
+  name: string;
+  text: string;
+}
 
 export interface AutomationRule {
   id: string;
   storeId: string;
   triggerType: AutomationTriggerType;
+  triggerConfig?: AutomationTriggerConfig | null;
   action: AutomationAction;
   enabled: boolean;
   cooldownMinutes: number;
@@ -148,6 +164,11 @@ export interface AutomationRule {
 export interface AutomationRulesResponse {
   storeId: string;
   rules: AutomationRule[];
+}
+
+export interface AutomationTemplatesResponse {
+  storeId: string;
+  templates: MessageTemplate[];
 }
 
 export interface Job {

@@ -17,7 +17,31 @@ const TRIGGER_LABEL: Record<AutomationRule['triggerType'], { title: string; desc
     title: 'Inactive conversation',
     description: 'Conversation went idle after the last assistant message.',
   },
+  keyword: {
+    title: 'Customer sends a keyword',
+    description: 'An inbound message contains one of the watched words.',
+  },
+  new_conversation: {
+    title: 'New conversation',
+    description: 'A customer starts a fresh chat.',
+  },
+  order_placed: {
+    title: 'Order placed',
+    description: 'A new order lands for a customer with a WhatsApp number.',
+  },
 };
+
+/**
+ * What the rule sends and to whom, in the two lines the card shows.
+ *
+ * `target` is the recipient for the fixed-number action; every other variant replies to
+ * whoever tripped the trigger, which is the default and needs no second line.
+ */
+function actionSummary(action: AutomationRule['action']): { label: string; target?: string } {
+  if (action.type === 'whatsapp_number') return { label: 'WhatsApp message to a fixed number', target: action.phone };
+  if (action.type === 'template') return { label: 'Saved template message' };
+  return { label: 'WhatsApp message' };
+}
 
 interface RuleCardProps {
   rule: AutomationRule;
@@ -32,6 +56,7 @@ export function RuleCard({ rule, onToggle, onDelete, disabled, toggling }: RuleC
     title: rule.triggerType,
     description: 'Custom automation rule',
   };
+  const action = actionSummary(rule.action);
 
   return (
     <motion.div
@@ -75,6 +100,11 @@ export function RuleCard({ rule, onToggle, onDelete, disabled, toggling }: RuleC
               </Badge>
             </div>
             <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">{meta.description}</p>
+            {rule.triggerType === 'keyword' && (rule.triggerConfig?.keywords ?? []).length > 0 && (
+              <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
+                Keywords: <span className="font-mono">{(rule.triggerConfig?.keywords ?? []).join(', ')}</span>
+              </p>
+            )}
           </div>
         </div>
 
@@ -95,7 +125,13 @@ export function RuleCard({ rule, onToggle, onDelete, disabled, toggling }: RuleC
       <div className="mt-4 rounded-xl border border-slate-200/70 bg-slate-50/60 p-3.5 dark:border-white/5 dark:bg-white/[0.02]">
         <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-violet-600 dark:text-violet-300">
           <MessageSquareQuote className="h-3.5 w-3.5" />
-          WhatsApp message
+          {action.label}
+          {action.target && (
+            <span className="font-mono normal-case tracking-normal text-slate-500 dark:text-slate-400">
+              {' '}
+              → {action.target}
+            </span>
+          )}
         </div>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
           {rule.action.text}

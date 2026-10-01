@@ -2,6 +2,9 @@ import type {
   AttributionsResponse,
   AutomationRule,
   AutomationRulesResponse,
+  AutomationTemplatesResponse,
+  AutomationTriggerConfig,
+  MessageTemplate,
   BillingStatus,
   ChatResponse,
   ChatResult,
@@ -228,6 +231,7 @@ export const api = {
   createAutomationRule: (input: {
     storeId: string;
     triggerType: AutomationRule['triggerType'];
+    triggerConfig?: AutomationTriggerConfig;
     action: AutomationRule['action'];
     enabled?: boolean;
     cooldownMinutes?: number;
@@ -242,6 +246,7 @@ export const api = {
     ruleId: string,
     patch: Partial<{
       triggerType: AutomationRule['triggerType'];
+      triggerConfig: AutomationTriggerConfig;
       action: AutomationRule['action'];
       enabled: boolean;
       cooldownMinutes: number;
@@ -251,6 +256,16 @@ export const api = {
     request<{ ok: true }>(`/api/automation/rules/${ruleId}`, {
       method: 'PUT',
       body: patch,
+    }),
+
+  automationTemplates: (storeId: string) =>
+    request<AutomationTemplatesResponse>(`/api/automation/templates/${storeId}`),
+
+  /** Replaces the whole saved-template list for the store. */
+  saveAutomationTemplates: (storeId: string, templates: MessageTemplate[]) =>
+    request<{ ok: true }>(`/api/automation/templates/${storeId}`, {
+      method: 'PUT',
+      body: { templates },
     }),
 
   deleteAutomationRule: (ruleId: string, storeId: string) =>

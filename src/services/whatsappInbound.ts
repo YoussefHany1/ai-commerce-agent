@@ -51,7 +51,7 @@ export async function handleInboundText(storeId: string, phone: string, text: st
  * cycle. Resolving it at call time costs nothing measurable and keeps the dependency
  * one-directional at module scope.
  */
-async function sendOverBaileys(storeId: string, phone: string, body: string): Promise<boolean> {
+export async function sendOverBaileys(storeId: string, phone: string, body: string): Promise<boolean> {
   try {
     const session = await import('./whatsappSession.js');
     if (!session.isLive(storeId)) return false;

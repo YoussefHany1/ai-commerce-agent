@@ -322,7 +322,34 @@ export const events = pgTable(
   ],
 );
 
-export type AutomationAction = { type: 'whatsapp_text'; text: string };
+/**
+ * What a rule does when its trigger matches.
+ *
+ * `whatsapp_text` replies to the conversation that tripped the trigger.
+ * `whatsapp_number` ignores that conversation and messages a fixed number instead — the
+ * "notify me when…" case, where the recipient is the merchant rather than the shopper.
+ * `template` is a saved body: the text is snapshotted into the rule at save time so a
+ * rule keeps working even if the template is later renamed or deleted.
+ */
+export type AutomationAction =
+  | { type: 'whatsapp_text'; text: string }
+  | { type: 'whatsapp_number'; phone: string; text: string }
+  | { type: 'template'; templateId: string; text: string };
+
+/**
+ * Per-trigger settings. Only the keyword trigger uses it today (`keywords`), but the
+ * column is generic so a future trigger can add fields without another migration.
+ */
+export type AutomationTriggerConfig = { keywords?: string[] };
+
+/**
+ * A reusable message body, stored on `stores.settings.messageTemplates`.
+ *
+ * Kept in store settings rather than its own table: it is a short, store-scoped list
+ * with no relations and no cross-store queries, and settings is already the home for
+ * exactly this kind of loose configuration.
+ */
+export type MessageTemplate = { id: string; name: string; text: string };
 
 export const automationRules = pgTable(
   'automation_rules',
@@ -330,6 +357,7 @@ export const automationRules = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     storeId: uuid('store_id').notNull(),
     triggerType: text('trigger_type').notNull(),
+    triggerConfig: jsonb('trigger_config').notNull().default({}).$type<AutomationTriggerConfig>(),
     action: jsonb('action').notNull().$type<AutomationAction>(),
     enabled: boolean('enabled').notNull().default(true),
     cooldownMinutes: integer('cooldown_minutes').notNull().default(1440),

@@ -34,7 +34,9 @@ whatsappChannels,
   type WhatsappBaileysSessionStatus,
   type BillingSubscription,
   type AutomationAction,
+  type AutomationTriggerConfig,
   type AutomationRule,
+  type MessageTemplate,
   type Client,
   type Operator,
 } from './schema.js';
@@ -468,6 +470,30 @@ export const storeRepo = {
       const [row] = await tx.select({ settings: stores.settings }).from(stores).where(eq(stores.id, storeId)).limit(1);
       return row?.settings ?? null;
     });
+  },
+
+  /** Saved message bodies for the automation builder. Tolerates a malformed settings blob. */
+  async getMessageTemplates(storeId: string): Promise<MessageTemplate[]> {
+    const settings = await this.getSettings(storeId);
+    const raw = settings?.messageTemplates;
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter(
+        (t): t is MessageTemplate =>
+          !!t &&
+          typeof t === 'object' &&
+          typeof (t as MessageTemplate).id === 'string' &&
+          typeof (t as MessageTemplate).name === 'string' &&
+          typeof (t as MessageTemplate).text === 'string',
+      )
+      .map((t) => ({ id: t.id, name: t.name, text: t.text }));
+  },
+
+  async setMessageTemplates(storeId: string, templates: MessageTemplate[]): Promise<void> {
+    const clean = (Array.isArray(templates) ? templates : [])
+      .filter((t) => t && typeof t.id === 'string' && typeof t.name === 'string' && typeof t.text === 'string' && t.text.trim())
+      .map((t) => ({ id: t.id, name: t.name.slice(0, 80), text: t.text.slice(0, 4000) }));
+    await this.updateSettings(storeId, { messageTemplates: clean });
   },
 };
 
@@ -1141,13 +1167,14 @@ export const eventRepo = {
 };
 
 export const automationRepo = {
-  async create(storeId: string, input: { triggerType: string; action: AutomationAction; enabled?: boolean; cooldownMinutes?: number; lookbackHours?: number }): Promise<string> {
+  async create(storeId: string, input: { triggerType: string; triggerConfig?: AutomationTriggerConfig; action: AutomationAction; enabled?: boolean; cooldownMinutes?: number; lookbackHours?: number }): Promise<string> {
     return withTenant(storeId, async (tx) => {
       const [row] = await tx
         .insert(automationRules)
         .values({
           storeId,
           triggerType: input.triggerType,
+          triggerConfig: input.triggerConfig ?? {},
           action: input.action,
           enabled: input.enabled ?? true,
           cooldownMinutes: input.cooldownMinutes ?? 1440,
@@ -1164,7 +1191,7 @@ export const automationRepo = {
     );
   },
 
-  async update(storeId: string, ruleId: string, patch: { triggerType?: string; action?: AutomationAction; enabled?: boolean; cooldownMinutes?: number; lookbackHours?: number }): Promise<boolean> {
+  async update(storeId: string, ruleId: string, patch: { triggerType?: string; triggerConfig?: AutomationTriggerConfig; action?: AutomationAction; enabled?: boolean; cooldownMinutes?: number; lookbackHours?: number }): Promise<boolean> {
     return withTenant(storeId, async (tx) => {
       const [row] = await tx
         .update(automationRules)

@@ -53,6 +53,8 @@ const ALLOWLIST: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   { method: 'POST', pattern: /^\/automation\/rules$/ },
   { method: 'PUT', pattern: /^\/automation\/rules\/[^/]+$/ },
   { method: 'DELETE', pattern: /^\/automation\/rules\/[^/]+$/ },
+  { method: 'GET', pattern: /^\/automation\/templates\/[^/]+$/ },
+  { method: 'PUT', pattern: /^\/automation\/templates\/[^/]+$/ },
   { method: 'POST', pattern: /^\/automation\/run$/ },
   { method: 'GET', pattern: /^\/jobs\/[^/]+$/ },
   { method: 'POST', pattern: /^\/jobs\/[^/]+\/retry$/ },

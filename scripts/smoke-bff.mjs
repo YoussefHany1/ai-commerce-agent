@@ -535,6 +535,23 @@ async function main() {
       check('DELETE on a rule path', body.url, '/api/automation/rules/rule1');
     }
     {
+      // Saved message templates. PUT is the interesting one: the dashboard replaces the
+      // whole list, and a PUT dropped from the bodied-method set would reach the API
+      // with no body and fail validation — the same class of bug as the DELETE above.
+      const read = await call(`${base}/api/automation/templates/s1`, { headers: { cookie: good } });
+      check('allowlisted GET on a template path', (await read.json()).url, '/api/automation/templates/s1');
+      const put = await call(`${base}/api/automation/templates/s1`, {
+        method: 'PUT',
+        headers: { cookie: good, 'content-type': 'application/json' },
+        body: JSON.stringify({ templates: [{ id: 't1', name: 'Price', text: 'our price' }] }),
+      });
+      const putBody = await put.json();
+      check('allowlisted PUT on a template path', putBody.method, 'PUT');
+      check('PUT template body forwarded intact', putBody.bodyBytes, JSON.stringify({
+        templates: [{ id: 't1', name: 'Price', text: 'our price' }],
+      }).length);
+    }
+    {
       // A DELETE with no body must still work, so this cannot regress the other way.
       const res = await call(`${base}/api/stores/abc123`, { method: 'DELETE', headers: { cookie: good } });
       const body = await res.json();

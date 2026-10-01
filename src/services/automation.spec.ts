@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isInCooldown, renderTemplate } from './automation.js';
+import { isInCooldown, keywordsFor, matchesKeyword, renderTemplate } from './automation.js';
 import type { AutomationRule } from '../db/schema.js';
 
 function rule(overrides: Partial<AutomationRule> = {}): AutomationRule {
@@ -7,6 +7,7 @@ function rule(overrides: Partial<AutomationRule> = {}): AutomationRule {
     id: 'rule1',
     storeId: 'store1',
     triggerType: 'clicked_no_conversion',
+    triggerConfig: {},
     action: { type: 'whatsapp_text', text: 'hello' },
     enabled: true,
     cooldownMinutes: 1440,
@@ -51,5 +52,40 @@ describe('isInCooldown', () => {
     const now = new Date('2026-01-03T00:00:00Z');
     const r = rule({ lastFiredAt: new Date('2026-01-01T00:00:00Z'), cooldownMinutes: 1440 });
     expect(isInCooldown(r, now)).toBe(false);
+  });
+});
+
+describe('matchesKeyword', () => {
+  it('matches case-insensitively on a substring', () => {
+    expect(matchesKeyword("What's the PRICE of this?", ['price'])).toBe(true);
+  });
+
+  it('matches any keyword in the list', () => {
+    expect(matchesKeyword('do you ship to cairo?', ['price', 'ship'])).toBe(true);
+  });
+
+  it('does not match when no keyword is present', () => {
+    expect(matchesKeyword('hello there', ['price', 'ship'])).toBe(false);
+  });
+
+  it('ignores blank keywords instead of matching everything', () => {
+    expect(matchesKeyword('hello there', ['   '])).toBe(false);
+  });
+
+  it('returns false for an empty keyword list', () => {
+    expect(matchesKeyword('anything', [])).toBe(false);
+  });
+});
+
+describe('keywordsFor', () => {
+  it('drops blank and non-string entries', () => {
+    const r = rule({ triggerConfig: { keywords: ['price', '  ', 42 as unknown as string] } });
+    expect(keywordsFor(r)).toEqual(['price']);
+  });
+
+  it('returns an empty list when triggerConfig is missing', () => {
+    const r = rule();
+    delete (r as { triggerConfig?: unknown }).triggerConfig;
+    expect(keywordsFor(r)).toEqual([]);
   });
 });

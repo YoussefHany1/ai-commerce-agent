@@ -44,6 +44,8 @@ const mocks = vi.hoisted(() => {
     getApiKeyHint: vi.fn(async () => null),
     getByEmbedKey: vi.fn(async () => null),
     setEmbedKey: vi.fn(async () => {}),
+    getMessageTemplates: vi.fn(async (): Promise<{ id: string; name: string; text: string }[]> => []),
+    setMessageTemplates: vi.fn(async () => {}),
   };
   const connectionRepo = { setTokens: vi.fn(), getTokens: vi.fn(), get: vi.fn() };
   const catalogRepo = { list: vi.fn() };
@@ -1072,5 +1074,123 @@ describe('routes: embed key management', () => {
     const res = await create({});
     expect(res.statusCode).toBe(401);
     expect(mocks.storeRepo.setEmbedKey).not.toHaveBeenCalled();
+  });
+});
+
+describe('routes: automation rules', () => {
+  let app: App;
+
+  beforeEach(async () => {
+    infra.store.clear();
+    vi.clearAllMocks();
+    app = await buildApp();
+    mocks.storeRepo.get.mockImplementation(async () => store('s1'));
+    mocks.automationRepo.create.mockResolvedValue('rule-1');
+  });
+
+  const headers = { 'x-api-key': ADMIN_KEY, 'content-type': 'application/json' };
+
+  const createRule = (payload: unknown) =>
+    app.inject({ method: 'POST', url: '/api/automation/rules', headers, payload: JSON.stringify(payload) });
+
+  it('creates a keyword rule with its keywords', async () => {
+    const res = await createRule({
+      storeId: 's1',
+      triggerType: 'keyword',
+      triggerConfig: { keywords: ['price', 'order'] },
+      action: { type: 'whatsapp_text', text: 'here you go' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(mocks.automationRepo.create).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ triggerType: 'keyword', triggerConfig: { keywords: ['price', 'order'] } }),
+    );
+  });
+
+  it('rejects a keyword rule with no keywords', async () => {
+    // Otherwise the rule is silently dead and reads as a bug rather than misconfiguration.
+    const res = await createRule({
+      storeId: 's1',
+      triggerType: 'keyword',
+      action: { type: 'whatsapp_text', text: 'hi' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(mocks.automationRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('strips formatting from a fixed-recipient number', async () => {
+    const res = await createRule({
+      storeId: 's1',
+      triggerType: 'order_placed',
+      action: { type: 'whatsapp_number', phone: '+966 50 123 4567', text: 'new order' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(mocks.automationRepo.create).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({
+        action: expect.objectContaining({ phone: '966501234567' }),
+      }),
+    );
+  });
+
+  it('rejects a fixed-recipient action without a usable number', async () => {
+    const res = await createRule({
+      storeId: 's1',
+      triggerType: 'order_placed',
+      action: { type: 'whatsapp_number', phone: 'nope', text: 'hi' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(mocks.automationRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('accepts the remaining new triggers', async () => {
+    for (const triggerType of ['new_conversation', 'inactive_conversation', 'clicked_no_conversion']) {
+      mocks.automationRepo.create.mockClear();
+      const res = await createRule({
+        storeId: 's1',
+        triggerType,
+        action: { type: 'whatsapp_text', text: 'hi' },
+      });
+      expect(res.statusCode).toBe(200);
+    }
+  });
+
+  it('round-trips saved templates', async () => {
+    mocks.storeRepo.getMessageTemplates.mockResolvedValueOnce([{ id: 't1', name: 'Price', text: 'our price' }]);
+    const read = await app.inject({ method: 'GET', url: '/api/automation/templates/s1', headers });
+    expect(read.json().templates).toEqual([{ id: 't1', name: 'Price', text: 'our price' }]);
+
+    const write = await app.inject({
+      method: 'PUT',
+      url: '/api/automation/templates/s1',
+      headers,
+      payload: JSON.stringify({ templates: [{ id: 't2', name: 'Ship', text: 'we ship' }] }),
+    });
+    expect(write.statusCode).toBe(200);
+    expect(mocks.storeRepo.setMessageTemplates).toHaveBeenCalledWith('s1', [
+      { id: 't2', name: 'Ship', text: 'we ship' },
+    ]);
+  });
+
+  it('rejects a template with no text', async () => {
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/api/automation/templates/s1',
+      headers,
+      payload: JSON.stringify({ templates: [{ id: 't2', name: 'Ship', text: '' }] }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(mocks.storeRepo.setMessageTemplates).not.toHaveBeenCalled();
+  });
+
+  it('keeps rule creation behind a credential', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/automation/rules',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({ storeId: 's1', triggerType: 'order_placed', action: { type: 'whatsapp_text', text: 'x' } }),
+    });
+    expect(res.statusCode).toBe(401);
+    expect(mocks.automationRepo.create).not.toHaveBeenCalled();
   });
 });

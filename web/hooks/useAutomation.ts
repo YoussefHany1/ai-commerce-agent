@@ -3,7 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { api } from '@/lib/api';
-import type { AutomationRule } from '@/lib/types';
+import type { AutomationRule, MessageTemplate } from '@/lib/types';
 
 export const automationKey = (storeId: string | null) => ['automation-rules', storeId] as const;
 
@@ -65,6 +65,32 @@ export function useAutomationRules(storeId: string | null) {
       },
       onError: (err: unknown) =>
         toast.error(err instanceof Error ? err.message : 'Failed to delete rule'),
+    }),
+  };
+}
+
+export const automationTemplatesKey = (storeId: string | null) => ['automation-templates', storeId] as const;
+
+export function useAutomationTemplates(storeId: string | null) {
+  const queryClient = useQueryClient();
+
+  return {
+    query: useQuery({
+      queryKey: automationTemplatesKey(storeId),
+      queryFn: () => api.automationTemplates(storeId!),
+      enabled: !!storeId,
+      staleTime: 60_000,
+    }),
+
+    save: useMutation({
+      mutationFn: ({ storeId: id, templates }: { storeId: string; templates: MessageTemplate[] }) =>
+        api.saveAutomationTemplates(id, templates),
+      onSuccess: (_data, vars) => {
+        queryClient.invalidateQueries({ queryKey: automationTemplatesKey(vars.storeId) });
+        toast.success('Templates saved');
+      },
+      onError: (err: unknown) =>
+        toast.error(err instanceof Error ? err.message : 'Failed to save templates'),
     }),
   };
 }

@@ -113,6 +113,13 @@
       "when": 1791100000000,
       "tag": "0015_whatsapp_baileys_sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1791200000000,
+      "tag": "0016_automation_options",
+      "breakpoints": true
     }
   ]
 }
