@@ -9,6 +9,7 @@ import { useSelectedStore, STORES_KEY } from '@/hooks/useStores';
 import { useHealth } from '@/hooks/useMetrics';
 import { api, API_BASE_URL } from '@/lib/api';
 import { PageHeader } from '@/components/dashboard/PageHeader';
+import { WhatsAppQrCard } from '@/components/dashboard/WhatsAppQrCard';
 import { Card } from '@/components/ui/Card';
 import { Input } from '@/components/ui/Input';
 import { Button } from '@/components/ui/Button';
@@ -143,6 +144,13 @@ export default function SettingsPage() {
             </p>
           </div>
         </Card>
+
+        {/* WhatsApp Web pairing — a separate transport from the Meta channel above */}
+        {storeId && (
+          <div className="lg:col-span-2">
+            <WhatsAppQrCard storeId={storeId} />
+          </div>
+        )}
 
         {/* Storefront widget */}
         <Card

@@ -13,7 +13,8 @@ import {
   messages,
   events,
   jobs,
-  whatsappChannels,
+whatsappChannels,
+  whatsappBaileysSessions,
   billingSubscriptions,
   automationRules,
   automationLogs,
@@ -29,6 +30,8 @@ import {
   type PlatformConnection,
   type WhatsappChannel,
   type NewWhatsappChannel,
+  type WhatsappBaileysSession,
+  type WhatsappBaileysSessionStatus,
   type BillingSubscription,
   type AutomationAction,
   type AutomationRule,
@@ -37,6 +40,7 @@ import {
 } from './schema.js';
 import { decryptKey, encryptKey, keyVersionOf, isEncrypted } from '../lib/encryption.js';
 import { refreshProviderToken } from '../integrations/refresh.js';
+import { normalizeJid } from '../lib/phone.js';
 import type { Platform, Product, Order } from '../types.js';
 
 export const SENSITIVE_SETTINGS_KEYS = new Set(['zidAuthorization']);
@@ -835,6 +839,107 @@ export const whatsappRepo = {
     return isEncrypted(channel.accessTokenEnc) ? decryptKey(channel.accessTokenEnc) : channel.accessTokenEnc;
   },
 };
+
+/**
+ * Baileys (WhatsApp Web) pairing state.
+ *
+ * Reads use `withOperator` rather than `withTenant` deliberately: restoring sessions
+ * at boot has to enumerate every paired store before any tenant context exists, and the
+ * session-limit scan is an operator-wide question ("how many numbers are live right
+ * now?"), not a per-tenant one. Both are operator-authenticated paths; a client never
+ * reaches this repo directly.
+ *
+ * `saveState` stores the complete `{ creds, keys }` blob encrypted. `keys` is the part
+ * that is easy to forget: it holds the Signal pre-key and session records, so a store
+ * that persists only `creds` looks correctly paired while every send fails.
+ */
+export const baileysSessionRepo = {
+  async get(storeId: string): Promise<WhatsappBaileysSession | null> {
+    return withOperator((tx) =>
+      tx
+        .select()
+        .from(whatsappBaileysSessions)
+        .where(eq(whatsappBaileysSessions.storeId, storeId))
+        .limit(1)
+        .then((r) => r[0] ?? null),
+    );
+  },
+
+  /** Every store with persisted state, for restoreAllSessions() at boot. */
+  async listAll(): Promise<WhatsappBaileysSession[]> {
+    return withOperator((tx) => tx.select().from(whatsappBaileysSessions));
+  },
+
+  /**
+   * Sessions that still hold or are establishing a connection.
+   *
+   * `logged_out` and `replaced` are excluded on purpose: a logged-out number is not
+   * occupying memory, and `replaced` means WhatsApp moved the session elsewhere, so
+   * counting it would leave a phantom occupying a one-slot limit.
+   */
+  async listOpen(): Promise<Array<{ storeId: string; status: string; phone: string | null }>> {
+    return withOperator((tx) =>
+      tx
+        .select({
+          storeId: whatsappBaileysSessions.storeId,
+          status: whatsappBaileysSessions.status,
+          phone: whatsappBaileysSessions.phone,
+        })
+        .from(whatsappBaileysSessions)
+        .where(inArray(whatsappBaileysSessions.status, ['idle', 'connecting', 'qr', 'open'])),
+    );
+  },
+
+  /**
+   * Persist the full auth state, creating the row if needed.
+   *
+   * The upsert target is `storeId` (the primary key), so a re-scan replaces the prior
+   * state rather than accumulating rows — which matters because the old plan's
+   * `.limit(1)`-with-no-ORDER-BY read would have picked between them nondeterministically.
+   */
+  async saveState(storeId: string, state: unknown): Promise<void> {
+    const stateEnc = encryptKey(JSON.stringify(state));
+    const keyVersion = keyVersionOf(stateEnc);
+    const phone = readPairedPhone(state);
+    const values = { storeId, stateEnc, keyVersion, phone };
+    await withOperator((tx) =>
+      tx
+        .insert(whatsappBaileysSessions)
+        .values({ ...values, status: 'connecting' })
+        .onConflictDoUpdate({ target: whatsappBaileysSessions.storeId, set: values }),
+    );
+  },
+
+  async setStatus(
+    storeId: string,
+    status: WhatsappBaileysSessionStatus,
+    extra: { phone?: string | null; lastError?: string | null } = {},
+  ): Promise<void> {
+    const patch: Record<string, unknown> = { status, updatedAt: new Date() };
+    if (extra.phone !== undefined) patch.phone = extra.phone;
+    if (extra.lastError !== undefined) patch.lastError = extra.lastError;
+    await withOperator((tx) =>
+      tx.update(whatsappBaileysSessions).set(patch).where(eq(whatsappBaileysSessions.storeId, storeId)),
+    );
+  },
+
+  /** Drops the row entirely, so a re-pair starts from a clean handshake. */
+  async clear(storeId: string): Promise<void> {
+    await withOperator((tx) =>
+      tx.delete(whatsappBaileysSessions).where(eq(whatsappBaileysSessions.storeId, storeId)),
+    );
+  },
+
+  decryptState(session: WhatsappBaileysSession): unknown {
+    return JSON.parse(decryptKey(session.stateEnc));
+  },
+};
+
+/** Pulls the paired number out of a Baileys auth state, if it has reached that point. */
+function readPairedPhone(state: unknown): string | null {
+  const creds = (state as { creds?: { me?: { id?: string } } } | null)?.creds;
+  return normalizeJid(creds?.me?.id ?? null);
+}
 
 export const billingRepo = {
   async upsertByStripeCustomer(input: {

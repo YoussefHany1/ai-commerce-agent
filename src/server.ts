@@ -101,6 +101,16 @@ if (!config.workersEnabled) {
   app.log.warn('background workers disabled via WORKERS_ENABLED — this replica serves traffic only');
 }
 
+// Restore persisted WhatsApp Web pairings. Imported dynamically and only when the flag
+// is on, so a Meta-only deployment never loads Baileys into the process at all. It runs
+// after listen() so a slow reconnect cannot delay the API accepting traffic, and each
+// store is independent — one undecryptable blob logs and skips rather than aborting boot.
+if (config.whatsappBaileysEnabled) {
+  void import('./services/whatsappSession.js')
+    .then((session) => session.restoreAllSessions())
+    .catch((err) => app.log.error({ err }, 'whatsapp: boot restore failed'));
+}
+
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;

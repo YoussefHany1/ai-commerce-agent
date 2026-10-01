@@ -1,16 +1,23 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
-import { customerRepo, conversationRepo, whatsappRepo } from '../db/repos.js';
+import { baileysSessionRepo, storeRepo, whatsappRepo } from '../db/repos.js';
 import { verifyHubSignature } from '../lib/webhooks.js';
-import { answerWithTools, toChatHistory } from '../services/agent.js';
-import { sendText } from '../integrations/whatsapp.js';
+import { handleInboundText } from '../services/whatsappInbound.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
 import { requireOperator, requireDashboard } from '../lib/auth.js';
 import { logger } from '../lib/logger.js';
+import {
+  SessionBusyError,
+  SessionLimitError,
+  livePhone,
+  startSession,
+  statusFor,
+  stopSession,
+  subscribe,
+} from '../services/whatsappSession.js';
 
 const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
-const MAX_TEXT_LENGTH = 2000;
 
 export async function whatsapp(app: FastifyInstance) {
   app.get('/webhooks/whatsapp', async (req, reply) => {
@@ -58,6 +65,184 @@ export async function whatsapp(app: FastifyInstance) {
   );
 
   app.get('/api/whatsapp/channels', { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] }, async () => whatsappRepo.listChannels());
+
+  registerQrRoutes(app);
+}
+
+/**
+ * The unofficial-protocol warning, shown before the merchant reaches the pairing flow.
+ *
+ * Deliberately not a checkbox inside the card: the merchant is the party whose number
+ * gets banned, and a box inside a card they are already scanning past is not informed
+ * consent. It gates access, and §1.3 of the plan puts it ahead of pairing.
+ */
+const TOS_SUMMARY = [
+  'Pairing uses WhatsApp Web, an unofficial protocol that Meta does not support.',
+  'Meta can temporarily or permanently ban a number used this way.',
+  'Reconnecting frequently is a known trigger for that action.',
+  'Use a number you can afford to lose, and prefer the official Cloud API where you can.',
+].join(' ');
+
+/**
+ * Whether this store has accepted the *current* terms version.
+ *
+ * Versioned rather than a bare boolean so revising the wording re-prompts every
+ * merchant instead of leaving a stale acceptance standing forever.
+ */
+export function hasAcknowledgedTos(store: { settings: unknown } | null | undefined): boolean {
+  const ack = (store?.settings as { whatsappQrAcknowledged?: { version?: string } } | null | undefined)
+    ?.whatsappQrAcknowledged;
+  return ack?.version === config.WHATSAPP_BAILEYS_TOS_VERSION;
+}
+
+/**
+ * QR pairing routes.
+ *
+ * All four 404 when `WHATSAPP_BAILEYS_ENABLED` is off, rather than 403: the feature is
+ * not part of this deployment at all, and a 403 invites a retry loop against an endpoint
+ * that will never succeed.
+ *
+ * The ToS gate lives on `qr-connect` specifically — it is the route that mints a
+ * session, so a client that skips the interstitial still cannot obtain a number. The
+ * read-only routes stay open so the dashboard can render "unavailable" from real state
+ * instead of guessing.
+ */
+function registerQrRoutes(app: FastifyInstance): void {
+  const dashboard = (req: any) => (req.body as { storeId?: string })?.storeId ?? (req.query as { storeId?: string })?.storeId;
+
+  app.post(
+    '/api/whatsapp/qr-connect',
+    {
+      preHandler: [
+        requireDashboard(dashboard, { allowStoreKey: true }),
+        storeRateLimitWindow('api', apiWindow),
+      ],
+    },
+    async (req, reply) => {
+      if (!config.whatsappBaileysEnabled) return reply.code(404).send({ error: 'not_available' });
+      const { storeId } = z.object({ storeId: z.string() }).parse(req.body);
+
+      // Gate before any socket work: this is the control, the UI is the courtesy.
+      const store = await storeRepo.get(storeId);
+      if (!hasAcknowledgedTos(store)) {
+        return reply.code(403).send({
+          error: 'tos_not_acknowledged',
+          message: TOS_SUMMARY,
+          version: config.WHATSAPP_BAILEYS_TOS_VERSION,
+        });
+      }
+
+      try {
+        const { resumed } = await startSession(storeId);
+        return { ok: true, resumed };
+      } catch (err) {
+        if (err instanceof SessionLimitError) {
+          return reply.code(409).send({
+            error: 'session_limit_reached',
+            openSessions: err.openSessions,
+            maxSessions: config.WHATSAPP_BAILEYS_MAX_SESSIONS,
+          });
+        }
+        // Another replica owns this number. Not an error worth surfacing as a 500.
+        if (err instanceof SessionBusyError) {
+          return reply.code(409).send({ error: 'session_busy' });
+        }
+        throw err;
+      }
+    },
+  );
+
+  /**
+   * Records the warning acceptance.
+   *
+   * Separate from `qr-connect` so the interstitial can persist consent without opening
+   * a socket: the merchant reads the terms, dismisses the card, and only then pairs.
+   */
+  app.post(
+    '/api/whatsapp/qr-acknowledge',
+    { preHandler: [requireDashboard(dashboard, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
+    async (req) => {
+      if (!config.whatsappBaileysEnabled) throw Object.assign(new Error('not_available'), { statusCode: 404 });
+      const { storeId } = z.object({ storeId: z.string() }).parse(req.body);
+      await storeRepo.updateSettings(storeId, {
+        whatsappQrAcknowledged: { version: config.WHATSAPP_BAILEYS_TOS_VERSION, at: new Date().toISOString() },
+      });
+      return { ok: true, version: config.WHATSAPP_BAILEYS_TOS_VERSION };
+    },
+  );
+
+  app.get(
+    '/api/whatsapp/qr-status',
+    { preHandler: [requireDashboard((req) => (req.query as { storeId?: string })?.storeId, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
+    async (req) => {
+      if (!config.whatsappBaileysEnabled) throw Object.assign(new Error('not_available'), { statusCode: 404 });
+      const { storeId } = z.object({ storeId: z.string() }).parse(req.query);
+      const [store, row] = await Promise.all([storeRepo.get(storeId), baileysSessionRepo.get(storeId)]);
+      return {
+        enabled: true,
+        tosAcknowledged: hasAcknowledgedTos(store),
+        tosVersion: config.WHATSAPP_BAILEYS_TOS_VERSION,
+        status: statusFor(storeId) ?? row?.status ?? 'idle',
+        phone: livePhone(storeId) ?? row?.phone ?? null,
+        lastError: row?.lastError ?? null,
+        maxSessions: config.WHATSAPP_BAILEYS_MAX_SESSIONS,
+      };
+    },
+  );
+
+  /**
+   * Server-sent events for the pairing flow.
+   *
+   * SSE rather than polling because a QR rotates every ~20s: polling that fast from
+   * every open dashboard tab is a self-inflicted load problem, and the stream also
+   * carries the `open` / `replaced` transitions a poll would still miss.
+   *
+   * Subscriptions are per store, so one tenant's events can never reach another's.
+   */
+  app.get(
+    '/api/whatsapp/qr-stream',
+    { preHandler: [requireDashboard((req) => (req.query as { storeId?: string })?.storeId, { allowStoreKey: true })] },
+    async (req, reply) => {
+      if (!config.whatsappBaileysEnabled) return reply.code(404).send({ error: 'not_available' });
+      const { storeId } = z.object({ storeId: z.string() }).parse(req.query);
+
+      reply.raw.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        // Proxies that buffer would defeat the point of a stream.
+        'x-accel-buffering': 'no',
+      });
+
+      const send = (data: unknown): void => {
+        reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      send({ type: 'status', status: statusFor(storeId) ?? 'idle' });
+      const unsubscribe = subscribe(storeId, send);
+
+      // Keeps intermediaries from closing an idle connection during a long pairing wait.
+      const heartbeat = setInterval(() => reply.raw.write(': ping\n\n'), 25_000);
+      heartbeat.unref?.();
+
+      req.raw.on('close', () => {
+        clearInterval(heartbeat);
+        unsubscribe();
+      });
+    },
+  );
+
+  app.delete(
+    '/api/whatsapp/qr-disconnect',
+    { preHandler: [requireDashboard(dashboard, { allowStoreKey: true }), storeRateLimitWindow('api', apiWindow)] },
+    async (req) => {
+      if (!config.whatsappBaileysEnabled) throw Object.assign(new Error('not_available'), { statusCode: 404 });
+      const { storeId } = z.object({ storeId: z.string() }).parse(req.body);
+      // logout, not end: the merchant asked to disconnect, so the number is unlinked.
+      await stopSession(storeId, { logout: true });
+      return { ok: true };
+    },
+  );
 }
 
 type WhatsappChange = {
@@ -88,16 +273,4 @@ export async function handleWhatsappPayload(payload: any): Promise<void> {
   }
 }
 
-export async function handleInboundText(storeId: string, phone: string, text: string): Promise<void> {
-  const trimmed = text.slice(0, MAX_TEXT_LENGTH);
-  const customerId = await customerRepo.upsert(storeId, { phone });
-  const conversationId = await conversationRepo.ensureOpen(storeId, customerId ?? undefined, 'whatsapp');
-  const history = toChatHistory(await conversationRepo.history(storeId, conversationId, 10));
-  await conversationRepo.addMessage({ storeId, conversationId, role: 'user', content: trimmed });
-
-  const reply = await answerWithTools(storeId, trimmed, history);
-  await conversationRepo.addMessage({ storeId, conversationId, role: 'assistant', content: reply });
-
-  const channel = await whatsappRepo.byStore(storeId);
-  if (channel) await sendText(phone, reply, channel);
-}
+export { handleInboundText };

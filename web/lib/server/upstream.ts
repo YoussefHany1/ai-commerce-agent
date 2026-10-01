@@ -42,6 +42,13 @@ const ALLOWLIST: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   { method: 'POST', pattern: /^\/billing\/portal$/ },
   { method: 'GET', pattern: /^\/whatsapp\/channels$/ },
   { method: 'POST', pattern: /^\/whatsapp\/channels$/ },
+  // QR pairing. `/qr-stream` is deliberately absent: it is a long-lived SSE response
+  // and the generic proxy buffers the body, so it gets a dedicated BFF route that
+  // pipes the stream through instead (web/app/api/whatsapp/qr-stream/route.ts).
+  { method: 'GET', pattern: /^\/whatsapp\/qr-status$/ },
+  { method: 'POST', pattern: /^\/whatsapp\/qr-connect$/ },
+  { method: 'POST', pattern: /^\/whatsapp\/qr-acknowledge$/ },
+  { method: 'DELETE', pattern: /^\/whatsapp\/qr-disconnect$/ },
   { method: 'GET', pattern: /^\/automation\/rules\/[^/]+$/ },
   { method: 'POST', pattern: /^\/automation\/rules$/ },
   { method: 'PUT', pattern: /^\/automation\/rules\/[^/]+$/ },

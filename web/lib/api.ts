@@ -32,6 +32,23 @@ export const API_BASE_URL = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhos
   '',
 );
 
+/**
+ * WhatsApp Web pairing state, mirroring `GET /api/whatsapp/qr-status`.
+ *
+ * `status` distinguishes `logged_out` and `replaced` from a generic error because they
+ * need different recovery — one needs a re-scan, the other usually just a reconnect —
+ * and collapsing them into `error` would show a merchant the wrong remedy.
+ */
+export type QrStatus = {
+  enabled: boolean;
+  tosAcknowledged: boolean;
+  tosVersion: string;
+  status: 'idle' | 'connecting' | 'qr' | 'open' | 'logged_out' | 'replaced' | 'error';
+  phone: string | null;
+  lastError: string | null;
+  maxSessions: number;
+};
+
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
@@ -168,6 +185,42 @@ export const api = {
     }),
 
   whatsappChannels: () => request<Array<{ id: string; storeId: string; phoneNumberId: string; wabaId: string | null; createdAt: string }>>('/api/whatsapp/channels'),
+
+  /**
+   * WhatsApp Web (QR) pairing state.
+   *
+   * `status` is the live socket state when this replica holds the number, falling back
+   * to the persisted value — which is why the card must load this on mount instead of
+   * trusting only live events: after a redeploy the socket is briefly absent and the
+   * stored status is the honest answer.
+   */
+  whatsappQrStatus: (storeId: string) =>
+    request<QrStatus>(`/api/whatsapp/qr-status?storeId=${encodeURIComponent(storeId)}`),
+
+  /** Records acceptance of the unofficial-protocol warning. Must precede qrConnect. */
+  whatsappQrAcknowledge: (storeId: string) =>
+    request<{ ok: true; version: string }>('/api/whatsapp/qr-acknowledge', {
+      method: 'POST',
+      body: { storeId },
+    }),
+
+  /**
+   * Starts pairing. Rejects with `tos_not_acknowledged` until the warning is accepted
+   * and `session_limit_reached` when the one-number limit is met — both are surfaced
+   * rather than retried.
+   */
+  whatsappQrConnect: (storeId: string) =>
+    request<{ ok: true; resumed: boolean }>('/api/whatsapp/qr-connect', {
+      method: 'POST',
+      body: { storeId },
+    }),
+
+  /** Unlinks the number from WhatsApp and drops the stored pairing. */
+  whatsappQrDisconnect: (storeId: string) =>
+    request<{ ok: true }>('/api/whatsapp/qr-disconnect', {
+      method: 'DELETE',
+      body: { storeId },
+    }),
 
   automationRules: (storeId: string) =>
     request<AutomationRulesResponse>(`/api/automation/rules/${storeId}`),

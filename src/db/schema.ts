@@ -427,6 +427,40 @@ export const whatsappChannels = pgTable(
   (t) => [uniqueIndex('whatsapp_channels_phone_uidx').on(t.phoneNumberId)],
 );
 
+/**
+ * Baileys (WhatsApp Web) pairing state, one row per paired number.
+ *
+ * Separate from `whatsappChannels` on purpose rather than by preference:
+ * `whatsapp_channels.phone_number_id` is NOT NULL with a unique index, but during
+ * QR pairing there is no phone number yet — while `creds` must already be persisted
+ * to survive a redeploy mid-handshake. Putting Baileys state here would force a
+ * placeholder into a NOT NULL unique column and let a later Meta `upsert` clobber it.
+ * See whatsapp_qr_plan.md §4.
+ */
+export const whatsappBaileysSessions = pgTable(
+  'whatsapp_baileys_sessions',
+  {
+    storeId: uuid('store_id')
+      .primaryKey()
+      .references(() => stores.id, { onDelete: 'cascade' }),
+    /**
+     * The complete Baileys `{ creds, keys }` auth state, AES-256-GCM encrypted.
+     * Not creds alone: `keys` holds the Signal pre-key and session records, and
+     * dropping them silently breaks an otherwise-paired session.
+     */
+    stateEnc: text('state_enc').notNull(),
+    keyVersion: text('key_version').notNull().default('v1'),
+    /** Bare digits, not a JID — it is compared against order phones in attribution. Null until paired. */
+    phone: text('phone'),
+    /** 'idle' | 'connecting' | 'qr' | 'open' | 'logged_out' | 'replaced' | 'error' */
+    status: text('status').notNull().default('idle'),
+    lastError: text('last_error'),
+    createdAt: ts(),
+    updatedAt: ts(),
+  },
+  (t) => [index('whatsapp_baileys_sessions_status_idx').on(t.status)],
+);
+
 export const billingSubscriptions = pgTable(
   'billing_subscriptions',
   {
@@ -493,6 +527,32 @@ export type EventRow = typeof events.$inferSelect;
 export type NewEvent = typeof events.$inferInsert;
 export type WhatsappChannel = typeof whatsappChannels.$inferSelect;
 export type NewWhatsappChannel = typeof whatsappChannels.$inferInsert;
+export type WhatsappBaileysSession = typeof whatsappBaileysSessions.$inferSelect;
+
+/**
+ * Baileys session lifecycle.
+ *
+ * `logged_out` and `replaced` are terminal and distinct, because they need different
+ * recovery: a logged-out number must be re-scanned, while a replaced one was moved to
+ * another device by the merchant and should reconnect quietly rather than scream.
+ * Neither is treated as "open", so neither holds a slot against the session limit.
+ */
+export type WhatsappBaileysSessionStatus =
+  | 'idle'
+  | 'connecting'
+  | 'qr'
+  | 'open'
+  | 'logged_out'
+  | 'replaced'
+  | 'error';
+
+/** Statuses that still own a socket, i.e. count against WHATSAPP_BAILEYS_MAX_SESSIONS. */
+export const OPEN_BAILEYS_STATUSES: WhatsappBaileysSessionStatus[] = [
+  'idle',
+  'connecting',
+  'qr',
+  'open',
+];
 export type BillingSubscription = typeof billingSubscriptions.$inferSelect;
 export type NewBillingSubscription = typeof billingSubscriptions.$inferInsert;
 export type DailyMetric = typeof dailyMetrics.$inferSelect;

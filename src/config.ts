@@ -42,6 +42,18 @@ const schema = z.object({
   WHATSAPP_WEBHOOK_VERIFY_TOKEN: z.string().optional(),
   WHATSAPP_APP_SECRET: z.string().optional(),
   WHATSAPP_GRAPH_VERSION: z.string().default('v21.0'),
+  // WhatsApp Web QR pairing runs a persistent Baileys socket per paired number.
+  // Off by default: it costs ~100-200 MB of RSS per session and holds an unofficial
+  // Meta protocol connection open, so it is opt-in per deployment rather than
+  // something every install pays for. See whatsapp_qr_plan.md §1.1.
+  WHATSAPP_BAILEYS_ENABLED: z.enum(['1', '0', 'true', 'false']).default('0'),
+  // One number per deployment. A product limit as much as a memory one: the free
+  // tier cannot hold two sockets in 512 MB, and the paid tier still ships with one
+  // number per merchant. Raise deliberately, one socket per increment.
+  WHATSAPP_BAILEYS_MAX_SESSIONS: z.coerce.number().int().positive().default(1),
+  // Bumping this re-prompts every merchant to re-acknowledge the unofficial-protocol
+  // warning, because acknowledgement is recorded per version and not as a bare boolean.
+  WHATSAPP_BAILEYS_TOS_VERSION: z.string().default('2026-01'),
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),
   STRIPE_PRICE_PRO: z.string().optional(),
@@ -132,6 +144,8 @@ export function loadConfig(raw: NodeJS.ProcessEnv = process.env) {
     ...parsed,
     retentionEnabled: parsed.RETENTION_ENABLED === '1' || parsed.RETENTION_ENABLED === 'true',
     workersEnabled: parsed.WORKERS_ENABLED === '1' || parsed.WORKERS_ENABLED === 'true',
+    whatsappBaileysEnabled:
+      parsed.WHATSAPP_BAILEYS_ENABLED === '1' || parsed.WHATSAPP_BAILEYS_ENABLED === 'true',
     trustProxy: parsed.TRUST_PROXY === '1' || parsed.TRUST_PROXY === 'true',
     encryption: {
       version: activeVersion,
