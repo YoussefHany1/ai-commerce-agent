@@ -1218,6 +1218,22 @@ export const automationRepo = {
     );
   },
 
+  /**
+   * Enabled rules of one trigger type for one store.
+   *
+   * Scoped to a store so the inbound path can ask "which keyword rules could this
+   * message match?" without loading every tenant's rules to filter in memory.
+   */
+  async listEnabledByTrigger(storeId: string, triggerType: string): Promise<AutomationRule[]> {
+    return withTenant(storeId, (tx) =>
+      tx
+        .select()
+        .from(automationRules)
+        .where(and(eq(automationRules.storeId, storeId), eq(automationRules.enabled, true), eq(automationRules.triggerType, triggerType)))
+        .orderBy(automationRules.createdAt),
+    );
+  },
+
   async claim(storeId: string, ruleId: string, triggerType: string, conversationId: string, channel: string): Promise<string | null> {
     return withTenant(storeId, async (tx) => {
       const [row] = await tx

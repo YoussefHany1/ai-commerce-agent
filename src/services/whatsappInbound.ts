@@ -29,6 +29,21 @@ export async function handleInboundText(storeId: string, phone: string, text: st
   const history = toChatHistory(await conversationRepo.history(storeId, conversationId, 10));
   await conversationRepo.addMessage({ storeId, conversationId, role: 'user', content: trimmed });
 
+  // Keyword automations run here, synchronously, before the AI answers. This is the
+  // only point where the customer's message is still the newest one — a polling worker
+  // would only ever see the assistant's reply that is about to be written below.
+  //
+  // Imported dynamically for the same reason as `sendOverBaileys`: the automation
+  // service statically imports this module, so a top-level import back would be a
+  // cycle. When a rule fires it has already delivered its own message, and the AI is
+  // skipped so the customer does not receive two replies to one message.
+  const keywordMatch = await runKeywordAutomationSafely(storeId, {
+    conversationId,
+    phone,
+    text: trimmed,
+  });
+  if (keywordMatch) return;
+
   const reply = await answerWithTools(storeId, trimmed, history);
   await conversationRepo.addMessage({ storeId, conversationId, role: 'assistant', content: reply });
 
@@ -51,6 +66,30 @@ export async function handleInboundText(storeId: string, phone: string, text: st
  * cycle. Resolving it at call time costs nothing measurable and keeps the dependency
  * one-directional at module scope.
  */
+/**
+ * Runs keyword automations, treating a failure as "no match".
+ *
+ * A broken automation must never swallow a customer's message: without this guard an
+ * error here would reject out of `handleInboundText` and the message would be stored
+ * with no reply at all, so a merchant's bad rule would silently mute their whole store.
+ */
+async function runKeywordAutomationSafely(
+  storeId: string,
+  input: { conversationId: string; phone: string; text: string },
+): Promise<boolean> {
+  try {
+    const { runKeywordAutomation } = await import('./automation.js');
+    const match = await runKeywordAutomation(storeId, input);
+    if (match) {
+      logger.info({ storeId, ruleId: match.ruleId, conversationId: input.conversationId }, 'whatsapp: keyword automation replied');
+    }
+    return !!match;
+  } catch (err) {
+    logger.error({ err, storeId }, 'whatsapp: keyword automation failed');
+    return false;
+  }
+}
+
 export async function sendOverBaileys(storeId: string, phone: string, body: string): Promise<boolean> {
   try {
     const session = await import('./whatsappSession.js');

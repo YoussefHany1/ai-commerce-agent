@@ -1,6 +1,39 @@
-import { describe, expect, it } from 'vitest';
-import { isInCooldown, keywordsFor, matchesKeyword, renderTemplate } from './automation.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  automationRepo: {
+    claim: vi.fn(),
+    complete: vi.fn(),
+    markFired: vi.fn(),
+    listEnabledByTrigger: vi.fn(),
+  },
+  storeRepo: { get: vi.fn(async () => ({ id: 'store1', name: 'Acme' })) },
+  whatsappRepo: { byStore: vi.fn(async () => ({ phoneNumberId: 'pn1' })) },
+  conversationRepo: { addMessage: vi.fn() },
+  sendText: vi.fn(async () => true),
+  sendOverBaileys: vi.fn(async () => true),
+  withTenant: vi.fn(async (_id: string, fn: (tx: unknown) => unknown) => fn({})),
+}));
+
+vi.mock('../db/repos.js', () => ({
+  automationRepo: mocks.automationRepo,
+  storeRepo: mocks.storeRepo,
+  whatsappRepo: mocks.whatsappRepo,
+  conversationRepo: mocks.conversationRepo,
+}));
+vi.mock('../db/client.js', () => ({ withTenant: mocks.withTenant }));
+vi.mock('../integrations/whatsapp.js', () => ({ sendText: mocks.sendText }));
+vi.mock('./whatsappInbound.js', () => ({ sendOverBaileys: mocks.sendOverBaileys }));
+
+const { isInCooldown, keywordsFor, matchesKeyword, renderTemplate, runKeywordAutomation } = await import('./automation.js');
 import type { AutomationRule } from '../db/schema.js';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.storeRepo.get.mockResolvedValue({ id: 'store1', name: 'Acme' });
+  mocks.whatsappRepo.byStore.mockResolvedValue({ phoneNumberId: 'pn1' });
+  mocks.sendText.mockResolvedValue(true);
+});
 
 function rule(overrides: Partial<AutomationRule> = {}): AutomationRule {
   return {
@@ -74,6 +107,56 @@ describe('matchesKeyword', () => {
 
   it('returns false for an empty keyword list', () => {
     expect(matchesKeyword('anything', [])).toBe(false);
+  });
+});
+
+describe('runKeywordAutomation', () => {
+  it('replies with the rule body when a keyword matches', async () => {
+    mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([rule({ triggerType: 'keyword', triggerConfig: { keywords: ['hi123'] } })]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+    mocks.whatsappRepo.byStore.mockResolvedValue({ phoneNumberId: 'pn1' });
+    mocks.sendText.mockResolvedValue(true);
+
+    const out = await runKeywordAutomation('store1', { conversationId: 'c1', phone: '966500000000', text: 'say hi123 please' });
+    expect(out).toEqual({ ruleId: 'rule1', body: 'hello' });
+    expect(mocks.sendText).toHaveBeenCalledWith('966500000000', 'hello', expect.anything());
+    expect(mocks.automationRepo.complete).toHaveBeenCalledWith('store1', 'log-1', 'sent', 'hello', null);
+  });
+
+  it('sends nothing when no keyword matches', async () => {
+    mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([rule({ triggerType: 'keyword', triggerConfig: { keywords: ['hi123'] } })]);
+    const out = await runKeywordAutomation('store1', { conversationId: 'c1', phone: '966500000000', text: 'what is the price' });
+    expect(out).toBeNull();
+    expect(mocks.sendText).not.toHaveBeenCalled();
+  });
+
+  it('renders template tokens in the reply', async () => {
+    mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([
+      rule({ triggerType: 'keyword', triggerConfig: { keywords: ['price'] }, action: { type: 'whatsapp_text', text: 'hi {customerName}' } }),
+    ]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+    mocks.whatsappRepo.byStore.mockResolvedValue({ phoneNumberId: 'pn1' });
+    mocks.sendText.mockResolvedValue(true);
+
+    const out = await runKeywordAutomation('store1', { conversationId: 'c1', phone: '9665', text: 'PRICE?', customerName: 'Sara' });
+    expect(out?.body).toBe('hi Sara');
+  });
+
+  it('ignores a rule whose conversation already fired', async () => {
+    // The claim is the per-customer dedup; a repeat keyword in the same conversation
+    // must not re-send.
+    mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([rule({ triggerType: 'keyword', triggerConfig: { keywords: ['hi123'] } })]);
+    mocks.automationRepo.claim.mockResolvedValue(null);
+
+    const out = await runKeywordAutomation('store1', { conversationId: 'c1', phone: '9665', text: 'hi123' });
+    expect(out).toBeNull();
+    expect(mocks.sendText).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when the store has no keyword rules', async () => {
+    mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([]);
+    const out = await runKeywordAutomation('store1', { conversationId: 'c1', phone: '9665', text: 'hi123' });
+    expect(out).toBeNull();
   });
 });
 
