@@ -120,6 +120,20 @@
       "when": 1791200000000,
       "tag": "0016_automation_options",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1791300000000,
+      "tag": "0017_automation_logs_dedupe_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1791300001000,
+      "tag": "0018_automation_logs_dedupe_key",
+      "breakpoints": true
     }
   ]
 }

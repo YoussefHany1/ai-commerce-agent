@@ -382,10 +382,23 @@ export const automationLogs = pgTable(
     status: text('status').notNull().default('pending'),
     body: text('body'),
     error: text('error'),
+    /**
+     * Selects the uniqueness rule for this row:
+     *   - 'conversation' — poll triggers, which must fire once per conversation
+     *   - 'message'     — inbound triggers, which fire once per incoming message
+     *   - null           — no dedupe at all
+     *
+     * Keyword rules use 'message' (keyed by the inbound message id) rather than
+     * 'conversation': a customer repeating the keyword is a new event, not a duplicate.
+     */
+    dedupeScope: text('dedupe_scope'),
+    dedupeKey: uuid('dedupe_key'),
     createdAt: ts(),
   },
   (t) => [
-    uniqueIndex('automation_logs_rule_conv_uidx').on(t.storeId, t.ruleId, t.conversationId),
+    uniqueIndex('automation_logs_dedupe_uidx')
+      .on(t.storeId, t.ruleId, t.dedupeKey)
+      .where(sql`${t.dedupeScope} is not null`),
     index('automation_logs_store_id_idx').on(t.storeId),
   ],
 );

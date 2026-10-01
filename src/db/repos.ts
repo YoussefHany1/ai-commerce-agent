@@ -656,9 +656,13 @@ export const conversationRepo = {
     });
   },
 
-  async addMessage(msg: NewMessage): Promise<void> {
+  /** Returns the new message id, so callers can key dedupe on the individual message. */
+  async addMessage(msg: NewMessage): Promise<string | null> {
     const values = msg.content ? { ...msg, content: encryptPii(msg.content) } : msg;
-    await withTenant(msg.storeId, (tx) => tx.insert(messages).values(values));
+    return withTenant(msg.storeId, async (tx) => {
+      const [row] = await tx.insert(messages).values(values).returning({ id: messages.id });
+      return row?.id ?? null;
+    });
   },
 };
 
@@ -1234,12 +1238,29 @@ export const automationRepo = {
     );
   },
 
-  async claim(storeId: string, ruleId: string, triggerType: string, conversationId: string, channel: string): Promise<string | null> {
+  /**
+   * Records the intent to send, returning null when an equivalent send already exists.
+   *
+   * `dedupeScope` picks the uniqueness rule. Poll triggers pass 'conversation' with the
+   * conversation id, so a rule handles each conversation once. Inbound (keyword) triggers
+   * pass 'message' with the inbound message id, so a customer repeating a keyword gets a
+   * fresh reply. Passing neither disables dedupe entirely.
+   */
+  async claim(
+    storeId: string,
+    ruleId: string,
+    triggerType: string,
+    conversationId: string,
+    channel: string,
+    dedupe?: { scope: 'conversation' | 'message'; key: string } | null,
+  ): Promise<string | null> {
+    const dedupeScope = dedupe?.scope ?? null;
+    const dedupeKey = dedupe?.key ?? null;
     return withTenant(storeId, async (tx) => {
       const [row] = await tx
         .insert(automationLogs)
-        .values({ storeId, ruleId, triggerType, conversationId, channel, status: 'pending' })
-        .onConflictDoNothing({ target: [automationLogs.storeId, automationLogs.ruleId, automationLogs.conversationId] })
+        .values({ storeId, ruleId, triggerType, conversationId, channel, status: 'pending', dedupeScope, dedupeKey })
+        .onConflictDoNothing({ target: [automationLogs.storeId, automationLogs.ruleId, automationLogs.dedupeKey] })
         .returning({ id: automationLogs.id });
       return row?.id ?? null;
     });

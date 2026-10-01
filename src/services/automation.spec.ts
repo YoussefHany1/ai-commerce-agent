@@ -142,13 +142,28 @@ describe('runKeywordAutomation', () => {
     expect(out?.body).toBe('hi Sara');
   });
 
-  it('ignores a rule whose conversation already fired', async () => {
-    // The claim is the per-customer dedup; a repeat keyword in the same conversation
-    // must not re-send.
+  it('dedupes on the inbound message, so a repeated keyword replies again', async () => {
+    mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([rule({ triggerType: 'keyword', triggerConfig: { keywords: ['hi123'] } })]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+
+    const first = await runKeywordAutomation('store1', { conversationId: 'c1', messageId: 'm1', phone: '9665', text: 'hi123' });
+    const second = await runKeywordAutomation('store1', { conversationId: 'c1', messageId: 'm2', phone: '9665', text: 'hi123' });
+
+    expect(first).toEqual({ ruleId: 'rule1', body: 'hello' });
+    expect(second).toEqual({ ruleId: 'rule1', body: 'hello' });
+    // Scoping dedupe to the conversation instead made a rule answer each customer once
+    // ever: the second keyword hit the unique conflict and fell through to the AI.
+    const scopes = mocks.automationRepo.claim.mock.calls.map((c) => (c[5] as { scope: string }).scope);
+    expect(scopes).toEqual(['message', 'message']);
+    expect(mocks.automationRepo.claim.mock.calls[0]![5]).toMatchObject({ scope: 'message', key: 'm1' });
+    expect(mocks.automationRepo.claim.mock.calls[1]![5]).toMatchObject({ scope: 'message', key: 'm2' });
+  });
+
+  it('sends nothing when the same inbound message already fired', async () => {
     mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([rule({ triggerType: 'keyword', triggerConfig: { keywords: ['hi123'] } })]);
     mocks.automationRepo.claim.mockResolvedValue(null);
 
-    const out = await runKeywordAutomation('store1', { conversationId: 'c1', phone: '9665', text: 'hi123' });
+    const out = await runKeywordAutomation('store1', { conversationId: 'c1', messageId: 'm1', phone: '9665', text: 'hi123' });
     expect(out).toBeNull();
     expect(mocks.sendText).not.toHaveBeenCalled();
   });

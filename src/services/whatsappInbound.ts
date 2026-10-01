@@ -27,7 +27,7 @@ export async function handleInboundText(storeId: string, phone: string, text: st
   const customerId = await customerRepo.upsert(storeId, { phone });
   const conversationId = await conversationRepo.ensureOpen(storeId, customerId ?? undefined, 'whatsapp');
   const history = toChatHistory(await conversationRepo.history(storeId, conversationId, 10));
-  await conversationRepo.addMessage({ storeId, conversationId, role: 'user', content: trimmed });
+  const messageId = await conversationRepo.addMessage({ storeId, conversationId, role: 'user', content: trimmed });
 
   // Keyword automations run here, synchronously, before the AI answers. This is the
   // only point where the customer's message is still the newest one — a polling worker
@@ -37,8 +37,13 @@ export async function handleInboundText(storeId: string, phone: string, text: st
   // service statically imports this module, so a top-level import back would be a
   // cycle. When a rule fires it has already delivered its own message, and the AI is
   // skipped so the customer does not receive two replies to one message.
+  //
+  // `messageId` is the dedupe key: it scopes "already answered this" to a single inbound
+  // message rather than the whole conversation, so a customer who repeats the keyword
+  // gets a reply every time.
   const keywordMatch = await runKeywordAutomationSafely(storeId, {
     conversationId,
+    messageId,
     phone,
     text: trimmed,
   });
@@ -75,7 +80,7 @@ export async function handleInboundText(storeId: string, phone: string, text: st
  */
 async function runKeywordAutomationSafely(
   storeId: string,
-  input: { conversationId: string; phone: string; text: string },
+  input: { conversationId: string; messageId: string | null; phone: string; text: string },
 ): Promise<boolean> {
   try {
     const { runKeywordAutomation } = await import('./automation.js');

@@ -215,7 +215,10 @@ export async function executeRule(storeId: string, rule: AutomationRule): Promis
   if (action.type === 'whatsapp_number') {
     const cand = candidates[0];
     const body = renderTemplate(action.text, { shopName });
-    const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, 'whatsapp');
+    const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, 'whatsapp', {
+      scope: 'conversation',
+      key: cand.conversationId,
+    });
     if (!logId) return { sent: 0, failed: 0 };
     const ok = await deliverToNumber(storeId, action.phone, body, waChannel);
     await automationRepo.complete(storeId, logId, ok ? 'sent' : 'failed', ok ? body : null, ok ? null : 'send_failed');
@@ -236,7 +239,10 @@ export async function executeRule(storeId: string, rule: AutomationRule): Promis
       orderCurrency: cand.orderCurrency,
     });
 
-    const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, cand.channel);
+    const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, cand.channel, {
+      scope: 'conversation',
+      key: cand.conversationId,
+    });
     if (!logId) continue;
     fired = true;
 
@@ -275,7 +281,7 @@ export type KeywordMatch = { ruleId: string; body: string };
  */
 export async function runKeywordAutomation(
   storeId: string,
-  input: { conversationId: string; phone: string; customerName?: string | null; text: string },
+  input: { conversationId: string; messageId?: string | null; phone: string; customerName?: string | null; text: string },
 ): Promise<KeywordMatch | null> {
   const rules = await automationRepo.listEnabledByTrigger(storeId, 'keyword');
   if (!rules.length) return null;
@@ -299,7 +305,13 @@ export async function runKeywordAutomation(
     };
 
     const body = renderTemplate(rule.action.text, { customerName: cand.customerName, shopName });
-    const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, 'whatsapp');
+    // Dedupe on the inbound message, not the conversation. Keying on the conversation made
+    // a keyword rule answer each customer exactly once for the lifetime of the
+    // conversation, so a repeat keyword fell through to the AI with no log at all.
+    const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, 'whatsapp', {
+      scope: 'message',
+      key: input.messageId ?? `${cand.conversationId}:${crypto.randomUUID()}`,
+    });
     if (!logId) continue;
 
     const ok = await deliverToCandidate(storeId, cand, body, waChannel);
