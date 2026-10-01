@@ -31,6 +31,32 @@ vi.mock('baileys', () => ({
   makeCacheableSignalKeyStore: (store: unknown) => store,
   makeWASocket: vi.fn(),
   Browsers: { ubuntu: () => ['ubuntu', 'chrome', '1'] },
+  // A new pairing seeds creds through this. The real one generates real keypairs;
+  // the tests only need a non-empty object with the right field names, and the
+  // harness in verify-baileys-esm.mjs covers the real thing end to end.
+  initAuthCreds: () => ({
+    noiseKey: undefined,
+    signedIdentityKey: undefined,
+    signedPreKey: undefined,
+    registrationId: undefined,
+    advSecretKey: undefined,
+    firstUnuploadedPreKeyId: undefined,
+    accountSyncCounter: undefined,
+    accountChecksum: undefined,
+    registered: false,
+    deviceId: undefined,
+    phoneId: 'test-device',
+    identityKey: undefined,
+    backupToken: undefined,
+    registration: {},
+    pairingCode: undefined,
+    lastPropHash: undefined,
+    routingInfo: undefined,
+    deviceList: {},
+    pairDeviceKey: undefined,
+    signalSkew: undefined,
+    platformType: 'unknown',
+  }),
 }));
 // Mocked so the QR path is deterministic: the real module is dynamically imported on
 // every QR, and its first load is slow enough to blow a waitFor window under parallel

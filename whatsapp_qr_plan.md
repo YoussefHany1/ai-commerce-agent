@@ -230,7 +230,6 @@ would pull a different, incompatible tree. Baileys 6.x also replaced the per-id
 against the real API rather than the sketch.
 
 ```ts
-import { makeWASocket, DisconnectReason, initAuthCreds } from 'baileys';
 import type {
   AuthenticationState,
   AuthenticationCreds,
@@ -242,7 +241,9 @@ import type {
 
 `baileys` is loaded through a local `requireBaileys()` helper (a memoised dynamic `import`) so the
 module is never evaluated when the feature flag is off (§8). Types are imported with `import type`
-and therefore erased at build time, so the flag-off path carries no runtime dependency.
+and therefore erased at build time, so the flag-off path carries no runtime dependency. `makeWASocket`,
+`DisconnectReason`, `makeCacheableSignalKeyStore`, and `initAuthCreds` all come off the awaited module
+rather than a static import — a static one would defeat the flag (§15.1).
 
 ### 5.2 JID normalisation — `src/lib/phone.ts`
 
@@ -800,3 +801,56 @@ Baileys' own internals. The unit suite reaches the service through `__setSocketF
 asserts the source contains `import('baileys')` rather than `require('baileys')` and that every
 `requireBaileys()` call site awaits. Verified by mutation — reverting either fix turns the new test
 red.
+
+## 16. Post-deployment correction - uninitialised credentials
+
+With 15.1 and 15.2 fixed, `POST /api/whatsapp/qr-connect` returned `200` and the dashboard moved from
+`Connecting…` to a permanent `Connecting…` again, with **no error anywhere**: no QR, no SSE error, and
+the `Reconnect` button appeared inert. The endpoint was healthy the whole time.
+
+### 16.1 Cause
+
+`loadAuthState` seeded a brand-new pairing with `let creds = {} as AuthenticationCreds`. Baileys'
+Noise handshake reads the credential fields immediately, so with a bare object the socket
+established a websocket, closed about half a second later, and never emitted a `qr` event. The
+service's existing reconnect/backoff loop treated each close as transient and retried forever, which
+is exactly the observed spinner. Measured directly against real Baileys:
+
+| Seed | Result |
+| --- | --- |
+| `{}` | connects, closes in ~0.5 s, **no QR** |
+| `initAuthCreds()` | `qr` data URL in ~0.6 s |
+
+Note the third production failure mode in a row, and the same symptom class: a silent loop with no
+surfaced error.
+
+### 16.2 Fix
+
+`loadAuthState` now awaits `requireBaileys()` up front and seeds every fresh credential set from
+`baileys.initAuthCreds()`, which in Baileys 6.x takes no argument — the original sketch in §5.1 called
+it with `{}` and would not have compiled. A stored blob that *has* creds is still used verbatim — they completed a handshake once, and
+re-initialising would discard the pairing. A stored blob *missing* creds falls back to
+`initAuthCreds()`, the same as no row. A blob that fails to decrypt still throws and refuses to
+connect (§16.3).
+
+### 16.3 Why "pair fresh" was not taken instead
+
+Resetting the row on a decrypt failure is the tempting one-line fix. It is wrong: the merchant's
+number is still linked to WhatsApp while this install would hold an unpaired row it believes is live.
+The existing throw forces an explicit re-pair from the dashboard, where the merchant can see the
+consequence.
+
+### 16.4 `Reconnect` was a no-op
+
+The button called `qr-connect`, and `startSession` answers `{ resumed: true }` for a live session — so
+it could not break the reconnect loop above. It now disconnects first, then reconnects, which forces
+a genuinely new handshake. This is a real behavioural change: `Reconnect` is no longer idempotent.
+
+### 16.5 Test coverage
+
+The harness is now an end-to-end pairing check rather than a load check: it subscribes the way the SSE
+route does, calls `startSession`, waits for a real `qr` event, and fails if the QR never arrives or if
+more than a few `connecting` transitions suggest a loop. Expected run: `connecting` then `qr`, no
+loop. `whatsappModuleLoading.spec.ts` also asserts the seed is `initAuthCreds()` and that the
+`= {} as AuthenticationCreds` form is absent. Verified by mutation — restoring the bare-`{}` seed
+turns both new tests red, which is precisely how the bug survived the original suite.

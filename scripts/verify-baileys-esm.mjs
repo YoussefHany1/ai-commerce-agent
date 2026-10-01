@@ -1,11 +1,20 @@
 /**
- * Executes the REAL session service under plain Node, so the module system matches
- * production. Vitest transpiles to CJS and injects `require`, which is why
- * `require('baileys')` passed 60 unit tests and then made qr-connect 500 on Render, and
- * why a malformed Baileys logger never surfaced: every test injects a socket factory and
- * so never calls makeWASocket.
+ * The pairing flow that actually reaches the merchant.
  *
- * This drives a real startSession() with only the DB/Redis layer stubbed.
+ * Three bugs shipped as "Connecting…" with a dead Reconnect button, all invisible to
+ * the unit suite because every test injects a socket factory and never calls
+ * makeWASocket:
+ *
+ *   1. `require('baileys')` — a ReferenceError in this ESM package.
+ *   2. `silentLogger()` returned a plain object for `child`, which Baileys calls as a
+ *      function.
+ *   3. A new pairing seeded `creds = {}` instead of `initAuthCreds()`. Baileys' Noise
+ *      handshake reads the credential fields immediately, so the socket connected,
+ *      never received a QR, and closed inside a second — retried forever on backoff,
+ *      with the dashboard showing a permanent spinner and no error.
+ *
+ * This compiles the service with the project's tsconfig and runs it under plain Node,
+ * stubbing only the DB/Redis layer, then waits for a real QR to reach a real subscriber.
  */
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -13,7 +22,7 @@ import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 const repoRoot = process.cwd();
-// Inside the repo so Node can resolve the bare 'baileys' specifier via node_modules.
+// Inside the repo so Node resolves the bare 'baileys' specifier via node_modules.
 const tmp = mkdtempSync(join(repoRoot, '.tmp-baileys-esm-'));
 
 const log = [];
@@ -31,6 +40,7 @@ function makeStubLogger() {
   return l;
 }
 
+const statuses = [];
 const stubs = {
   '../lib/logger.js': { logger: makeStubLogger() },
   '../config.js': {
@@ -46,7 +56,9 @@ const stubs = {
       listOpen: async () => [],
       get: async () => null,
       saveState: async () => undefined,
-      setStatus: async () => undefined,
+      setStatus: async (storeId, status, extra) => {
+        statuses.push({ status, extra: extra ?? null, at: Date.now() - t0 });
+      },
       clear: async () => undefined,
       listAll: async () => [],
       decryptState: () => ({ creds: {}, keys: {} }),
@@ -66,14 +78,15 @@ const stubs = {
 };
 
 globalThis.__stubs = stubs;
+const t0 = Date.now();
 
 function stubUrl(spec) {
   const file = join(tmp, spec.replace(/[^\w]/g, '_') + '.mjs');
-  const ref = `globalThis.__stubs[${JSON.stringify(spec)}]`;
+  const s = `globalThis.__stubs[${JSON.stringify(spec)}]`;
   writeFileSync(
     file,
     [
-      `const s = ${ref};`,
+      `const s = ${s};`,
       `export default s;`,
       `export const logger = s.logger;`,
       `export const config = s.config;`,
@@ -91,41 +104,61 @@ function stubUrl(spec) {
   return pathToFileURL(file).href;
 }
 
-function fail(msg, err) {
-  console.error(msg);
-  if (err) console.error(String(err.stack || err));
+function finish(code) {
   rmSync(tmp, { recursive: true, force: true });
-  process.exit(1);
+  process.exit(code);
 }
 
 try {
-  // Compile with the project's own config so the emitted JS is what Render runs.
   execFileSync(
     process.execPath,
     [join(repoRoot, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.build.json', '--outDir', join(tmp, 'out')],
     { cwd: repoRoot, stdio: 'pipe' },
   );
-
   let patched = readFileSync(join(tmp, 'out/services/whatsappSession.js'), 'utf8');
-  for (const spec of Object.keys(stubs)) {
-    patched = patched.split(`'${spec}'`).join(`'${stubUrl(spec)}'`);
-  }
+  for (const spec of Object.keys(stubs)) patched = patched.split(`'${spec}'`).join(`'${stubUrl(spec)}'`);
   const patchedFile = join(tmp, 'out/services/whatsappSessionPatched.js');
   writeFileSync(patchedFile, patched);
 
-  // No socket factory: this must reach the real makeWASocket, which is where the
-  // logger.child bug lived.
   const mod = await import(pathToFileURL(patchedFile).href);
-  await mod.startSession('store-real-esm');
 
-  const live = mod.isLive('store-real-esm');
-  const hasSocket = mod.socketFor('store-real-esm') !== null;
-  console.log('resolved baileys and created a socket');
-  console.log('isLive:', live, '| socket present:', hasSocket);
+  // Subscribe exactly as the SSE route does, before pairing starts.
+  const received = [];
+  mod.subscribe('pairing-e2e', (e) => {
+    received.push({ type: e.type, status: e.status ?? null, hasQr: Boolean(e.qr), at: Date.now() - t0 });
+    console.log(`+${Date.now() - t0}ms EVENT ${e.type}${e.status ? ' ' + e.status : ''}${e.qr ? ' (data URL)' : ''}`);
+  });
 
-  rmSync(tmp, { recursive: true, force: true });
-  // Stop the socket and close the Baileys/WS transport so the harness can exit.
-  process.exit(live && hasSocket ? 0 : 2);
+  await mod.startSession('pairing-e2e');
+  console.log(`+${Date.now() - t0}ms startSession resolved; status=${mod.statusFor('pairing-e2e')}`);
+
+  await new Promise((r) => setTimeout(r, 9000));
+
+  const qr = received.find((e) => e.type === 'qr');
+  const stuck = received.filter((e) => e.status === 'connecting').length;
+
+  console.log('\n--- summary ---');
+  console.log('status transitions:', JSON.stringify(statuses.map((s) => s.status)));
+  console.log('events:', JSON.stringify(received));
+  console.log('final status:', mod.statusFor('pairing-e2e'));
+  console.log('connecting events:', stuck, stuck > 4 ? '(reconnect loop)' : '');
+
+  if (!qr) {
+    console.log('\nVERDICT: no QR reached the subscriber.');
+    try { mod.socketFor('pairing-e2e')?.end(undefined); } catch {}
+    finish(7);
+  }
+  if (stuck > 4) {
+    console.log('\nVERDICT: QR arrived but the socket is also looping on connecting.');
+    try { mod.socketFor('pairing-e2e')?.end(undefined); } catch {}
+    finish(8);
+  }
+
+  console.log('\nVERDICT: pairing works — a real QR reached a real subscriber.');
+  try { mod.socketFor('pairing-e2e')?.end(undefined); } catch {}
+  finish(0);
 } catch (err) {
-  fail('ESM harness failed:', err);
+  console.error('harness failed:', err && (err.stack || err.message));
+  console.error('log tail:', JSON.stringify(log.slice(-6)));
+  finish(1);
 }

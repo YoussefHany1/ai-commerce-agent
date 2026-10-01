@@ -22,6 +22,24 @@ const repoRoot = process.cwd();
  * Checking the source text alone would not catch it: only executing the emitted module
  * can.
  */
+/**
+ * A new pairing must be seeded with Baileys' initialised credentials.
+ *
+ * `initAuthCreds({})` versus a bare `{}` decides whether the merchant ever sees a QR:
+ * with a plain object the Noise handshake fails immediately, the socket closes in about
+ * half a second, and the service retries forever — a permanent spinner, no error, and a
+ * Reconnect button that changes nothing. Asserting on the shape is what stops that from
+ * coming back; the end-to-end harness above covers the runtime consequence.
+ */
+describe('a new pairing is seeded with initialised credentials', () => {
+  test('loadAuthState gives Baileys the initialised creds shape, not a bare object', async () => {
+    const source = await readFileUtf8('src/services/whatsappSession.ts');
+    // A bare `{}` is the bug. initAuthCreds must be the seed, with no `= {}` fallback.
+    expect(source).not.toMatch(/let creds = \{\} as AuthenticationCreds/);
+    expect(source).toMatch(/initAuthCreds\(\)/);
+  });
+});
+
 describe('baileys is loadable in the module system production uses', () => {
   const dir = mkdtempSync(join(tmpdir(), 'baileys-esm-'));
 
@@ -53,11 +71,13 @@ describe('baileys is loadable in the module system production uses', () => {
     expect(source).toMatch(/import\(\s*['"]baileys['"]\s*\)/);
   });
 
-  test('a real session starts under Node ESM, reaching the real makeWASocket', async () => {
-    // The decisive check. Every unit test injects a socket factory, so none of them ever
-    // call makeWASocket — which is exactly how a malformed Baileys logger shipped.
-    // This compiles with the project's tsconfig and runs the service as Node will,
-    // stubbing only the DB/Redis layer.
+  test('a merchant pairing reaches a real QR, end to end, under Node ESM', async () => {
+    // The decisive check. Every unit test injects a socket factory, so none of them
+    // ever call makeWASocket — which is how a bad logger, a bad module load, and
+    // uninitialised creds all shipped as "Connecting…" with no error.
+    // Compiles with the project's tsconfig and runs the service as Node will,
+    // stubbing only the DB/Redis layer, and fails if the QR never arrives or the
+    // socket loops on `connecting`.
     const { code } = await execFileAsync(
       process.execPath,
       [join(repoRoot, 'scripts/verify-baileys-esm.mjs')],
@@ -66,7 +86,7 @@ describe('baileys is loadable in the module system production uses', () => {
       () => ({ code: 0 }),
       (err: any) => ({ code: err.code as number, stderr: String(err.stderr ?? '') }),
     );
-    expect(code, 'ESM harness must start a real session; see stderr').toBe(0);
+    expect(code, 'pairing harness must deliver a QR; see stdout above for the events').toBe(0);
   });
 
   test('every requireBaileys() caller awaits it', async () => {

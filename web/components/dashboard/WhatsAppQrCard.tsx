@@ -163,7 +163,14 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
       setPhase('connecting');
     }, 'Could not record your acceptance.');
 
-  const connect = () => run(() => api.whatsappQrConnect(storeId), 'Could not start pairing.');
+  // Force a genuinely new handshake rather than reusing the live socket: startSession
+  // otherwise answers `resumed: true`, so clicking Reconnect while the backend is stuck
+  // in a reconnect loop changes nothing and looks like a dead button.
+  const connect = () =>
+    run(async () => {
+      await api.whatsappQrDisconnect(storeId).catch(() => undefined);
+      await api.whatsappQrConnect(storeId);
+    }, 'Could not start pairing.');
 
   const disconnect = () =>
     run(async () => {

@@ -228,16 +228,27 @@ function emit(storeId: string, event: Omit<SessionEvent, 'at'>): void {
  */
 async function loadAuthState(storeId: string): Promise<AuthState> {
   const row = await baileysSessionRepo.get(storeId);
-  let creds = {} as AuthenticationCreds;
-  let storedKeys: Record<string, SignalDataSet> = {};
+  const baileys = await requireBaileys();
 
+  // A store with no stored row is pairing from scratch, and `initAuthCreds` — not a
+  // bare `{}` — is what Baileys expects here. Its Noise handshake reads these fields
+  // immediately, so a plain object yields a socket that connects, never receives a QR,
+  // and closes inside a second. The service then retries on backoff forever and the
+  // dashboard shows a permanent "Connecting…" with no error.
+  const freshCreds = (): AuthenticationCreds => baileys.initAuthCreds();
+
+  let creds = freshCreds();
+  let storedKeys: Record<string, SignalDataSet> = {};
   if (row) {
     try {
       const parsed = baileysSessionRepo.decryptState(row) as {
         creds?: AuthenticationCreds;
         keys?: Record<string, SignalDataSet>;
       };
-      creds = parsed.creds ?? ({} as AuthenticationCreds);
+      // A stored blob missing `creds` fails the same way as no row at all, so fall back
+      // to the initialised shape. A blob that *has* creds is used verbatim: they
+      // completed a handshake once, and re-initialising would discard the pairing.
+      creds = parsed.creds ?? freshCreds();
       storedKeys = parsed.keys ?? {};
     } catch {
       // A failed decrypt means the encryption key rotated without a re-encrypt, or the
@@ -318,7 +329,6 @@ async function loadAuthState(storeId: string): Promise<AuthState> {
 
   // Baileys' own wrapper adds request-level caching and read/write batching. Without it
   // every encryption round-trip re-reads the store, which is the expensive path.
-  const baileys = await requireBaileys();
   return {
     creds,
     keys: baileys.makeCacheableSignalKeyStore(store),
