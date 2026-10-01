@@ -43,7 +43,10 @@ vi.mock('baileys', () => ({
     firstUnuploadedPreKeyId: undefined,
     accountSyncCounter: undefined,
     accountChecksum: undefined,
-    registered: false,
+    // A genuinely paired device reports `registered: true`. The old fixture used
+    // `false`, which is why sends on an unregistered socket went unnoticed until
+    // production automation replies silently vanished.
+    registered: true,
     deviceId: undefined,
     phoneId: 'test-device',
     identityKey: undefined,
@@ -114,7 +117,13 @@ beforeEach(() => {
   repo.saveState.mockResolvedValue(undefined);
   repo.setStatus.mockResolvedValue(undefined);
   repo.clear.mockResolvedValue(undefined);
-  repo.decryptState.mockReturnValue({ creds: { me: { id: '966501234567@s.whatsapp.net' } }, keys: {} });
+  // A restored, genuinely paired device: WhatsApp confirmed registration when the
+  // handshake completed. Sends are refused without this flag (see `sendTextOverSocket`),
+  // so a bare `me.id` fixture would silently fail every send test.
+  repo.decryptState.mockReturnValue({
+    creds: { registered: true, me: { id: '966501234567@s.whatsapp.net' } },
+    keys: {},
+  });
   events.record.mockResolvedValue(true);
   inbound.handleInboundText.mockResolvedValue(undefined);
   leaseMocks = [];
@@ -646,6 +655,21 @@ describe('sending', () => {
 
   test('refuses to send when the socket is not open', async () => {
     await session.startSession(STORE);
+    await expect(session.sendTextOverSocket(STORE, '966509999999', 'hello')).resolves.toBe(false);
+    expect(socket.sent).toHaveLength(0);
+  });
+
+  test('refuses to send on an open but unregistered socket', async () => {
+    // Regression: the socket opens and inbound decrypts, but WhatsApp never confirmed
+    // registration, so it discards outbound stanzas. Baileys still resolves sendMessage,
+    // which made every automation reply vanish while the log claimed "sent".
+    repo.decryptState.mockReturnValue({
+      creds: { registered: false, me: { id: '966501234567@s.whatsapp.net' } },
+      keys: {},
+    });
+    await session.startSession(STORE);
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
     await expect(session.sendTextOverSocket(STORE, '966509999999', 'hello')).resolves.toBe(false);
     expect(socket.sent).toHaveLength(0);
   });

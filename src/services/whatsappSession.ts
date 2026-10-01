@@ -643,6 +643,17 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
     await auth.flush();
     await move('open', { phone });
     emit(storeId, { type: 'status', status: 'open', phone });
+    // Report the handshake outcome separately from connectivity: a socket can be open
+    // while the device is still unregistered, which means inbound decrypts but outbound
+    // is dropped by WhatsApp. Without this the dashboard shows a healthy connection and
+    // every automation reply disappears with no error anywhere.
+    const registered = (auth.creds as { registered?: boolean }).registered === true;
+    if (!registered) {
+      logger.error(
+        { storeId, phone },
+        'whatsapp: socket open but device unregistered — outbound sends will be dropped; re-pair this number',
+      );
+    }
     return;
   }
 
@@ -851,6 +862,15 @@ export async function sendTextOverSocket(storeId: string, to: string, body: stri
   const session = live.get(storeId);
   if (!session || session.status !== 'open') {
     logger.warn({ storeId, to }, 'whatsapp: no open baileys session for send');
+    return false;
+  }
+  // An open socket is not proof the device is registered. When `creds.registered` is
+  // false the handshake never completed, and Baileys still resolves `sendMessage` for
+  // outbound stanzas that WhatsApp then silently discards — so callers record a send
+  // that never reached the customer. Refuse instead, so the failure is visible upstream.
+  const registered = (session.auth.creds as { registered?: boolean }).registered === true;
+  if (!registered) {
+    logger.warn({ storeId, to }, 'whatsapp: refusing send on unregistered baileys socket');
     return false;
   }
   const jid = toJid(to);
