@@ -5,8 +5,8 @@ import type { WhatsappBaileysSessionStatus } from '../db/schema.js';
 import { normalizeJid, toJid } from '../lib/phone.js';
 import { acquireLock, type Lock } from '../lib/lock.js';
 import { handleInboundText } from './whatsappInbound.js';
-// Type-only: erased at compile time, so this does not defeat the lazy `require` of the
-// runtime module in createSocket() below.
+// Type-only: erased at compile time, so this does not defeat the lazy dynamic import of
+// the runtime module in requireBaileys() below.
 import type { AuthenticationCreds, AuthenticationState, SignalDataSet, SignalKeyStore } from 'baileys';
 
 /**
@@ -184,7 +184,7 @@ type LiveSession = {
   closing: boolean;
 };
 
-type SocketFactory = (opts: { auth: AuthState; storeId: string }) => SocketLike;
+type SocketFactory = (opts: { auth: AuthState; storeId: string }) => SocketLike | Promise<SocketLike>;
 
 /** Injected in tests; defaults to the real Baileys socket. */
 let socketFactory: SocketFactory | null = null;
@@ -318,7 +318,7 @@ async function loadAuthState(storeId: string): Promise<AuthState> {
 
   // Baileys' own wrapper adds request-level caching and read/write batching. Without it
   // every encryption round-trip re-reads the store, which is the expensive path.
-  const baileys = requireBaileys();
+  const baileys = await requireBaileys();
   return {
     creds,
     keys: baileys.makeCacheableSignalKeyStore(store),
@@ -433,7 +433,7 @@ export async function startSession(storeId: string): Promise<{ resumed: boolean 
     throw err;
   }
 
-  const socket = createSocket({ auth, storeId });
+  const socket = await createSocket({ auth, storeId });
 
   const session: LiveSession = {
     storeId,
@@ -454,9 +454,9 @@ export async function startSession(storeId: string): Promise<{ resumed: boolean 
   return { resumed: false };
 }
 
-function createSocket(opts: { auth: AuthState; storeId: string }): SocketLike {
+async function createSocket(opts: { auth: AuthState; storeId: string }): Promise<SocketLike> {
   if (socketFactory) return socketFactory(opts);
-  const baileys = requireBaileys();
+  const baileys = await requireBaileys();
   return baileys.makeWASocket({
     auth: opts.auth,
     // The QR goes to the dashboard over SSE, never to a deploy log nobody reads.
@@ -470,10 +470,21 @@ function createSocket(opts: { auth: AuthState; storeId: string }): SocketLike {
   }) as unknown as SocketLike;
 }
 
-/** Baileys is imported lazily so a deployment with the flag off never loads it. */
-let baileysModule: typeof import('baileys') | null = null;
-function requireBaileys(): typeof import('baileys') {
-  if (!baileysModule) baileysModule = require('baileys') as typeof import('baileys');
+/**
+ * Baileys is imported lazily so a deployment with the flag off never loads it.
+ *
+ * This must be a dynamic `import()`, not `require()`: the package is `"type": "module"`,
+ * so the emitted JS is ESM and a bare `require` is not defined at runtime. That failure
+ * is invisible to the unit suite — Vitest transpiles to CJS and injects `require` — but
+ * it makes `POST /api/whatsapp/qr-connect` return 500 on Render.
+ * See `whatsappModuleLoading.spec.ts`.
+ *
+ * The resolved module is memoised as a promise so concurrent callers for different
+ * stores share one import rather than racing to evaluate Baileys several times.
+ */
+let baileysModule: Promise<typeof import('baileys')> | null = null;
+function requireBaileys(): Promise<typeof import('baileys')> {
+  baileysModule ??= import('baileys');
   return baileysModule;
 }
 
@@ -483,7 +494,23 @@ function requireBaileys(): typeof import('baileys') {
  * recorded explicitly via `baileysSessionRepo.setStatus` and the session events.
  */
 function silentLogger(): Record<string, unknown> {
-  return { level: 'silent', child: { level: 'silent' } } as never;
+  // `child` must be a callable function returning a logger, because Baileys does
+  // `logger.child({ module })` when it builds its internal sub-loggers. Returning a plain
+  // object here throws a TypeError inside makeWASocket, before any socket exists.
+  // `child` must be a callable function returning a logger, because Baileys does
+  // `logger.child({ module })` when it builds its internal sub-loggers. Returning a plain
+  // object here throws a TypeError inside makeWASocket, before any socket exists, which
+  // surfaces as a 500 from qr-connect.
+  const base = {
+    level: 'silent',
+    trace: () => {},
+    debug: () => {},
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+    fatal: () => {},
+  };
+  return { ...base, child: () => ({ ...base }) } as never;
 }
 
 function wireSocket(session: LiveSession, auth: AuthState): void {

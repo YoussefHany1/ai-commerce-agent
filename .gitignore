@@ -9,3 +9,5 @@ server.pid
 server.out.log
 server.err.log
 backups/
+# Scratch build output from scripts/verify-baileys-esm.mjs.
+.tmp-baileys-esm-*/

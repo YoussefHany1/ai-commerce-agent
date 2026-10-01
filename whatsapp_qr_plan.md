@@ -764,3 +764,39 @@ All three previously-open questions are now answered and folded into the section
   decision before launch, not before implementation.
 - **Media support itself** (actually reading images). Explicitly out of scope for v1. The
   decision here is how to decline, not how to eventually accept.
+
+---
+
+## 15. Post-implementation corrections
+
+Found by `scripts/verify-baileys-esm.mjs`, which compiles the service with the project's own
+tsconfig and runs it under plain Node with only the DB/Redis layer stubbed. Vitest transpiles to
+CJS and injects `require`, and every unit test injects a socket factory, so neither issue below
+was reachable from the suite. Both surfaced as `500` from `POST /api/whatsapp/qr-connect` once the
+flag was enabled on Render.
+
+### 15.1 `require('baileys')` is a ReferenceError in this package
+
+`package.json` is `"type": "module"`, so the emitted JS is ESM and a bare `require` is not
+defined. `requireBaileys()` now uses a memoised dynamic `import('baileys')` and returns a promise;
+`loadAuthState` and `createSocket` await it, and `createSocket` is async. `SocketFactory` widened to
+allow a promise so the test seam still works.
+
+### 15.2 The silent Baileys logger was not a logger
+
+`silentLogger()` returned `{ level: 'silent', child: { level: 'silent' } }`. Baileys constructs its
+internal sub-loggers with `logger.child({ module })`, so `child` must be a **callable function**.
+The plain object threw `TypeError: logger.child is not a function` inside `makeWASocket`, before any
+socket existed — a second, independent 500 on the same route. It now returns no-op level methods
+plus `child: () => ({ ...base })`.
+
+### 15.3 Why the suite could not see either
+
+Both bugs live in code that only executes outside Vitest: a bare `require` in an ESM package, and
+Baileys' own internals. The unit suite reaches the service through `__setSocketFactory`, so
+`makeWASocket` is never called and `requireBaileys` never has to resolve.
+
+`src/services/whatsappModuleLoading.spec.ts` pins all of it: it executes the harness as a test, and
+asserts the source contains `import('baileys')` rather than `require('baileys')` and that every
+`requireBaileys()` call site awaits. Verified by mutation — reverting either fix turns the new test
+red.
