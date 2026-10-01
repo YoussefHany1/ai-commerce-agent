@@ -372,6 +372,82 @@ describe('connection lifecycle', () => {
     expect(repo.clear).not.toHaveBeenCalled();
   });
 
+  test('a re-emitted QR replaces the expired one instead of being dropped', async () => {
+    // Baileys re-emits when the previous QR expires. The merchant scans whatever is on
+    // screen, so a silently-ignored refresh means scanning an image that cannot work.
+    const events: any[] = [];
+    session.subscribe(STORE, (e) => events.push(e));
+    await session.startSession(STORE);
+    socket.emit('connection.update', { qr: 'FIRST' });
+    await vi.waitFor(() => expect(events.some((e) => e.type === 'qr')).toBe(true));
+    socket.emit('connection.update', { qr: 'SECOND' });
+    await vi.waitFor(() => expect(events.some((e) => e.qr?.includes('SECOND'))).toBe(true));
+    expect(session.statusFor(STORE)).toBe('qr');
+  });
+
+  test('515 right after a scan is a restart, not a failure', async () => {
+    // This is what WhatsApp sends once a pairing succeeds: restart with the new
+    // credentials. Treating it as a plain transient close bounces the merchant back to
+    // a spinner mid-handshake, which is what reads as a failed scan.
+    vi.useFakeTimers();
+    const events: any[] = [];
+    session.subscribe(STORE, (e) => events.push(e));
+    await session.startSession(STORE);
+    socket.emit('connection.update', { qr: 'BASE64QR' });
+    await vi.advanceTimersByTimeAsync(50);
+    // Everything the merchant sees from here on is what they judge us by.
+    const afterScan = events.length;
+    socket.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 515 } } },
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const seen = events.slice(afterScan);
+    // Must not flip them back to a spinner.
+    expect(seen.filter((e) => e.status === 'connecting').length).toBe(0);
+    expect(session.statusFor(STORE)).not.toBe('connecting');
+    expect(session.statusFor(STORE)).toBe('qr');
+    // The fresh credentials are persisted before the socket is replaced, so the
+    // reconnect (and any redeploy) uses the identity WhatsApp just issued.
+    expect(repo.saveState).toHaveBeenCalled();
+  });
+
+  test('a rejected pairing reports the pairing, not a bogus logout', async () => {
+    // The phone said "couldn't log in"; telling the merchant their number is logged
+    // out sends them hunting for a problem that does not exist.
+    const events: any[] = [];
+    session.subscribe(STORE, (e) => events.push(e));
+    await session.startSession(STORE);
+    socket.emit('connection.update', { qr: 'BASE64QR' });
+    await vi.waitFor(() => expect(events.some((e) => e.type === 'qr')).toBe(true));
+    socket.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 401 } } },
+    });
+    await vi.waitFor(() => {
+      const err = events.find((e) => e.type === 'status' && e.status === 'error');
+      expect(err?.error).toMatch(/pairing/i);
+    });
+    expect(session.statusFor(STORE)).toBe('error');
+    // A half-finished handshake must not be reused as the basis for the next attempt.
+    expect(repo.clear).toHaveBeenCalled();
+  });
+
+  test('a 401 on an already-linked number is still a logout', async () => {
+    // The complement of the case above, and the reason the distinction is not based on
+    // `phone`: it is null right up until a socket opens, including for a restored
+    // session that has been paired for weeks.
+    await session.startSession(STORE);
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
+    socket.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 401 } } },
+    });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('logged_out'));
+  });
+
   test('a transient close reconnects rather than ending the session', async () => {
     vi.useFakeTimers();
     await session.startSession(STORE);
@@ -394,6 +470,34 @@ describe('connection lifecycle', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(socket.ended).toBe(true);
     expect(socket.loggedOut).toBe(false);
+  });
+
+  test('a reconnect reuses the in-memory auth state, not a possibly-stale stored blob', async () => {
+    // The stored row trails the live socket by up to a second of debounced key writes.
+    // Re-reading it here re-handshakes with a half-written device identity, which is
+    // what makes a scanned pairing come back as "couldn't log in" a moment later.
+    vi.useFakeTimers();
+    await session.startSession(STORE);
+    const readsBefore = repo.get.mock.calls.length;
+    socket.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 428 } } },
+    });
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(lock.acquireLock).toHaveBeenCalled();
+    // One read for the original start; the reconnect must not add another.
+    expect(repo.get.mock.calls.length).toBe(readsBefore);
+  });
+
+  test('an explicit disconnect forgets the in-memory auth state', async () => {
+    await session.startSession(STORE);
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
+    await session.stopSession(STORE, { logout: true });
+    // The next start must read the database rather than resume the unlinked device.
+    const readsBefore = repo.get.mock.calls.length;
+    await session.startSession(STORE);
+    expect(repo.get.mock.calls.length).toBe(readsBefore + 1);
   });
 });
 

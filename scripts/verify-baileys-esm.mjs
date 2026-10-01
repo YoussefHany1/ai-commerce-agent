@@ -132,7 +132,16 @@ try {
   await mod.startSession('pairing-e2e');
   console.log(`+${Date.now() - t0}ms startSession resolved; status=${mod.statusFor('pairing-e2e')}`);
 
-  await new Promise((r) => setTimeout(r, 9000));
+  // Poll rather than sleep a fixed amount: a cold Baileys import takes ~2s alone but
+  // much longer when the rest of the suite is compiling in parallel, and a fixed window
+  // turned that into a flaky failure.
+  const deadline = Date.now() + 40_000;
+  while (Date.now() < deadline && !received.some((e) => e.type === 'qr')) {
+    if (received.filter((e) => e.status === 'connecting').length > 4) break;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  // Settle so any immediately-following reconnect loop is visible.
+  await new Promise((r) => setTimeout(r, 1_000));
 
   const qr = received.find((e) => e.type === 'qr');
   const stuck = received.filter((e) => e.status === 'connecting').length;

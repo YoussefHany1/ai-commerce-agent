@@ -182,7 +182,40 @@ type LiveSession = {
   phone: string | null;
   attempts: number;
   closing: boolean;
+  /**
+   * Kept so a reconnect reuses the *live* Signal store rather than re-reading the
+   * database. See the note on `liveAuth`.
+   */
+  auth: AuthState;
+  /**
+   * True from the first QR until the socket opens — i.e. this socket has been through
+   * a merchant scan but has never completed a handshake.
+   *
+   * This, and not `phone`, is what distinguishes "pairing was rejected" from "a linked
+   * number was unlinked". `phone` is in-memory and only set on `open`, so it is null
+   * during the whole first handshake *and* for the window between restoring a paired
+   * session and its socket opening. A 401 in that window is a perfectly-paired number
+   * getting logged out and must not be reported as a failed scan.
+   */
+  awaitingScan: boolean;
 };
+
+/**
+ * In-memory auth state per store, surviving socket teardown.
+ *
+ * This is what keeps a pairing from being thrown away by its own reconnect. Signal
+ * pre-key and session records are written in bursts, and our persistence is both
+ * debounced and batched behind `makeCacheableSignalKeyStore`, so immediately after the
+ * merchant scans the QR the database is *behind* the socket by up to a second's worth
+ * of writes. Re-reading the row on reconnect loads a half-written device identity:
+ * Baileys re-handshakes with different keys, WhatsApp rejects it, and the phone shows
+ * "Couldn't log in. Check your phone's internet connection and scan the QR code again"
+ * — with the merchant's phone, their router, and their ISP all perfectly healthy.
+ *
+ * The database remains the durable record (it survives a redeploy); this only covers
+ * reconnects inside one process lifetime.
+ */
+const liveAuth = new Map<string, AuthState>();
 
 type SocketFactory = (opts: { auth: AuthState; storeId: string }) => SocketLike | Promise<SocketLike>;
 
@@ -227,6 +260,9 @@ function emit(storeId: string, event: Omit<SessionEvent, 'at'>): void {
  * they are rare and losing them costs a re-scan.
  */
 async function loadAuthState(storeId: string): Promise<AuthState> {
+  const cached = liveAuth.get(storeId);
+  if (cached) return cached;
+
   const row = await baileysSessionRepo.get(storeId);
   const baileys = await requireBaileys();
 
@@ -329,11 +365,23 @@ async function loadAuthState(storeId: string): Promise<AuthState> {
 
   // Baileys' own wrapper adds request-level caching and read/write batching. Without it
   // every encryption round-trip re-reads the store, which is the expensive path.
-  return {
+  const auth: AuthState = {
     creds,
     keys: baileys.makeCacheableSignalKeyStore(store),
     flush,
   };
+  liveAuth.set(storeId, auth);
+  return auth;
+}
+
+/**
+ * Drops the in-memory auth state so the next start reads the database again.
+ *
+ * Only called when the stored state is genuinely unusable (explicit disconnect, or a
+ * logout that invalidates it). A reconnect must *not* do this — see `liveAuth`.
+ */
+function forgetAuth(storeId: string): void {
+  liveAuth.delete(storeId);
 }
 
 function parseReason(error: unknown): number | null {
@@ -405,7 +453,10 @@ export async function resetSession(storeId: string): Promise<void> {
  * session, because the re-scan path after `connectionReplaced` would otherwise deadlock
  * against the very limit it just tripped.
  */
-export async function startSession(storeId: string): Promise<{ resumed: boolean }> {
+export async function startSession(
+  storeId: string,
+  opts: { continuingPairing?: boolean } = {},
+): Promise<{ resumed: boolean }> {
   const existing = live.get(storeId);
   if (existing && !existing.closing) return { resumed: true };
 
@@ -454,11 +505,19 @@ export async function startSession(storeId: string): Promise<{ resumed: boolean 
     phone: null,
     attempts: 0,
     closing: false,
+    auth,
+    awaitingScan: false,
   };
   live.set(storeId, session);
-  lastStatus.set(storeId, 'connecting');
-  await baileysSessionRepo.setStatus(storeId, 'connecting').catch(() => undefined);
-  emit(storeId, { type: 'status', status: 'connecting' });
+  // A post-pairing restart keeps the merchant mid-scan. Flipping back to `connecting`
+  // here replaces the QR they are looking at with a spinner, and a spinner is what they
+  // read as "it failed" — so the status stays on `qr` until the socket either opens or
+  // emits a replacement code.
+  const initialStatus: WhatsappBaileysSessionStatus = opts.continuingPairing ? 'qr' : 'connecting';
+  session.status = initialStatus;
+  lastStatus.set(storeId, initialStatus);
+  await baileysSessionRepo.setStatus(storeId, initialStatus).catch(() => undefined);
+  emit(storeId, { type: 'status', status: initialStatus });
 
   wireSocket(session, auth);
   return { resumed: false };
@@ -472,6 +531,17 @@ async function createSocket(opts: { auth: AuthState; storeId: string }): Promise
     // The QR goes to the dashboard over SSE, never to a deploy log nobody reads.
     printQRInTerminal: false,
     browser: baileys.Browsers.ubuntu('Chrome'),
+    // WhatsApp closes the websocket if the handshake is slower than this. The default
+    // (20s) is tight on a cold Render start, where the Noise handshake plus TLS can
+    // exceed it on a first pairing and surface as the phone's misleading
+    // "couldn't log in, check your internet" message.
+    connectTimeoutMs: 60_000,
+    // Our queries are driven by inbound socket events, not request/response timeouts,
+    // so the default 90s cap mostly exists to fail faster than Baileys already does.
+    defaultQueryTimeoutMs: undefined,
+    // Render's free tier idles the socket between deploys and on a shared NAT; a
+    // sub-30s ping keeps the pairing window alive through that.
+    keepAliveIntervalMs: 25_000,
     // A permanently-present presence badge invites "why is this bot always online".
     markOnlineOnConnect: false,
     // We only need new messages; history sync costs a full re-download of the account.
@@ -556,6 +626,10 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
   };
 
   if (update.qr) {
+    // Baileys re-emits a QR when the previous one expires or the socket is recreated.
+    // Emit it rather than returning silently: the merchant rescans whatever is on
+    // screen, and a stale image would just fail again.
+    session.awaitingScan = true;
     await move('qr');
     emit(storeId, { type: 'qr', qr: await qrToDataUrl(update.qr) });
     return;
@@ -563,6 +637,7 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
 
   if (update.connection === 'open') {
     session.attempts = 0;
+    session.awaitingScan = false;
     const phone = normalizeJid((auth.creds as { me?: { id?: string } } | undefined)?.me?.id ?? null);
     session.phone = phone;
     await auth.flush();
@@ -575,9 +650,44 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
 
   const reason = parseReason(update.lastDisconnect?.error);
 
+  // The phone's message for a failed pairing ("Couldn't log in. Check your phone's
+  // internet connection") describes the merchant's network, not ours, and is the same
+  // string for a rejected handshake, a rate limit, and a datacenter-IP block. Record
+  // what WhatsApp actually closed with so the next attempt is diagnosable from logs.
+  logger.warn(
+    {
+      storeId,
+      reason,
+      awaitingScan: session.awaitingScan,
+      phone: session.phone,
+      attempts: session.attempts,
+    },
+    'whatsapp: connection closed',
+  );
+
   if (reason !== null && TERMINAL_REASONS.has(reason)) {
     // loggedOut / replaced / forbidden: reconnecting fights WhatsApp. Persist the
     // terminal status so the dashboard offers a re-scan instead of a spinner.
+    //
+    // A 401 while we are still waiting for the scan to complete means the handshake was
+    // rejected, not that the merchant unlinked anything — there is nothing to unlink
+    // yet. Say so plainly instead of telling them their number is logged out, which
+    // sends them to look for a problem they do not have.
+    if (session.awaitingScan) {
+      logger.error({ storeId, reason }, 'whatsapp: pairing handshake rejected by WhatsApp');
+      await move('error', { lastError: `pairing rejected (disconnect ${reason})` });
+      emit(storeId, {
+        type: 'status',
+        status: 'error',
+        error: 'WhatsApp rejected this pairing. Wait a minute, then scan a fresh QR code.',
+      });
+      // The stored creds are a half-finished handshake; keeping them makes the next
+      // attempt worse rather than better.
+      forgetAuth(storeId);
+      await teardown(session, { logout: false, keepState: false });
+      return;
+    }
+
     const status: WhatsappBaileysSessionStatus = reason === 440 ? 'replaced' : 'logged_out';
     await move(status, { lastError: `disconnect ${reason}` });
     emit(storeId, { type: 'status', status });
@@ -589,6 +699,25 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
     await move('error', { lastError: `disconnect ${reason}` });
     emit(storeId, { type: 'status', status: 'error', error: `disconnect ${reason}` });
     await teardown(session, { logout: false, keepState: true });
+    return;
+  }
+
+  // The pairing landed. Persist it before anything else can tear the socket down: a
+  // redeploy or a lost lease between `creds.update` and the debounced key flush would
+  // otherwise leave the row describing a device WhatsApp has already unlinked.
+  if (reason === 515) {
+    // 515 right after a scan is WhatsApp saying "restart with the new credentials",
+    // not a failure. The phone is mid-handshake at this point, so reconnect on the
+    // short delay and keep the status off `connecting` — bouncing the merchant back to
+    // a spinner is what reads as a failed scan.
+    await auth.flush();
+    logger.info({ storeId }, 'whatsapp: post-pairing restart required, reconnecting');
+    await teardown(session, { logout: false, keepState: true });
+    setTimeout(() => {
+      void startSession(storeId, { continuingPairing: true }).catch((err) =>
+        logger.error({ err, storeId }, 'whatsapp: post-pairing reconnect failed'),
+      );
+    }, 500).unref?.();
     return;
   }
 
@@ -625,6 +754,10 @@ async function teardown(
   live.delete(session.storeId);
   await session.lock.release();
   if (!opts.keepState) {
+    // Both halves. The row is what the next process reads, `liveAuth` is what the next
+    // socket in this process reads; clearing only the row leaves the stale in-memory
+    // state winning and the re-pair picking up where the failed attempt left off.
+    forgetAuth(session.storeId);
     await baileysSessionRepo.clear(session.storeId).catch(() => undefined);
   }
   session.closing = false;
@@ -765,6 +898,7 @@ export function __resetLiveForTest(): void {
     s.closing = true;
   }
   live.clear();
+  liveAuth.clear();
   lastStatus.clear();
   subscribers.clear();
   lastInbound.clear();

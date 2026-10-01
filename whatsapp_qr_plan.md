@@ -854,3 +854,48 @@ more than a few `connecting` transitions suggest a loop. Expected run: `connecti
 loop. `whatsappModuleLoading.spec.ts` also asserts the seed is `initAuthCreds()` and that the
 `= {} as AuthenticationCreds` form is absent. Verified by mutation — restoring the bare-`{}` seed
 turns both new tests red, which is precisely how the bug survived the original suite.
+
+## 17. Post-deployment correction — the scan itself
+
+With §16 deployed the QR appeared and was scannable, but the phone sat on "Logging in…" and then
+reported *"Couldn't log in. Check your phone's internet connection and scan the QR code again."* The
+phone, its network, and its ISP were all fine; the message is WhatsApp's generic string for a failed
+server-side handshake.
+
+### 17.1 The reconnect threw away its own half-finished pairing
+
+`teardown()` + `startSession()` is how a transient close reconnects, and `startSession` rebuilt its
+auth state from the database. But the database trails the live socket: Signal key writes are debounced
+1s and batched behind `makeCacheableSignalKeyStore`, and `creds.update` only calls `void auth.flush()`
+(fire-and-forget). Between the scan and the debounce landing, the row describes a *different, older*
+device identity. The reconnect therefore re-handshook with keys that did not match what WhatsApp had
+just issued, and the pairing was rejected.
+
+The fix is a `liveAuth` map: in-process reconnects reuse the live auth state, the database stays the
+durable record for a redeploy, and only an explicit disconnect (or a rejected pairing) clears it.
+
+### 17.2 `515` is the post-pairing restart, not a transient failure
+
+Immediately after a successful scan WhatsApp closes with `515` and expects a reconnect using the newly
+issued credentials. It was being handled by the generic transient path, which (a) emitted
+`status: 'connecting'` — replacing the QR mid-scan with a spinner, precisely the "it failed" signal —
+and (b) reconnected from the stale row in §17.1. `515` is now its own branch: flush first, keep the
+status off `connecting`, reconnect in 500ms with the same auth.
+
+### 17.3 Rejected pairings were reported as a logout
+
+A `401` during pairing hit the terminal branch and told the merchant their number was logged out.
+There is nothing to unlink yet, so that sends them looking for a problem they do not have. The session
+now tracks `awaitingScan` (first QR until `open`) and distinguishes the two: a rejected pairing is an
+`error` reading "WhatsApp rejected this pairing", and its unusable half-handshake is cleared so the
+next attempt starts clean. The test asserts a `401` after `open` is *still* a logout, which is why the
+check is `awaitingScan` and not `phone` — `phone` is null during a restored session's first handshake.
+
+### 17.4 QR refresh, timeouts, and diagnostics
+
+- Baileys re-emits a QR when the previous one expires; the handler now forwards every one instead of
+  only the first, so the merchant is never scanning a stale image.
+- `connectTimeoutMs` raised to 60s and `keepAliveIntervalMs` set to 25s: the default 20s handshake
+  timeout is tight on a cold Render start and on a shared NAT.
+- Every close now logs `reason`, `awaitingScan`, `phone`, and `attempts`, so the next report can be
+  diagnosed from the server side rather than from WhatsApp's misleading phone message.
