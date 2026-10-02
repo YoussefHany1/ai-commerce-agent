@@ -80,6 +80,10 @@ export default function AutomationPage() {
     .map((k) => k.trim())
     .filter(Boolean);
 
+  // Mirrors EVENT_TRIGGERS in src/services/automation.ts. A cooldown on a discrete event
+  // means the first occurrence silences the next one, which is why the engine ignores it.
+  const isEventTrigger = draft.triggerType === 'order_placed';
+
   const missingRequirement = !draft.message.trim()
     ? 'Write the message to send.'
     : draft.triggerType === 'keyword' && keywordList.length === 0
@@ -366,14 +370,25 @@ export default function AutomationPage() {
           </div>
 
           <div className="grid grid-cols-2 gap-4">
-            <Input
-              label="Cooldown (minutes)"
-              type="number"
-              min={1}
-              max={43200}
-              value={draft.cooldownMinutes}
-              onChange={(e) => setDraft((d) => ({ ...d, cooldownMinutes: e.target.value }))}
-            />
+            {isEventTrigger ? (
+              <div className="flex flex-col justify-center rounded-lg border border-dashed border-slate-300 px-3 py-2 dark:border-slate-700">
+                <span className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                  Cooldown: not applicable
+                </span>
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  Each order is its own event and is sent once.
+                </span>
+              </div>
+            ) : (
+              <Input
+                label="Cooldown (minutes)"
+                type="number"
+                min={1}
+                max={43200}
+                value={draft.cooldownMinutes}
+                onChange={(e) => setDraft((d) => ({ ...d, cooldownMinutes: e.target.value }))}
+              />
+            )}
             <Input
               label="Lookback (hours)"
               type="number"
@@ -384,8 +399,17 @@ export default function AutomationPage() {
             />
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            <b>Cooldown</b>: minimum time between nudges for the same customer.{' '}
-            <b>Lookback</b>: how far back the engine scans for matching triggers.
+            {isEventTrigger ? (
+              <>
+                <b>Lookback</b>: how far back the engine scans for matching triggers. Every
+                matching order is messaged, and an order is never messaged twice.
+              </>
+            ) : (
+              <>
+                <b>Cooldown</b>: minimum time between nudges for the same customer.{' '}
+                <b>Lookback</b>: how far back the engine scans for matching triggers.
+              </>
+            )}
           </p>
           {missingRequirement && (
             <p className="text-xs text-amber-600 dark:text-amber-400">{missingRequirement}</p>

@@ -141,7 +141,18 @@ export function RuleCard({ rule, onToggle, onDelete, disabled, toggling }: RuleC
       <div className="mt-3.5 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-slate-500 dark:text-slate-400">
         <span className="flex items-center gap-1.5">
           <Clock className="h-3.5 w-3.5" />
-          Cooldown: <b className="font-semibold text-slate-700 dark:text-slate-200">{rule.cooldownMinutes} min</b>
+          {rule.triggerType === 'order_placed' ? (
+            <>
+              Cadence: <b className="font-semibold text-slate-700 dark:text-slate-200">every order</b>
+            </>
+          ) : (
+            <>
+              Cooldown:{' '}
+              <b className="font-semibold text-slate-700 dark:text-slate-200">
+                {rule.cooldownMinutes} min
+              </b>
+            </>
+          )}
         </span>
         <span className="flex items-center gap-1.5">
           <AlarmClock className="h-3.5 w-3.5" />

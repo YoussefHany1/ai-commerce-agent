@@ -88,6 +88,31 @@ describe('isInCooldown', () => {
     const r = rule({ lastFiredAt: new Date('2026-01-01T00:00:00Z'), cooldownMinutes: 1440 });
     expect(isInCooldown(r, now)).toBe(false);
   });
+
+  it('never cools down an order_placed rule, so the next order is not swallowed', () => {
+    // The regression behind "order placed never fires": a rule-level cooldown made the
+    // first order consume a 24h window (the UI default) and silently dropped every order
+    // after it, while per-order dedupe in automation_logs already prevented repeats.
+    const now = new Date('2026-01-01T23:59:59Z');
+    const r = rule({
+      triggerType: 'order_placed',
+      lastFiredAt: new Date('2026-01-01T23:59:58Z'),
+      cooldownMinutes: 1440,
+    });
+    expect(isInCooldown(r, now)).toBe(false);
+  });
+
+  it('still cools down a condition-style trigger', () => {
+    // inactive_conversation re-matches for as long as the customer stays quiet, so
+    // cooldown is the thing preventing the same person being pinged every 30 seconds.
+    const now = new Date('2026-01-02T00:00:00Z');
+    const r = rule({
+      triggerType: 'inactive_conversation',
+      lastFiredAt: new Date('2026-01-01T23:00:00Z'),
+      cooldownMinutes: 1440,
+    });
+    expect(isInCooldown(r, now)).toBe(true);
+  });
 });
 
 describe('matchesKeyword', () => {

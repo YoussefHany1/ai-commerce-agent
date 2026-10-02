@@ -48,7 +48,21 @@ export function renderTemplate(template: string, data: Record<string, unknown>):
   });
 }
 
+/**
+ * Triggers that describe a discrete event rather than a standing condition.
+ *
+ * `order_placed` is one: each order is its own occurrence, and the `automation_logs`
+ * claim already dedupes per order id, so every unmatched order stays eligible. Applying
+ * a rule-level cooldown made the FIRST order consume a window and silently drop every
+ * order after it — with the 1440-minute UI default, a store that took one order was
+ * deaf to the next for 24 hours, and a repeat customer was thanked exactly once.
+ * Cooldown is meaningful for `inactive_conversation` and `clicked_no_conversion`, where
+ * the same person keeps re-matching for as long as they stay in that state.
+ */
+const EVENT_TRIGGERS = new Set(['order_placed']);
+
 export function isInCooldown(rule: AutomationRule, now = new Date()): boolean {
+  if (EVENT_TRIGGERS.has(rule.triggerType)) return false;
   if (!rule.lastFiredAt) return false;
   const minutes = (now.getTime() - new Date(rule.lastFiredAt).getTime()) / 60_000;
   return minutes < rule.cooldownMinutes;
