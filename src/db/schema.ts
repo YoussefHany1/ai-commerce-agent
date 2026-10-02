@@ -393,6 +393,14 @@ export const automationLogs = pgTable(
      */
     dedupeScope: text('dedupe_scope'),
     dedupeKey: uuid('dedupe_key'),
+    /**
+     * Delivery attempts made for this claim. A transient failure (the transport was
+     * down, WhatsApp was reconnecting) must not block the order forever: `claim`
+     * reclaims a `failed` row while `attempts < AUTOMATION_LOG_MAX_ATTEMPTS`, spacing
+     * retries with backoff measured from `lastAttemptAt`.
+     */
+    attempts: integer('attempts').notNull().default(0),
+    lastAttemptAt: timestamp('last_attempt_at', { withTimezone: true }),
     createdAt: ts(),
   },
   (t) => [

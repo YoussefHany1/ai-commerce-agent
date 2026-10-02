@@ -12,6 +12,7 @@ let storeRepo: typeof import('../db/repos.js').storeRepo;
 let clientRepo: typeof import('../db/repos.js').clientRepo;
 let catalogRepo: typeof import('../db/repos.js').catalogRepo;
 let connectionRepo: typeof import('../db/repos.js').connectionRepo;
+let automationRepo: typeof import('../db/repos.js').automationRepo;
 let withTenant: typeof import('../db/client.js').withTenant;
 let products: typeof import('../db/schema.js').products;
 let createSession: typeof import('../lib/session.js').createSession;
@@ -40,6 +41,7 @@ async function loadModules() {
     clientRepo = repos.clientRepo;
     catalogRepo = repos.catalogRepo;
     connectionRepo = repos.connectionRepo;
+    automationRepo = repos.automationRepo;
     products = schema.products;
     createSession = session.createSession;
     getSession = session.getSession;
@@ -294,5 +296,46 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
     const bumped = await bumpOperatorSessionEpoch();
     expect(bumped).not.toBe(first);
     await expect(ensureOperatorSessionEpoch()).resolves.toBe(bumped);
+  });
+
+  it('reclaims a failed automation claim after backoff, but never a sent one', async () => {
+    // Regression: dedupe used to be absolute. A transient send failure (no WhatsApp
+    // transport yet, mid-reconnect) left the failed row owning
+    // (store_id, rule_id, dedupe_key), so claim's ON CONFLICT DO NOTHING returned null on
+    // every later tick and the order was never retried. A poll trigger keeps selecting
+    // the order, so the fix is to let claim reclaim a failed row a bounded number of
+    // times, while a delivered (sent) row must still conflict so it is never resent.
+    const s = await storeRepo.create({ name: 'RETRY', platform: 'shopify', shopDomain: 'retry.myshopify.com' });
+    createdStores.push(s);
+    const ruleId = await automationRepo.create(s, {
+      triggerType: 'order_placed',
+      action: { type: 'whatsapp_text', text: 'Thanks!' },
+    });
+    const key = crypto.randomUUID();
+    const claim = () =>
+      automationRepo.claim(s, ruleId, 'order_placed', null, 'whatsapp', { scope: 'conversation', key });
+
+    const first = await claim();
+    expect(first).toBeTruthy();
+
+    await automationRepo.complete(s, first!, 'failed', null, 'send_failed');
+    // Still inside the backoff window: the row must not be reclaimed yet.
+    await expect(claim()).resolves.toBeNull();
+
+    // Once the backoff has elapsed, the failed row is reclaimed and its attempt counted.
+    await admin!`update automation_logs set last_attempt_at = now() - interval '1 hour' where id = ${first}`;
+    await expect(claim()).resolves.toBe(first);
+    const [retried] = await admin!`select attempts, status from automation_logs where id = ${first}`;
+    expect(retried.attempts).toBe(1);
+    expect(retried.status).toBe('pending');
+
+    // A sent row is terminal: backdating must not make it resend.
+    await automationRepo.complete(s, first!, 'sent', 'Thanks!', null);
+    await admin!`update automation_logs set last_attempt_at = now() - interval '1 hour' where id = ${first}`;
+    await expect(claim()).resolves.toBeNull();
+
+    // At the attempt cap the claim is abandoned rather than retried forever.
+    await admin!`update automation_logs set status = 'failed', attempts = 5, last_attempt_at = now() - interval '1 hour' where id = ${first}`;
+    await expect(claim()).resolves.toBeNull();
   });
 });

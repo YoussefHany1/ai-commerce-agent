@@ -1,4 +1,4 @@
-import { and, count, desc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, isNull, lt, or, sql, type SQL } from 'drizzle-orm';
 import { withClient, withOperator, withTenant, type Db } from './client.js';
 import { encryptPii, decryptPii } from '../services/pii.js';
 import {
@@ -1178,6 +1178,15 @@ export const eventRepo = {
   },
 };
 
+/**
+ * How many delivery attempts a single automation claim may make before it is abandoned.
+ *
+ * The first send is attempt 0; each reclaim of a failed row increments the count. Five
+ * attempts with the backoff in `claim` (30s, 1m, 2m, 4m, 8m, capped at 30m) ride out a
+ * transport that is briefly down without retrying an undeliverable number forever.
+ */
+export const AUTOMATION_LOG_MAX_ATTEMPTS = 5;
+
 export const automationRepo = {
   async create(storeId: string, input: { triggerType: string; triggerConfig?: AutomationTriggerConfig; action: AutomationAction; enabled?: boolean; cooldownMinutes?: number; lookbackHours?: number }): Promise<string> {
     return withTenant(storeId, async (tx) => {
@@ -1260,6 +1269,14 @@ export const automationRepo = {
    * `conversationId` is nullable because a poll trigger can now reach a customer who
    * has never been messaged and therefore has no conversation yet. `automation_logs.
    * conversation_id` is already nullable in the schema; the parameter was not.
+   *
+   * A `failed` row is reclaimable. Dedupe used to be absolute: a transient failure (no
+   * transport yet, WhatsApp mid-reconnect) left the row owning the key, so `ON CONFLICT
+   * DO NOTHING` returned no id on every later tick and the order was never retried. The
+   * upsert now flips a failed row back to `pending`, bumps `attempts`, and stamps
+   * `lastAttemptAt`, but only while `attempts < AUTOMATION_LOG_MAX_ATTEMPTS` and only
+   * once the backoff window since the last attempt has elapsed. A `sent` row still
+   * conflicts, so a delivered message is never resent.
    */
   async claim(
     storeId: string,
@@ -1275,7 +1292,23 @@ export const automationRepo = {
       const [row] = await tx
         .insert(automationLogs)
         .values({ storeId, ruleId, triggerType, conversationId, channel, status: 'pending', dedupeScope, dedupeKey })
-        .onConflictDoNothing({ target: [automationLogs.storeId, automationLogs.ruleId, automationLogs.dedupeKey] })
+        .onConflictDoUpdate({
+          target: [automationLogs.storeId, automationLogs.ruleId, automationLogs.dedupeKey],
+          set: {
+            status: 'pending',
+            attempts: sql`${automationLogs.attempts} + 1`,
+            lastAttemptAt: new Date(),
+            conversationId,
+            channel,
+            triggerType,
+            error: null,
+          },
+          setWhere: and(
+            eq(automationLogs.status, 'failed'),
+            lt(automationLogs.attempts, AUTOMATION_LOG_MAX_ATTEMPTS),
+            sql`(${automationLogs.lastAttemptAt} IS NULL OR ${automationLogs.lastAttemptAt} <= now() - least(interval '30 seconds' * power(2, ${automationLogs.attempts}), interval '30 minutes'))`,
+          ),
+        })
         .returning({ id: automationLogs.id });
       return row?.id ?? null;
     });
@@ -1283,7 +1316,10 @@ export const automationRepo = {
 
   async complete(storeId: string, logId: string, status: string, body: string | null, error: string | null): Promise<void> {
     await withTenant(storeId, (tx) =>
-      tx.update(automationLogs).set({ status, body, error }).where(eq(automationLogs.id, logId)),
+      tx
+        .update(automationLogs)
+        .set({ status, body, error, lastAttemptAt: new Date() })
+        .where(eq(automationLogs.id, logId)),
     );
   },
 
