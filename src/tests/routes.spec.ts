@@ -633,6 +633,47 @@ describe('routes: platform webhooks', () => {
     expect(services.webhookApply.applyWebhook).toHaveBeenCalledWith('shopify', expect.objectContaining({ type: 'app/uninstalled' }), 's-web');
   });
 
+  it('answers 200 for an uninstall whose store is already gone', async () => {
+    // 404 made Shopify retry an uninstall that had already reached its desired end state,
+    // each retry failing the same way against a store that no longer existed.
+    mocks.storeRepo.byRef.mockResolvedValue(null);
+    mocks.eventRepo.record.mockResolvedValue(true);
+    const body = JSON.stringify({ id: 42 });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/shopify',
+      headers: {
+        'content-type': 'application/json',
+        'x-shopify-hmac-sha256': shopifyHmac(body),
+        'x-shopify-topic': 'app/uninstalled',
+        'x-shopify-shop-domain': 'gone.myshopify.com',
+      },
+      payload: body,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ alreadyRemoved: true });
+    expect(services.webhookApply.applyWebhook).not.toHaveBeenCalled();
+  });
+
+  it('still 404s a non-uninstall webhook for an unknown store', async () => {
+    // Only the uninstall is safe to swallow: an order for a store we cannot resolve is a
+    // real missed order, and answering 200 would tell Shopify the delivery succeeded.
+    mocks.storeRepo.byRef.mockResolvedValue(null);
+    const body = JSON.stringify({ id: 42 });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/shopify',
+      headers: {
+        'content-type': 'application/json',
+        'x-shopify-hmac-sha256': shopifyHmac(body),
+        'x-shopify-topic': 'orders/create',
+        'x-shopify-shop-domain': 'unknown.myshopify.com',
+      },
+      payload: body,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
   it('returns duplicate for an already-recorded event with no side effects', async () => {
     mocks.storeRepo.byRef.mockImplementation(async () => ({ id: 's-web' }));
     mocks.eventRepo.record.mockResolvedValue(false);

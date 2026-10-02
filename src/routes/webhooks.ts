@@ -31,7 +31,14 @@ export async function webhooks(app: FastifyInstance) {
 
     const event = extractEvent(p, raw, req.headers as Record<string, string | string[] | undefined>, body);
     const store = event.storeRef ? await storeRepo.byRef(event.storeRef, p) : null;
-    if (!store) throw Object.assign(new Error('store_not_found'), { statusCode: 404 });
+    if (!store) {
+      // An uninstall whose store is already gone is the desired end state, so answer 2xx.
+      // Returning 404 made Shopify retry the same uninstall several times against a store
+      // that no longer existed — every retry failed identically, so nothing changed except
+      // noise in the logs and delivery attempts against a dead shop.
+      if (event.type === 'app/uninstalled') return { received: true, alreadyRemoved: true };
+      throw Object.assign(new Error('store_not_found'), { statusCode: 404 });
+    }
 
     const recorded = await eventRepo.record({
       storeId: store.id,

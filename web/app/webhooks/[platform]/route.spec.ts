@@ -53,6 +53,33 @@ describe('POST /webhooks/[platform]', () => {
     expect(String(fetchMock.mock.calls[0]![0])).toBe('http://api.test/webhooks/salla?tenant=7');
   });
 
+  test('forwards the topic and shop domain, not just the signature', async () => {
+    // The regression: only the HMAC was relayed. The API identifies an event by
+    // `x-shopify-topic` and resolves the store by `x-shopify-shop-domain`, 404ing on
+    // `store_not_found` without the latter. So every webhook arrived as an unknown-topic
+    // event for no store, and `app/uninstalled` never reached the handler that deletes the
+    // store — which is why a store deleted in Shopify still read as connected.
+    await POST(
+      new Request('http://localhost:3001/webhooks/shopify', {
+        method: 'POST',
+        body: '{}',
+        headers: {
+          'content-type': 'application/json',
+          'x-shopify-hmac-sha256': 'sig-abc',
+          'x-shopify-topic': 'app/uninstalled',
+          'x-shopify-shop-domain': 'demo.myshopify.com',
+          'x-shopify-webhook-id': 'wh-1',
+        },
+      }),
+      params('shopify'),
+    );
+
+    const headers = fetchMock.mock.calls[0]![1]!.headers as Record<string, string>;
+    expect(headers['x-shopify-topic']).toBe('app/uninstalled');
+    expect(headers['x-shopify-shop-domain']).toBe('demo.myshopify.com');
+    expect(headers['x-shopify-webhook-id']).toBe('wh-1');
+  });
+
   test('sends no session credential — the HMAC is the authenticator', async () => {
     await POST(
       new Request('http://localhost:3001/webhooks/shopify', { method: 'POST', body: '{}' }),

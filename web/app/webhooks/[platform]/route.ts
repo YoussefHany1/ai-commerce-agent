@@ -42,8 +42,28 @@ export async function POST(
   // authenticator, so attaching a dashboard session would only widen what is trusted.
   const body = await request.text();
   const headers: Record<string, string> = { 'content-type': request.headers.get('content-type') ?? 'application/json' };
-  const hmac = request.headers.get('x-shopify-hmac-sha256');
-  if (hmac) headers['x-shopify-hmac-sha256'] = hmac;
+
+  // The HMAC alone says "this payload is authentic", not "what happened" or "for which
+  // store". The API reads `x-shopify-topic` for the event type and `x-shopify-shop-domain`
+  // to resolve the store, and 404s on `store_not_found` when the domain header is absent.
+  // Relaying only the signature therefore made every webhook an unknown-topic event for
+  // no store: order sync stopped updating live, and `app/uninstalled` never reached its
+  // handler, so a store the merchant had deleted in Shopify still showed as connected in
+  // the dashboard. Forward the whole identifying set, plus Salla's equivalent header.
+  const forwarded = [
+    'x-shopify-hmac-sha256',
+    'x-shopify-topic',
+    'x-shopify-shop-domain',
+    'x-shopify-webhook-id',
+    'x-shopify-triggered-at',
+    'x-shopify-api-version',
+    'x-hub-signature-256',
+    'x-hub-signature',
+  ];
+  for (const name of forwarded) {
+    const v = request.headers.get(name);
+    if (v) headers[name] = v;
+  }
 
   try {
     const res = await fetch(upstream, { method: 'POST', headers, body, cache: 'no-store' });
