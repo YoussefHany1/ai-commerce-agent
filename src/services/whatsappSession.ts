@@ -171,6 +171,25 @@ const RETRYABLE_REASONS = new Set<number>([408, 428, 500, 503, 515]);
  */
 const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 60_000];
 
+/**
+ * How long a socket may sit without reaching `open` before it is recycled.
+ *
+ * A restored registered session emits `connecting` and then, on a wedged handshake,
+ * nothing at all — no `open`, no `close`, no error. Nothing in the Baileys event model
+ * fires, so without this the row is stamped `connecting` forever, `sendText` refuses
+ * every message, and the dashboard shows a spinner that never resolves. This must exceed
+ * Baileys' own `connectTimeoutMs` (60s) so a normal close gets to run its own path first.
+ */
+export const CONNECT_WATCHDOG_MS = 90_000;
+
+/**
+ * Consecutive watchdog recycles per store, so the retry backoff grows across them.
+ *
+ * Process-local and reset on `open`. The per-session `attempts` counter cannot serve
+ * here because recycling tears the session down and discards it.
+ */
+const connectFailures = new Map<string, number>();
+
 /** Lease TTL for socket ownership. Renewed while the session lives. */
 const LEASE_TTL_MS = 60_000;
 const LEASE_NAME = 'whatsapp:baileys';
@@ -211,6 +230,8 @@ type LiveSession = {
   phone: string | null;
   attempts: number;
   closing: boolean;
+  /** Fires if the socket never reaches `open`; cleared on `open` and in `teardown`. */
+  connectTimer: NodeJS.Timeout | null;
   /**
    * Kept so a reconnect reuses the *live* Signal store rather than re-reading the
    * database. See the note on `liveAuth`.
@@ -534,6 +555,7 @@ export async function startSession(
     phone: null,
     attempts: 0,
     closing: false,
+    connectTimer: null,
     auth,
     awaitingScan: false,
   };
@@ -549,7 +571,54 @@ export async function startSession(
   emit(storeId, { type: 'status', status: initialStatus });
 
   wireSocket(session, auth);
+  armConnectWatchdog(session);
   return { resumed: false };
+}
+
+/**
+ * Recycles a socket that never reached `open`.
+ *
+ * Restoring a paired session is the path this exists for: the socket is handed restored
+ * credentials, emits `connecting`, and on a wedged handshake never emits anything again.
+ * There is no event to react to, so the only signal is absence — a timer. On expiry the
+ * socket is torn down and a fresh one is started, with the backoff growing per
+ * consecutive failure just like a transient disconnect.
+ */
+function armConnectWatchdog(session: LiveSession): void {
+  if (session.connectTimer) clearTimeout(session.connectTimer);
+  session.connectTimer = setTimeout(() => {
+    session.connectTimer = null;
+    // A scan can legitimately take minutes, and a live socket is obviously fine.
+    if (session.closing || session.status === 'open' || session.awaitingScan) return;
+    const { storeId } = session;
+    const failures = (connectFailures.get(storeId) ?? 0) + 1;
+    connectFailures.set(storeId, failures);
+    logger.error(
+      { storeId, status: session.status, failures },
+      'whatsapp: socket never opened within the watchdog window; recycling',
+    );
+    const delay = backoffFor(failures - 1);
+    void (async () => {
+      await moveToConnecting(session, 'connection did not open in time');
+      await teardown(session, { logout: false, keepState: true });
+      setTimeout(() => {
+        void startSession(storeId).catch((err) =>
+          logger.error({ err, storeId }, 'whatsapp: watchdog restart failed'),
+        );
+      }, delay).unref?.();
+    })();
+  }, CONNECT_WATCHDOG_MS);
+  session.connectTimer.unref?.();
+}
+
+/** Records a `connecting` transition (in memory and Postgres) and notifies subscribers. */
+async function moveToConnecting(session: LiveSession, lastError: string): Promise<void> {
+  session.status = 'connecting';
+  lastStatus.set(session.storeId, 'connecting');
+  await baileysSessionRepo
+    .setStatus(session.storeId, 'connecting', { lastError })
+    .catch(() => undefined);
+  emit(session.storeId, { type: 'status', status: 'connecting', error: lastError });
 }
 
 async function createSocket(opts: { auth: AuthState; storeId: string }): Promise<SocketLike> {
@@ -667,10 +736,17 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
   if (update.connection === 'open') {
     session.attempts = 0;
     session.awaitingScan = false;
+    if (session.connectTimer) {
+      clearTimeout(session.connectTimer);
+      session.connectTimer = null;
+    }
+    connectFailures.delete(storeId);
     const phone = normalizeJid((auth.creds as { me?: { id?: string } } | undefined)?.me?.id ?? null);
     session.phone = phone;
     await auth.flush();
-    await move('open', { phone });
+    // Clearing `lastError` matters: a watchdog recycle stamps one, and without this a
+    // session that recovered would keep showing "connection did not open in time".
+    await move('open', { phone, lastError: null });
     emit(storeId, { type: 'status', status: 'open', phone });
     // `creds.registered` is not a health signal: Baileys only sets it at the end of
     // companion pairing and never clears it, so an established session reports false
@@ -781,6 +857,10 @@ async function teardown(
 ): Promise<void> {
   session.closing = true;
   clearInterval(session.leaseTimer);
+  if (session.connectTimer) {
+    clearTimeout(session.connectTimer);
+    session.connectTimer = null;
+  }
   try {
     if (opts.logout) await session.socket.logout?.();
     else session.socket.end();
@@ -949,6 +1029,7 @@ export async function restoreAllSessions(): Promise<void> {
 export function __resetLiveForTest(): void {
   for (const s of live.values()) {
     clearInterval(s.leaseTimer);
+    if (s.connectTimer) clearTimeout(s.connectTimer);
     s.closing = true;
   }
   live.clear();
@@ -956,4 +1037,5 @@ export function __resetLiveForTest(): void {
   lastStatus.clear();
   subscribers.clear();
   lastInbound.clear();
+  connectFailures.clear();
 }

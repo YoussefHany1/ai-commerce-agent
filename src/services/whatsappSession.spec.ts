@@ -467,6 +467,47 @@ describe('connection lifecycle', () => {
     expect(lock.acquireLock).toHaveBeenCalled();
   });
 
+  test('a socket that never opens is recycled instead of wedging the session forever', async () => {
+    // The restored-session wedge: `connecting` is emitted, then nothing — no open, no
+    // close, no error. Every send is refused and the row sits on `connecting` forever.
+    vi.useFakeTimers();
+    const created: Array<ReturnType<typeof fakeSocket>> = [];
+    session.__setSocketFactory(() => {
+      const s = fakeSocket();
+      created.push(s);
+      return s;
+    });
+    await session.startSession(STORE);
+    expect(created).toHaveLength(1);
+    created[0].emit('connection.update', { connection: 'connecting' });
+    await vi.advanceTimersByTimeAsync(session.CONNECT_WATCHDOG_MS + 5_000);
+    // The silent socket was torn down and a fresh one built from the same stored pairing.
+    expect(created[0].ended).toBe(true);
+    expect(created.length).toBeGreaterThan(1);
+    expect(session.isLive(STORE)).toBe(true);
+  });
+
+  test('the watchdog stands down once the socket opens', async () => {
+    vi.useFakeTimers();
+    await session.startSession(STORE);
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(session.statusFor(STORE)).toBe('open');
+    await vi.advanceTimersByTimeAsync(session.CONNECT_WATCHDOG_MS + 5_000);
+    expect(socket.ended).toBe(false);
+    expect(session.statusFor(STORE)).toBe('open');
+  });
+
+  test('a pairing QR suppresses the watchdog, because a scan may take minutes', async () => {
+    vi.useFakeTimers();
+    await session.startSession(STORE);
+    socket.emit('connection.update', { qr: 'BASE64QR' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(session.statusFor(STORE)).toBe('qr');
+    await vi.advanceTimersByTimeAsync(session.CONNECT_WATCHDOG_MS + 5_000);
+    expect(socket.ended).toBe(false);
+  });
+
   test('end() is used for a transient drop, never logout()', async () => {
     vi.useFakeTimers();
     await session.startSession(STORE);
