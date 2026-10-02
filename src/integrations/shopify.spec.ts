@@ -1,5 +1,12 @@
-import { describe, expect, test, vi, afterEach } from 'vitest';
+import { describe, expect, test, vi, afterEach, beforeEach } from 'vitest';
 import { ShopifyAdapter, mapShopifyOrderNode } from './shopify.js';
+import { logger } from '../lib/logger.js';
+
+vi.mock('../lib/logger.js', () => ({ logger: { error: vi.fn(), info: vi.fn(), warn: vi.fn() } }));
+
+beforeEach(() => {
+  vi.mocked(logger.warn).mockClear();
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -246,6 +253,42 @@ describe('shopify customer scope fallback', () => {
     expect(orders[0]?.customer?.phone).toBeUndefined();
     expect(queries).toHaveLength(2);
     expect(queries[1]).not.toContain('customer{');
+  });
+
+  test('warns that orders will sync without a customer, so a dead automation is diagnosable', async () => {
+    // The silent part of this fallback is what made an `order_placed` rule look broken:
+    // sync reported success, every order had a null customer, and the rule matched
+    // nothing because there was no phone to send to. Nobody could tell from the logs.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as { query: string };
+        if (body.query.includes('customer{')) {
+          return { ok: true, async json() { return { errors: CUSTOMER_DENIED }; } } as Response;
+        }
+        return {
+          ok: true,
+          async json() {
+            return {
+              data: {
+                orders: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [{ ...orderNode({ id: 'kept' }), customer: undefined }],
+                },
+              },
+            };
+          },
+        } as Response;
+      }),
+    );
+
+    await new ShopifyAdapter('demo.myshopify.com', 'tok').listOrders();
+
+    expect(logger.warn).toHaveBeenCalled();
+    const [payload, msg] = vi.mocked(logger.warn).mock.calls[0] as [{ shop: string }, string];
+    expect(payload.shop).toBe('demo.myshopify.com');
+    expect(msg).toMatch(/read_customers/);
+    expect(msg).toMatch(/order_placed/);
   });
 
   test('drops the field for the rest of the process once the scope is known missing', async () => {

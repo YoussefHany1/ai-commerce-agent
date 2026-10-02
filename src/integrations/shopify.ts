@@ -1,5 +1,6 @@
 import { CommerceAdapter, Product, Order } from '../types.js';
 import { fetchWithTimeout, LONG_TIMEOUT_MS } from '../lib/http.js';
+import { logger } from '../lib/logger.js';
 
 /**
  * Shared by getOrder and the listOrders backfill so both produce an identical
@@ -79,15 +80,21 @@ export class ShopifyAdapter implements CommerceAdapter {
     return `id createdAt displayFinancialStatus displayFulfillmentStatus currentTotalPriceSet{shopMoney{amount currencyCode}}${customer}`;
   }
 
-  /**
+/**
    * Runs an order query, dropping the `customer` selection and retrying once if
    * the token turns out not to be allowed to read it.
    *
    * The fallback keeps revenue and order counts intact and only drops phone and
    * email, which `markConversationsForOrder` uses to attribute a sale to a
-   * conversation. Trading conversion attribution for the entire order history is
-   * a good deal, and a merchant who re-authorises with the wider scope gets the
+   * conversation. Trading conversion attribution for the entire order history is a
+   * good deal, and a merchant who re-authorises with the wider scope gets the
    * customer fields back automatically.
+   *
+   * The downgrade is logged at warn, not debug. Silence here is what made an
+   * `order_placed` automation look broken: the token came back `ACCESS_DENIED` for
+   * `read_customers`, every order synced "successfully" with a null customer, and the
+   * rule then matched nothing because there was no phone to send to. Sync reporting
+   * success while the only field the product needs was dropped is worth shouting about.
    */
   private async gqlOrderQuery(
     build: (withCustomer: boolean) => string,
@@ -98,7 +105,14 @@ export class ShopifyAdapter implements CommerceAdapter {
     } catch (err) {
       if (this.customerScopeDenied || !deniesCustomerField(err)) throw err;
       this.customerScopeDenied = true;
-      return await this.gql(build(false), variables);
+      logger.warn(
+        {
+          shop: this.shop,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'shopify: token cannot read customer fields; orders will sync WITHOUT customer phone and email. Re-authorise the app with the read_customers scope to restore them. Any automation that messages a customer (e.g. order_placed) will match no candidates until then.',
+      );
+return await this.gql(build(false), variables);
     }
   }
 

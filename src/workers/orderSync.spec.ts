@@ -137,6 +137,20 @@ describe('runOrderSync', () => {
     expect(res.cursor).toBe(newestIso);
   });
 
+  test('re-reads all history when asked to backfill from the epoch', async () => {
+    // Orders synced while the token lacked read_customers landed with a null customer.
+    // Re-syncing from the epoch is how those rows get their phone back, and the upsert
+    // is conflict-safe, so this refreshes in place rather than duplicating.
+    const { runOrderSync, listOrders } = await load({
+      cursor: new Date('2026-03-04T12:00:00Z'),
+      orders: [order('old', '2025-01-01T00:00:00Z')],
+    });
+    await runOrderSync('s1', { since: new Date(0) });
+    // No `since` at all is what tells listOrders to ignore the cursor entirely; passing
+    // the epoch Date straight through would filter for orders created since 1970 anyway.
+    expect(listOrders).toHaveBeenCalledWith(expect.objectContaining({ since: undefined }));
+  });
+
   test('rolls up the span the backfill touched, measured back from today', async () => {
     const sixDaysAgo = new Date(Date.now() - 6 * 86_400_000).toISOString();
     const { runOrderSync, analytics } = await load({

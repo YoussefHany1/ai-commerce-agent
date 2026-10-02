@@ -239,6 +239,58 @@ describe('executeRule with no prior conversation', () => {
     expect(out).toEqual({ sent: 0, failed: 0 });
     expect(mocks.sendText).not.toHaveBeenCalled();
   });
+
+  it('announces a fixed-recipient order rule once, not once per tick', async () => {
+    // A first-time order has no conversation, and the fallback used to mint a random uuid
+    // per evaluation. dedupe_key is unique per (store, rule, key), so a fresh key always
+    // looked new: the merchant was sent the same "new order" alert every 30s for the whole
+    // 72h lookback window.
+    stubQuery([orderRow()]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+
+    await executeRule(
+      'store1',
+      rule({ triggerType: 'order_placed', action: { type: 'whatsapp_number', phone: '966500000001', text: 'order!' } }),
+    );
+
+    const key = mocks.automationRepo.claim.mock.calls[0]![5] as { key: string };
+    expect(key.key).toBe('order-1');
+    expect(mocks.sendText).toHaveBeenCalledWith('966500000001', 'order!', { phoneNumberId: 'pn1' });
+  });
+
+  it('routes a keyword rule to its configured number, not to the customer who typed it', async () => {
+    // A merchant alerting a shared inbox would otherwise get their own alert bounced back
+    // to the shopper who happened to say the keyword.
+    mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([
+      rule({
+        triggerType: 'keyword',
+        triggerConfig: { keywords: ['urgent'] },
+        action: { type: 'whatsapp_number', phone: '966500000009', text: 'ping' },
+      }),
+    ]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+    mocks.sendText.mockResolvedValue(true);
+
+    await runKeywordAutomation('store1', { conversationId: 'c1', messageId: 'm1', phone: '966599999999', text: 'urgent' });
+
+    expect(mocks.sendText).toHaveBeenCalledWith('966500000009', 'ping', { phoneNumberId: 'pn1' });
+    expect(mocks.sendText).not.toHaveBeenCalledWith('966599999999', expect.anything(), expect.anything());
+  });
+
+  it('claims a keyword reply with a valid uuid when the message has no id', async () => {
+    // dedupe_key is a uuid column. The old fallback built `"<conversationId>:<uuid>"`,
+    // which Postgres rejected outright, so a keyword reply threw instead of sending.
+    mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([
+      rule({ triggerType: 'keyword', triggerConfig: { keywords: ['urgent'] } }),
+    ]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+    mocks.sendText.mockResolvedValue(true);
+
+    await runKeywordAutomation('store1', { conversationId: 'c1', phone: '9665', text: 'urgent' });
+
+    const key = mocks.automationRepo.claim.mock.calls[0]![5] as { key: string };
+    expect(key.key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
 });
 
 describe('keywordsFor', () => {

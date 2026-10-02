@@ -1,4 +1,5 @@
 import { sql } from 'drizzle-orm';
+import { createHash } from 'node:crypto';
 import { withTenant } from '../db/client.js';
 import { automationRepo, conversationRepo, customerRepo, storeRepo, whatsappRepo } from '../db/repos.js';
 import { logger } from '../lib/logger.js';
@@ -228,6 +229,21 @@ async function deliverToCandidate(
   return sendOverBaileys(storeId, cand.phone, body);
 }
 
+/**
+ * A stable uuid for a claim that has no inbound message id to key on.
+ *
+ * `automation_logs.dedupe_key` is a uuid column, so a composite string like
+ * `"conv-1:9f8e..."` is not a valid uuid and Postgres rejects the entire insert. That
+ * turned a missing messageId into a thrown error on the inbound path rather than a
+ * sent reply. Folding the parts into one v5-shaped uuid keeps the key deterministic —
+ * the same conversation and rule produce the same key, which is the point of dedupe —
+ * and keeps the insert valid.
+ */
+function fallbackDedupeKey(conversationOrPhone: string, ruleId: string): string {
+  const hex = createHash('sha256').update(`${conversationOrPhone}:${ruleId}`).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
 /** Same transports as `deliverToCandidate`, but to a fixed number rather than a candidate. */
 async function deliverToNumber(
   storeId: string,
@@ -263,7 +279,11 @@ export async function executeRule(storeId: string, rule: AutomationRule): Promis
     const body = renderTemplate(action.text, { shopName });
     const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, 'whatsapp', {
       scope: 'conversation',
-      key: cand.conversationId ?? crypto.randomUUID(),
+      // Key on the same event the candidate was selected for. A first-time order has no
+      // conversation, and a fresh UUID each tick meant the claim always looked new — the
+      // merchant got the same "one" order message every 30 seconds for the whole lookback
+      // window. `dedupeKey` is the order id for order_placed, so this is stable per order.
+      key: cand.dedupeKey ?? cand.conversationId ?? crypto.randomUUID(),
     });
     if (!logId) return { sent: 0, failed: 0 };
     const ok = await deliverToNumber(storeId, action.phone, body, waChannel);
@@ -362,17 +382,31 @@ export async function runKeywordAutomation(
       productLink: null,
     };
 
-    const body = renderTemplate(rule.action.text, { customerName: cand.customerName, shopName });
+    // A keyword rule can be configured to notify a fixed number instead of replying to
+    // whoever typed the keyword. Routing every action through `deliverToCandidate` sent
+    // the merchant's own configured alert back to the customer who triggered it, which
+    // is the opposite of what the rule says to do.
+    const action = rule.action;
+    const fixedPhone = action.type === 'whatsapp_number' ? action.phone : null;
+    const body = renderTemplate(action.text, { customerName: cand.customerName, shopName });
+
     // Dedupe on the inbound message, not the conversation. Keying on the conversation made
     // a keyword rule answer each customer exactly once for the lifetime of the
     // conversation, so a repeat keyword fell through to the AI with no log at all.
+    //
+    // `dedupe_key` is a uuid column, so the no-messageId fallback cannot be a composite
+    // string: `"<conversationId>:<uuid>"` is not a uuid and Postgres rejected the whole
+    // insert, which made a keyword reply throw instead of being sent. Hash it into a
+    // real uuid instead.
     const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, 'whatsapp', {
       scope: 'message',
-      key: input.messageId ?? `${cand.conversationId}:${crypto.randomUUID()}`,
+      key: input.messageId ?? fallbackDedupeKey(cand.conversationId ?? input.phone, rule.id),
     });
     if (!logId) continue;
 
-    const ok = await deliverToCandidate(storeId, cand, body, waChannel);
+    const ok = fixedPhone
+      ? await deliverToNumber(storeId, fixedPhone, body, waChannel)
+      : await deliverToCandidate(storeId, cand, body, waChannel);
     await automationRepo.complete(storeId, logId, ok ? 'sent' : 'failed', ok ? body : null, ok ? null : 'send_failed');
     if (ok) await automationRepo.markFired(storeId, rule.id);
     return ok ? { ruleId: rule.id, body } : null;

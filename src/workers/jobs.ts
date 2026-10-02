@@ -52,7 +52,16 @@ export async function runOrderSync(storeId: string, opts: { since?: Date } = {})
   if (!adapter) throw new Error('no_connection');
 
   const cursor = opts.since ?? (await connectionRepo.getOrdersCursor(storeId));
-  const since = cursor ? new Date(cursor.getTime() - ORDER_OVERLAP_MS) : undefined;
+  // An explicit `since` of the epoch means "re-read everything", which is how a store
+  // backfills orders that synced while its token could not read customer fields. The
+  // upsert is conflict-safe, so re-reading history refreshes the customer columns in
+  // place rather than duplicating orders.
+  const since =
+    opts.since instanceof Date && opts.since.getTime() === 0
+      ? undefined
+      : cursor
+        ? new Date(cursor.getTime() - ORDER_OVERLAP_MS)
+        : undefined;
   const fetched = await adapter.listOrders({ since, limit: ORDER_PAGE_LIMIT });
 
   let maxPlacedAt: Date | null = cursor ?? null;

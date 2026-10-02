@@ -782,6 +782,14 @@ export const orderRepo = {
             paymentStatus: o.paymentStatus,
             total: o.total,
             currency: o.currency,
+            // The conflict set omitted customerId. An order first synced before the store
+            // token had `read_customers` had a null customer_id, and re-syncing after the
+            // scope was granted refreshed the denormalised name/phone/email below but left
+            // customer_id null forever — so the order stayed unlinked even once a customers
+            // row existed, and conversion attribution never recovered. Only overwrite with
+            // a real id: `customerRepo.upsert` returns null when there is no customer data
+            // at all, and blanking a working link would be worse than leaving it.
+            ...(customerId ? { customerId } : {}),
             customerName: o.customer?.name,
             customerPhone: o.customer?.phone,
             customerEmail: o.customer?.email,
