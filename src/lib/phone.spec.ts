@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { normalizeJid, toJid } from '../lib/phone.js';
+import { normalizeJid, toJid, parseJid, addressForSend } from '../lib/phone.js';
 
 /**
  * These helpers sit on the boundary between WhatsApp's address format and the bare
@@ -53,6 +53,13 @@ describe('normalizeJid', () => {
     expect(normalizeJid('966501234567')).toBeNull();
   });
 
+  test('reduces a LID to digits, which is a matching key and not a sendable address', () => {
+    // The regression that made keyword replies vanish: the rule fired, `sendMessage`
+    // resolved, `sent` was logged, and nothing arrived — because the digits were
+    // rebuilt as a phone-number JID the contact does not answer on.
+    expect(normalizeJid('51848895557795@lid')).toBe('51848895557795');
+  });
+
   test('rejects a non-numeric user, which must not become an empty phone', () => {
     expect(normalizeJid('abcdef@s.whatsapp.net')).toBeNull();
   });
@@ -96,5 +103,52 @@ describe('toJid', () => {
 
   test('rejects input with no digits at all', () => {
     expect(toJid('not-a-number')).toBeNull();
+  });
+});
+
+describe('parseJid', () => {
+  test('keeps a LID as a LID so the reply reaches the same identity', () => {
+    expect(parseJid('51848895557795@lid')).toEqual({
+      digits: '51848895557795',
+      jid: '51848895557795@lid',
+    });
+  });
+
+  test('normalises the legacy c.us suffix to s.whatsapp.net', () => {
+    expect(parseJid('966501234567@c.us')?.jid).toBe('966501234567@s.whatsapp.net');
+  });
+
+  test('strips a device suffix', () => {
+    expect(parseJid('966501234567:12@s.whatsapp.net')?.jid).toBe('966501234567@s.whatsapp.net');
+  });
+
+  test('rejects group and broadcast JIDs', () => {
+    expect(parseJid('123-456@g.us')).toBeNull();
+    expect(parseJid('1234567@broadcast')).toBeNull();
+  });
+});
+
+describe('addressForSend', () => {
+  test('sends a LID contact back to its LID, not to a phone-number JID', () => {
+    // The bug: both reduce to the same digits, and replying to the phone-number form
+    // of a LID-only contact is silently dropped by WhatsApp after a successful write.
+    expect(addressForSend('51848895557795@lid', '51848895557795')).toBe('51848895557795@lid');
+  });
+
+  test('prefers the known JID over the digits', () => {
+    expect(addressForSend('966501234567@s.whatsapp.net', '966501234567')).toBe('966501234567@s.whatsapp.net');
+  });
+
+  test('falls back to digits for contacts with no remembered JID', () => {
+    expect(addressForSend(null, '966501234567')).toBe('966501234567@s.whatsapp.net');
+  });
+
+  test('ignores an unusable stored JID rather than sending nowhere', () => {
+    expect(addressForSend('garbage', '966501234567')).toBe('966501234567@s.whatsapp.net');
+  });
+
+  test('returns null when there is nothing sendable', () => {
+    expect(addressForSend(null, null)).toBeNull();
+    expect(addressForSend('', '')).toBeNull();
   });
 });

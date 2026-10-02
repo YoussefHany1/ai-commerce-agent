@@ -9,7 +9,8 @@ const mocks = vi.hoisted(() => ({
   },
   storeRepo: { get: vi.fn(async () => ({ id: 'store1', name: 'Acme' })) },
   whatsappRepo: { byStore: vi.fn(async () => ({ phoneNumberId: 'pn1' })) },
-  conversationRepo: { addMessage: vi.fn() },
+  conversationRepo: { addMessage: vi.fn(), ensureOpen: vi.fn(async () => 'conv-new') },
+  customerRepo: { upsert: vi.fn(async () => 'cust-new') },
   sendText: vi.fn(async () => true),
   sendOverBaileys: vi.fn(async () => true),
   withTenant: vi.fn(async (_id: string, fn: (tx: unknown) => unknown) => fn({})),
@@ -20,12 +21,13 @@ vi.mock('../db/repos.js', () => ({
   storeRepo: mocks.storeRepo,
   whatsappRepo: mocks.whatsappRepo,
   conversationRepo: mocks.conversationRepo,
+  customerRepo: mocks.customerRepo,
 }));
 vi.mock('../db/client.js', () => ({ withTenant: mocks.withTenant }));
 vi.mock('../integrations/whatsapp.js', () => ({ sendText: mocks.sendText }));
 vi.mock('./whatsappInbound.js', () => ({ sendOverBaileys: mocks.sendOverBaileys }));
 
-const { isInCooldown, keywordsFor, matchesKeyword, renderTemplate, runKeywordAutomation } = await import('./automation.js');
+const { isInCooldown, keywordsFor, matchesKeyword, renderTemplate, runKeywordAutomation, executeRule } = await import('./automation.js');
 import type { AutomationRule } from '../db/schema.js';
 
 beforeEach(() => {
@@ -172,6 +174,70 @@ describe('runKeywordAutomation', () => {
     mocks.automationRepo.listEnabledByTrigger.mockResolvedValue([]);
     const out = await runKeywordAutomation('store1', { conversationId: 'c1', phone: '9665', text: 'hi123' });
     expect(out).toBeNull();
+  });
+});
+
+describe('executeRule with no prior conversation', () => {
+  const orderRow = (over: Record<string, unknown> = {}) => ({
+    conversation_id: null,
+    phone: '966501234567',
+    customer_name: 'Sara',
+    customer_id: null,
+    order_id: 'order-1',
+    order_total: 120,
+    order_currency: 'SAR',
+    ...over,
+  });
+
+  function stubQuery(rows: unknown[]) {
+    mocks.withTenant.mockImplementation(async (_id: string, fn: (tx: unknown) => unknown) =>
+      fn({ execute: async () => rows }),
+    );
+  }
+
+  it('messages a first-time buyer who has never been contacted', async () => {
+    // The regression: order_placed inner-joined customers AND conversations, so a
+    // customer with no prior WhatsApp conversation produced zero candidates and the
+    // rule looked like it had simply never run.
+    stubQuery([orderRow()]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+
+    const out = await executeRule('store1', rule({ triggerType: 'order_placed' }));
+
+    expect(out).toEqual({ sent: 1, failed: 0 });
+    expect(mocks.customerRepo.upsert).toHaveBeenCalledWith('store1', expect.objectContaining({ phone: '966501234567' }));
+    expect(mocks.conversationRepo.ensureOpen).toHaveBeenCalledWith('store1', 'cust-new', 'whatsapp');
+    expect(mocks.sendText).toHaveBeenCalledWith('966501234567', expect.any(String), { phoneNumberId: 'pn1' });
+  });
+
+  it('still reaches an order whose customer row was never linked', async () => {
+    // Orders synced without a phone at checkout have customer_id = null, which an inner
+    // join to customers could never satisfy.
+    stubQuery([orderRow({ customer_id: null })]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+
+    const out = await executeRule('store1', rule({ triggerType: 'order_placed' }));
+    expect(out.sent).toBe(1);
+  });
+
+  it('dedupes on the order, so a second order from the same customer still fires', async () => {
+    // Conversation-keyed dedupe meant one message per customer forever, so a repeat
+    // order was swallowed by the unique conflict and never announced.
+    stubQuery([orderRow()]);
+    mocks.automationRepo.claim.mockResolvedValue('log-1');
+
+    await executeRule('store1', rule({ triggerType: 'order_placed' }));
+
+    expect(mocks.automationRepo.claim.mock.calls[0]![5]).toMatchObject({ scope: 'conversation', key: 'order-1' });
+  });
+
+  it('does not claim when the same order was already announced', async () => {
+    stubQuery([orderRow()]);
+    mocks.automationRepo.claim.mockResolvedValue(null);
+
+    const out = await executeRule('store1', rule({ triggerType: 'order_placed' }));
+    expect(out).toEqual({ sent: 0, failed: 0 });
+    expect(mocks.sendText).not.toHaveBeenCalled();
   });
 });
 

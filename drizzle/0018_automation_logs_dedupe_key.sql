@@ -19,5 +19,4 @@ UPDATE automation_logs
 DROP INDEX IF EXISTS automation_logs_dedupe_uidx;
 
 CREATE UNIQUE INDEX IF NOT EXISTS automation_logs_dedupe_uidx
-  ON automation_logs (store_id, rule_id, dedupe_key)
-  WHERE dedupe_scope IS NOT NULL;
+  ON automation_logs (store_id, rule_id, dedupe_key);

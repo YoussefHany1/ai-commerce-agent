@@ -9,5 +9,9 @@ server.pid
 server.out.log
 server.err.log
 backups/
-# Scratch build output from scripts/verify-baileys-esm.mjs.
+# Scratch build output from the Baileys pairing harnesses.
 .tmp-baileys-esm-*/
+.tmp-baileys-live-*/
+# QR rendered by scripts/verify-baileys-live.mjs when no output path is given.
+baileys-live-qr.png
+baileys-raw-qr.png

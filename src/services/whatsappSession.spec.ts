@@ -43,10 +43,9 @@ vi.mock('baileys', () => ({
     firstUnuploadedPreKeyId: undefined,
     accountSyncCounter: undefined,
     accountChecksum: undefined,
-    // A genuinely paired device reports `registered: true`. The old fixture used
-    // `false`, which is why sends on an unregistered socket went unnoticed until
-    // production automation replies silently vanished.
-    registered: true,
+    // Irrelevant to readiness: Baileys only sets `registered` at the end of companion
+    // pairing, so a real paired device can legitimately report false.
+    registered: false,
     deviceId: undefined,
     phoneId: 'test-device',
     identityKey: undefined,
@@ -117,11 +116,10 @@ beforeEach(() => {
   repo.saveState.mockResolvedValue(undefined);
   repo.setStatus.mockResolvedValue(undefined);
   repo.clear.mockResolvedValue(undefined);
-  // A restored, genuinely paired device: WhatsApp confirmed registration when the
-  // handshake completed. Sends are refused without this flag (see `sendTextOverSocket`),
-  // so a bare `me.id` fixture would silently fail every send test.
+  // A restored paired device. `registered: false` is realistic: it is set only at the end
+  // of companion pairing and never cleared, so it does not gate sending.
   repo.decryptState.mockReturnValue({
-    creds: { registered: true, me: { id: '966501234567@s.whatsapp.net' } },
+    creds: { registered: false, me: { id: '966501234567@s.whatsapp.net' } },
     keys: {},
   });
   events.record.mockResolvedValue(true);
@@ -659,10 +657,30 @@ describe('sending', () => {
     expect(socket.sent).toHaveLength(0);
   });
 
-  test('refuses to send on an open but unregistered socket', async () => {
-    // Regression: the socket opens and inbound decrypts, but WhatsApp never confirmed
-    // registration, so it discards outbound stanzas. Baileys still resolves sendMessage,
-    // which made every automation reply vanish while the log claimed "sent".
+  test('replies to a LID contact on its LID, not on a phone-number JID', async () => {
+    // Regression: the contact wrote in from `...@lid`. Reducing to digits and
+    // rebuilding `@s.whatsapp.net` addressed an identity it does not have. The write
+    // succeeded, so `sent` was logged and nothing ever arrived.
+    await session.startSession(STORE);
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
+
+    // An attachment still triggers an immediate reply (the "can't read this" notice), so
+    // this exercises the send path without depending on the AI/automation mocks.
+    socket.emit('messages.upsert', {
+      type: 'notify',
+      messages: [{ key: { remoteJid: '51848895557795@lid', fromMe: false, id: 'LIDMSG1' }, message: { imageMessage: {} } }],
+    });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    expect(socket.sent.at(-1)!.jid).toBe('51848895557795@lid');
+  });
+
+  test('sends on an open socket even when creds.registered is false', async () => {
+    // Regression: `registered` was used as a send gate. Baileys sets it in exactly one
+    // place (the end of companion pairing) and never clears it, so a long-lived paired
+    // session reports false forever. The gate refused every send on a working socket and
+    // the automation layer recorded `failed` — indistinguishable from a rule that never
+    // matched, which is exactly how it presented.
     repo.decryptState.mockReturnValue({
       creds: { registered: false, me: { id: '966501234567@s.whatsapp.net' } },
       keys: {},
@@ -670,8 +688,8 @@ describe('sending', () => {
     await session.startSession(STORE);
     socket.emit('connection.update', { connection: 'open' });
     await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
-    await expect(session.sendTextOverSocket(STORE, '966509999999', 'hello')).resolves.toBe(false);
-    expect(socket.sent).toHaveLength(0);
+    await expect(session.sendTextOverSocket(STORE, '966509999999', 'hello')).resolves.toBe(true);
+    expect(socket.sent.at(-1)!.jid).toBe('966509999999@s.whatsapp.net');
   });
 
   test('refuses to send to a store with no live session', async () => {

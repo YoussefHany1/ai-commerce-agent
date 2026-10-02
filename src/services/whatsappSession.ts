@@ -2,7 +2,36 @@ import { logger } from '../lib/logger.js';
 import { config } from '../config.js';
 import { baileysSessionRepo, eventRepo } from '../db/repos.js';
 import type { WhatsappBaileysSessionStatus } from '../db/schema.js';
-import { normalizeJid, toJid } from '../lib/phone.js';
+import { normalizeJid, parseJid, addressForSend } from '../lib/phone.js';
+
+/**
+ * The exact JID each contact last reached us on, keyed `storeId:digits`.
+ *
+ * WhatsApp addresses some contacts by LID (`51848895557795@lid`) and others by phone
+ * number (`51848895557795@s.whatsapp.net`). Both reduce to the same digits, and the two
+ * are NOT interchangeable: replying to the phone-number form of a LID-only contact is
+ * accepted by the socket, logged `sent`, and silently dropped by WhatsApp. Digits are
+ * therefore kept for matching (rule evaluation, order attribution) and this map keeps
+ * the address for sending.
+ *
+ * Process-local by design: it is rebuilt on the first inbound from each contact, and a
+ * send with no entry falls back to digits exactly as before. Persisting it would mean a
+ * schema change for a value that is already implied by the next message.
+ */
+const jidByContact = new Map<string, string>();
+
+function contactKey(storeId: string, digits: string): string {
+  return `${storeId}:${digits}`;
+}
+
+function rememberJid(storeId: string, digits: string, jid: string): void {
+  jidByContact.set(contactKey(storeId, digits), jid);
+}
+
+/** The JID to reply to, or `null` when this contact has never written to us. */
+function recallJid(storeId: string, digits: string): string | null {
+  return jidByContact.get(contactKey(storeId, digits)) ?? null;
+}
 import { acquireLock, type Lock } from '../lib/lock.js';
 import { handleInboundText } from './whatsappInbound.js';
 // Type-only: erased at compile time, so this does not defeat the lazy dynamic import of
@@ -643,16 +672,12 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
     await auth.flush();
     await move('open', { phone });
     emit(storeId, { type: 'status', status: 'open', phone });
-    // Report the handshake outcome separately from connectivity: a socket can be open
-    // while the device is still unregistered, which means inbound decrypts but outbound
-    // is dropped by WhatsApp. Without this the dashboard shows a healthy connection and
-    // every automation reply disappears with no error anywhere.
-    const registered = (auth.creds as { registered?: boolean }).registered === true;
-    if (!registered) {
-      logger.error(
-        { storeId, phone },
-        'whatsapp: socket open but device unregistered — outbound sends will be dropped; re-pair this number',
-      );
+    // `creds.registered` is not a health signal: Baileys only sets it at the end of
+    // companion pairing and never clears it, so an established session reports false
+    // forever. The assigned `me.id` is the proof that linking succeeded, and this block
+    // fires on every open — a pairing that has not completed simply has no `me`.
+    if (!phone) {
+      logger.warn({ storeId }, 'whatsapp: socket open but no device identity assigned yet; pairing still in progress');
     }
     return;
   }
@@ -802,12 +827,17 @@ export async function stopSession(
  *
  * `fromMe` is skipped so the paired number never talks to itself, and group or status
  * JIDs are dropped by `normalizeJid` returning null.
+ *
+ * The exact remote JID is remembered per contact so replies go back to the address
+ * WhatsApp actually used. See `rememberJid`.
  */
 async function handleUpsert(storeId: string, messages: AnyMessage[]): Promise<void> {
   for (const msg of messages) {
     if (msg.key?.fromMe) continue;
-    const phone = normalizeJid(msg.key?.remoteJid ?? null);
+    const parsed = parseJid(msg.key?.remoteJid ?? null);
+    const phone = parsed?.digits ?? null;
     if (!phone) continue;
+    rememberJid(storeId, phone, parsed!.jid);
 
     const kind = classifyInbound(msg.message ?? undefined);
     if (kind === 'ignore') continue;
@@ -864,16 +894,20 @@ export async function sendTextOverSocket(storeId: string, to: string, body: stri
     logger.warn({ storeId, to }, 'whatsapp: no open baileys session for send');
     return false;
   }
-  // An open socket is not proof the device is registered. When `creds.registered` is
-  // false the handshake never completed, and Baileys still resolves `sendMessage` for
-  // outbound stanzas that WhatsApp then silently discards — so callers record a send
-  // that never reached the customer. Refuse instead, so the failure is visible upstream.
+  // `creds.registered` must NOT gate sends. Baileys sets it in exactly one place
+  // (messages-recv.js, at the end of companion pairing) and never clears it, so on an
+  // already-paired session it stays false for the whole process lifetime. Gating on it
+  // refused every send on a socket that was open and working — the automation rule
+  // matched, then reported `failed`, which looked exactly like the rule not firing.
+  // Readiness is the open socket; that is the signal we can actually trust.
   const registered = (session.auth.creds as { registered?: boolean }).registered === true;
   if (!registered) {
-    logger.warn({ storeId, to }, 'whatsapp: refusing send on unregistered baileys socket');
-    return false;
+    logger.debug({ storeId, to }, 'whatsapp: creds.registered false on open socket; sending anyway');
   }
-  const jid = toJid(to);
+  // Prefer the JID this contact actually wrote from. `to` is bare digits, which loses
+  // whether the contact was addressed as a LID; rebuilding `@s.whatsapp.net` from those
+  // digits addresses the wrong identity for LID contacts and the message never lands.
+  const jid = addressForSend(recallJid(storeId, to), to);
   if (!jid) return false;
   try {
     await session.socket.sendMessage(jid, { text: body });

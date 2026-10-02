@@ -1246,11 +1246,18 @@ export const automationRepo = {
    * pass 'message' with the inbound message id, so a customer repeating a keyword gets a
    * fresh reply. Passing neither disables dedupe entirely.
    */
+  /**
+   * Reserves a send for (rule, dedupeKey).
+   *
+   * `conversationId` is nullable because a poll trigger can now reach a customer who
+   * has never been messaged and therefore has no conversation yet. `automation_logs.
+   * conversation_id` is already nullable in the schema; the parameter was not.
+   */
   async claim(
     storeId: string,
     ruleId: string,
     triggerType: string,
-    conversationId: string,
+    conversationId: string | null,
     channel: string,
     dedupe?: { scope: 'conversation' | 'message'; key: string } | null,
   ): Promise<string | null> {

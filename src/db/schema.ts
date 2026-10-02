@@ -397,8 +397,7 @@ export const automationLogs = pgTable(
   },
   (t) => [
     uniqueIndex('automation_logs_dedupe_uidx')
-      .on(t.storeId, t.ruleId, t.dedupeKey)
-      .where(sql`${t.dedupeScope} is not null`),
+      .on(t.storeId, t.ruleId, t.dedupeKey),
     index('automation_logs_store_id_idx').on(t.storeId),
   ],
 );

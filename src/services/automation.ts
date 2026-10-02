@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import { withTenant } from '../db/client.js';
-import { automationRepo, conversationRepo, storeRepo, whatsappRepo } from '../db/repos.js';
+import { automationRepo, conversationRepo, customerRepo, storeRepo, whatsappRepo } from '../db/repos.js';
+import { logger } from '../lib/logger.js';
 import type { AutomationRule } from '../db/schema.js';
 import { sendText } from '../integrations/whatsapp.js';
 import { sendOverBaileys } from './whatsappInbound.js';
@@ -15,7 +16,13 @@ export const TRIGGER_TYPES = [
 export const MAX_ACTIONS = 50;
 
 type Candidate = {
-  conversationId: string;
+  /**
+   * Null when the customer has never been contacted on this channel. A merchant
+   * triggering an order update must be able to reach a first-time buyer who has no
+   * conversation yet, so the conversation is created on demand at delivery time
+   * rather than being a precondition for being a candidate.
+   */
+  conversationId: string | null;
   channel: string;
   phone: string;
   customerName?: string | null;
@@ -23,6 +30,14 @@ type Candidate = {
   productLink?: string | null;
   orderTotal?: number | null;
   orderCurrency?: string | null;
+  /**
+   * What "already handled" means for this candidate. Defaults to the conversation, but
+   * an order must key on the ORDER: a customer placing a second order is a new event,
+   * and conversation-keyed dedupe would silently swallow it.
+   */
+  dedupeKey?: string | null;
+  /** Present when the store already has a customers row for this phone. */
+  customerId?: string | null;
 };
 
 export function renderTemplate(template: string, data: Record<string, unknown>): string {
@@ -138,28 +153,48 @@ async function candidatesFor(storeId: string, rule: AutomationRule): Promise<Can
 
   if (rule.triggerType === 'order_placed') {
     return withTenant(storeId, async (tx) => {
+      // The customer is matched by phone, and the conversation is LEFT JOINed rather
+      // than required. Two reasons, both of which silently produced zero candidates
+      // before: an order whose `customer_id` is null (no phone captured at checkout, or
+      // a webhook that carried no customer) could never satisfy an inner join, and a
+      // first-time buyer has no WhatsApp conversation yet, so requiring one excluded
+      // exactly the customers a merchant most wants to notify.
+      //
+      // `customer_phone` on the order is used when no customers row was linked, so the
+      // message still goes out rather than the rule quietly matching nothing.
       const rows = (await tx.execute(sql`
         select distinct on (o.id)
-               c.id as conversation_id, c.channel as channel, cust.phone as phone, cust.name as customer_name,
+               c.id as conversation_id,
+               coalesce(cust.phone, o.customer_phone) as phone,
+               coalesce(cust.name, o.customer_name) as customer_name,
+               cust.id as customer_id,
+               o.id as order_id,
                o.total as order_total, o.currency as order_currency
         from orders o
-        join customers cust on cust.id = o.customer_id
-        join conversations c on c.customer_id = o.customer_id and c.store_id = o.store_id and c.channel = 'whatsapp'
-        where o.store_id = ${storeId} and cust.phone is not null
+        left join customers cust on cust.store_id = o.store_id and cust.id = o.customer_id
+        left join conversations c
+          on c.store_id = o.store_id and c.channel = 'whatsapp' and c.customer_id = cust.id
+        where o.store_id = ${storeId}
+          and coalesce(cust.phone, o.customer_phone) is not null
+          and coalesce(cust.phone, o.customer_phone) <> ''
           and coalesce(o.placed_at, o."createdAt") >= now() - make_interval(hours => ${rule.lookbackHours})
         order by o.id, c."createdAt" desc
         limit ${MAX_ACTIONS}
       `)) as any[];
       return rows.map((r) => ({
-        conversationId: String(r.conversation_id),
-        channel: String(r.channel),
+        conversationId: r.conversation_id ? String(r.conversation_id) : null,
+        channel: 'whatsapp',
         phone: String(r.phone),
         customerName: r.customer_name ?? null,
         productTitle: null,
         productLink: null,
         orderTotal: r.order_total === null || r.order_total === undefined ? null : Number(r.order_total),
         orderCurrency: r.order_currency ?? null,
-      }));
+        // One send per ORDER, not per conversation. A customer who orders twice must be
+        // told twice; conversation-keyed dedupe made the second order invisible.
+        dedupeKey: r.order_id ? String(r.order_id) : null,
+        customerId: r.customer_id ? String(r.customer_id) : null,
+      })) as Candidate[];
     });
   }
 
@@ -180,8 +215,13 @@ async function deliverToCandidate(
   body: string,
   waChannel: Awaited<ReturnType<typeof whatsappRepo.byStore>>,
 ): Promise<boolean> {
+  // A non-WhatsApp channel has no socket and needs the transcript written by hand. The
+  // conversation may not exist yet for a first-time customer, so open one rather than
+  // dropping the message on a null id.
   if (cand.channel !== 'whatsapp') {
-    await conversationRepo.addMessage({ storeId, conversationId: cand.conversationId, role: 'assistant', content: body });
+    const conversationId =
+      cand.conversationId ?? (await conversationRepo.ensureOpen(storeId, cand.customerId ?? undefined, cand.channel));
+    await conversationRepo.addMessage({ storeId, conversationId, role: 'assistant', content: body });
     return true;
   }
   if (waChannel && (await sendText(cand.phone, body, waChannel))) return true;
@@ -201,7 +241,13 @@ async function deliverToNumber(
 
 export async function executeRule(storeId: string, rule: AutomationRule): Promise<{ sent: number; failed: number }> {
   const candidates = await candidatesFor(storeId, rule);
-  if (!candidates.length) return { sent: 0, failed: 0 };
+  if (!candidates.length) {
+    // "Evaluated but matched nothing" and "never ran" are indistinguishable from the
+    // outside — the tick summary only carries counts. A rule that can never match (a
+    // missing phone, an unlinked customer) then looks identical to an idle one.
+    logger.debug({ storeId, ruleId: rule.id, triggerType: rule.triggerType }, 'automation rule matched no candidates');
+    return { sent: 0, failed: 0 };
+  }
 
   const store = await storeRepo.get(storeId);
   const shopName = store?.name ?? null;
@@ -217,7 +263,7 @@ export async function executeRule(storeId: string, rule: AutomationRule): Promis
     const body = renderTemplate(action.text, { shopName });
     const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, 'whatsapp', {
       scope: 'conversation',
-      key: cand.conversationId,
+      key: cand.conversationId ?? crypto.randomUUID(),
     });
     if (!logId) return { sent: 0, failed: 0 };
     const ok = await deliverToNumber(storeId, action.phone, body, waChannel);
@@ -239,9 +285,21 @@ export async function executeRule(storeId: string, rule: AutomationRule): Promis
       orderCurrency: cand.orderCurrency,
     });
 
-    const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, cand.conversationId, cand.channel, {
+    // A customer who has never been messaged has no conversation. Open one rather than
+    // skipping them: the merchant is asking to be told about this order, and a customer
+    // who never wrote in first is exactly who a store needs to reach. Without this the
+    // rule silently matched nothing for every first-time buyer.
+    // Link the conversation to a customers row so later inbound messages and order
+    // attribution attach to the same person. An order synced without a customer (no
+    // phone at checkout) has no row yet, so create one from the phone we are about to
+    // message rather than leaving the conversation orphaned.
+    const customerId = cand.customerId ?? (await customerRepo.upsert(storeId, { phone: cand.phone, name: cand.customerName ?? undefined }));
+    const conversationId =
+      cand.conversationId ?? (await conversationRepo.ensureOpen(storeId, customerId ?? undefined, cand.channel));
+
+    const logId = await automationRepo.claim(storeId, rule.id, rule.triggerType, conversationId, cand.channel, {
       scope: 'conversation',
-      key: cand.conversationId,
+      key: cand.dedupeKey ?? conversationId,
     });
     if (!logId) continue;
     fired = true;
