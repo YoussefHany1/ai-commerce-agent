@@ -295,7 +295,7 @@ export default function SettingsPage() {
       <div className="mt-4">
         <Card
           title="Connected stores"
-          description="Disconnect a store to stop the AI agent and its webhooks."
+          description="Disconnecting a store stops its AI agent and permanently deletes its conversations, orders, customers, products and automations."
         >
           {stores.length === 0 ? (
             <p className="text-sm text-slate-500">No stores connected.</p>

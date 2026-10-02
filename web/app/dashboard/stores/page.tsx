@@ -270,7 +270,7 @@ export default function StoresPage() {
         onConfirm={() => toDisconnect && disconnect.mutate(toDisconnect)}
         loading={disconnect.isPending}
         title={`Disconnect ${toDisconnect?.name ?? 'store'}?`}
-        description="This removes the store and its AI agent. Analytics data is kept for legal/accounting records."
+        description="This permanently deletes the store and everything attached to it — conversations, orders, customers, products and automations. It cannot be undone."
         confirmLabel="Disconnect"
       />
     </div>
