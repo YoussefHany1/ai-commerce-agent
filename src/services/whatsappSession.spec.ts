@@ -747,6 +747,21 @@ describe('boot restore', () => {
     expect(session.isLive(STORE)).toBe(true);
   });
 
+  test('retries a restore whose lease the outgoing replica still holds', async () => {
+    vi.useFakeTimers();
+    repo.listAll.mockResolvedValue([
+      { storeId: STORE, stateEnc: 'enc:x', status: 'open', phone: '966501234567' } as never,
+    ]);
+    // The boot pass loses the lease race to the dying replica; the retry gets it.
+    lock.acquireLock.mockResolvedValueOnce(null);
+
+    await session.restoreAllSessions();
+    expect(session.isLive(STORE)).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(session.RESTORE_RETRY_DELAY_MS);
+    expect(session.isLive(STORE)).toBe(true);
+  });
+
   test('one bad row does not stop the others from restoring', async () => {
     repo.listAll.mockResolvedValue([
       { storeId: STORE, stateEnc: 'bad', status: 'open', phone: null } as never,

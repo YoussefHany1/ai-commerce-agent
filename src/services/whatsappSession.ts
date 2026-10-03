@@ -194,6 +194,21 @@ const connectFailures = new Map<string, number>();
 const LEASE_TTL_MS = 60_000;
 const LEASE_NAME = 'whatsapp:baileys';
 
+/**
+ * How long to wait before re-attempting a boot restore whose socket lease was still held.
+ *
+ * A redeploy overlaps the outgoing process, whose global socket lease outlives it by up
+ * to LEASE_TTL_MS — it is only ever renewed, never released on SIGTERM. The incoming
+ * process boots inside that window, `startSession` throws SessionBusyError, and with no
+ * retry the store is silently offline in memory while Postgres still says `open`; every
+ * send then fails at the `isLive` gate with `send_failed` until the next restart. Wait
+ * out the lease, then take it.
+ */
+export const RESTORE_RETRY_DELAY_MS = LEASE_TTL_MS + 5_000;
+
+/** Bounded so a genuinely contended lease does not retry forever. */
+const RESTORE_MAX_ATTEMPTS = 6;
+
 export class SessionLimitError extends Error {
   readonly openSessions: number;
   constructor(openSessions: number) {
@@ -993,7 +1008,15 @@ export async function sendTextOverSocket(storeId: string, to: string, body: stri
     await session.socket.sendMessage(jid, { text: body });
     return true;
   } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
     logger.warn({ err, storeId, to }, 'whatsapp: baileys send failed');
+    // Persist the reason. `automation_logs.error` only ever says `send_failed`, which
+    // cannot distinguish a dead socket from a WhatsApp-side rejection or a bad JID —
+    // and that distinction is the difference between a redeploy and waiting out a
+    // temporary block. The row is already `open`; this only enriches `last_error`.
+    await baileysSessionRepo
+      .setStatus(storeId, 'open', { lastError: `send: ${detail}` })
+      .catch(() => undefined);
     return false;
   }
 }
@@ -1009,6 +1032,7 @@ export async function restoreAllSessions(): Promise<void> {
   const rows = await baileysSessionRepo.listAll();
   const max = config.WHATSAPP_BAILEYS_MAX_SESSIONS;
   let started = 0;
+  const busy: string[] = [];
   for (const row of rows) {
     if (started >= max) {
       logger.warn({ storeId: row.storeId }, 'whatsapp: session limit reached at boot, leaving store offline');
@@ -1019,10 +1043,49 @@ export async function restoreAllSessions(): Promise<void> {
       await startSession(row.storeId);
       started += 1;
     } catch (err) {
-      logger.error({ err, storeId: row.storeId }, 'whatsapp: failed to restore session at boot');
+      if (err instanceof SessionBusyError) {
+        // The previous replica is still winding down and holds the lease. Do not give up:
+        // retry once its TTL elapses (see RESTORE_RETRY_DELAY_MS).
+        busy.push(row.storeId);
+        logger.warn({ storeId: row.storeId }, 'whatsapp: socket lease still held at boot, will retry');
+      } else {
+        logger.error({ err, storeId: row.storeId }, 'whatsapp: failed to restore session at boot');
+      }
     }
   }
+  if (busy.length) scheduleRestoreRetry(busy, 1);
   logger.info({ restored: started, total: rows.length }, 'whatsapp: boot restore complete');
+}
+
+/**
+ * Re-runs a boot restore that lost the lease race to the outgoing replica.
+ *
+ * Without this the store stays offline in memory while Postgres reports `open`, and every
+ * automation send fails silently at the `isLive` gate — the only visible symptom is
+ * `send_failed`, which is indistinguishable from a rule that matched nothing.
+ */
+function scheduleRestoreRetry(storeIds: string[], attempt: number): void {
+  if (attempt > RESTORE_MAX_ATTEMPTS) {
+    logger.error({ storeIds, attempts: attempt - 1 }, 'whatsapp: giving up on boot restore, lease never freed');
+    return;
+  }
+  const timer = setTimeout(() => {
+    void (async () => {
+      const stillBusy: string[] = [];
+      for (const storeId of storeIds) {
+        if (isLive(storeId)) continue;
+        try {
+          await startSession(storeId);
+          logger.info({ storeId, attempt }, 'whatsapp: restored session after lease freed');
+        } catch (err) {
+          if (err instanceof SessionBusyError) stillBusy.push(storeId);
+          else logger.error({ err, storeId, attempt }, 'whatsapp: delayed boot restore failed');
+        }
+      }
+      if (stillBusy.length) scheduleRestoreRetry(stillBusy, attempt + 1);
+    })();
+  }, RESTORE_RETRY_DELAY_MS);
+  timer.unref?.();
 }
 
 /** Test seam: forget all live state without touching the DB. */
