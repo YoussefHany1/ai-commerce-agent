@@ -209,6 +209,9 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
     run(async () => {
       await api.whatsappQrDisconnect(storeId).catch(() => undefined);
       await api.whatsappQrConnect(storeId);
+      // Hold the buttons disabled until the socket reports `qr`/`open`, so a second
+      // click cannot tear down the handshake that is still in flight.
+      setPhase('connecting');
     }, 'Could not start pairing.');
 
   const disconnect = () =>
@@ -410,6 +413,7 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
                   variant="secondary"
                   onClick={requestCode}
                   loading={busy}
+                  disabled={phase === 'connecting'}
                 >
                   Get code
                 </Button>
@@ -430,7 +434,12 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
             Disconnect
           </Button>
         ) : (
-          <Button onClick={connect} loading={busy} leftIcon={<QrCode className="h-4 w-4" />}>
+          <Button
+            onClick={connect}
+            loading={busy}
+            disabled={phase === 'connecting'}
+            leftIcon={<QrCode className="h-4 w-4" />}
+          >
             {phase === 'qr' || phase === 'connecting' ? 'Reconnect' : 'Show QR code'}
           </Button>
         )}
