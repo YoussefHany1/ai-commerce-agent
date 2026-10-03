@@ -51,6 +51,12 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
+  // Latest phase, for the code path that waits on the SSE stream to reach `qr`. A ref
+  // because that wait runs outside React and must not close over a stale render.
+  const phaseRef = useRef<Phase>(phase);
+  useEffect(() => {
+    phaseRef.current = phase;
+  }, [phase]);
 
   /** Live status arrives by SSE; this maps it onto the card's phases. */
   const applyStatus = useCallback((status: QrStatus['status']) => {
@@ -186,6 +192,11 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
         setMessage('WhatsApp is still connecting. Give it a moment, then try again.');
         return;
       }
+      if (e.message.includes('already_linked')) {
+        setMessage('This store already has a linked number. Disconnect it first to pair a different one.');
+        setPhase('open');
+        return;
+      }
       setMessage(e.message || failMessage);
       setPhase('error');
     } finally {
@@ -216,11 +227,41 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
       setPhase('idle');
     }, 'Could not disconnect.');
 
-  // Phone-number pairing, for a merchant who cannot scan the QR on the same device. The
-  // code is shown from local state if the response carries it, and the SSE stream replays
-  // it to a card that remounts mid-pairing.
+  /**
+   * Resolves once the SSE stream reports the socket is at the QR stage.
+   *
+   * Throws `already_linked` if it reaches `open` instead: there is no code to mint for a
+   * number that is already paired.
+   */
+  const waitForQr = useCallback(async (timeoutMs = 30_000) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const p = phaseRef.current;
+      if (p === 'qr') return;
+      if (p === 'open') throw new Error('already_linked');
+      if (Date.now() >= deadline) throw new Error('session_not_ready');
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }, []);
+
+  /**
+   * Phone-number pairing, for a merchant who cannot scan the QR on the same device.
+   *
+   * A code can only be minted from a live socket that has reached the QR stage, and a
+   * cold handshake takes several seconds. Holding one HTTP request open for that whole
+   * time races every proxy timeout in front of the API (the browser and the API both
+   * waited 20s, so the browser aborted first). Instead, start the session, let the
+   * already-open SSE stream tell us when it is at `qr`, and only then request the code —
+   * a call that now returns immediately.
+   */
   const requestCode = () =>
     run(async () => {
+      if (phaseRef.current !== 'qr') {
+        if (phaseRef.current === 'open') throw new Error('already_linked');
+        // Idempotent when a session is already live; it never tears a live one down.
+        await api.whatsappQrConnect(storeId);
+        await waitForQr();
+      }
       const res = await api.whatsappQrPairCode(storeId, pairingPhone.trim());
       setPairingCode(res.pairingCode);
       setPhase('qr');

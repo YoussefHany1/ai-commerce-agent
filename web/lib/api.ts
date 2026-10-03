@@ -270,11 +270,17 @@ export const api = {
    * The number must be in full international format (country code first); it is
    * normalised to digits server-side. Rejects with `invalid_phone` and
    * `session_not_ready` (still connecting, or already linked) rather than retrying.
+   *
+   * The caller first waits for the session to reach the QR stage (via the SSE stream),
+   * so this normally returns immediately. The longer timeout is only a guard for the
+   * race where the socket drops between the stream reporting `qr` and this POST, in
+   * which case the API waits for the socket again — it must answer before we abort.
    */
   whatsappQrPairCode: (storeId: string, phone: string) =>
     request<{ ok: true; pairingCode: string; phone: string }>('/api/whatsapp/qr-pair-code', {
       method: 'POST',
       body: { storeId, phone },
+      timeoutMs: 35_000,
     }),
 
   /** Unlinks the number from WhatsApp and drops the stored pairing. */
