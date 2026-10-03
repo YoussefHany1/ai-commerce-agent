@@ -342,6 +342,20 @@ describe('connection lifecycle', () => {
     expect(events.find((e) => e.type === 'qr').qr).toBe('data:image/png;base64,RENDERED(BASE64QR)');
   });
 
+  test('remembers the last QR so a late subscriber can replay it', async () => {
+    const events: any[] = [];
+    session.subscribe(STORE, (e) => events.push(e));
+    await session.startSession(STORE);
+    socket.emit('connection.update', { qr: 'BASE64QR' });
+    await vi.waitFor(() => expect(events.some((e) => e.type === 'qr')).toBe(true));
+    expect(session.qrFor(STORE)).toBe('data:image/png;base64,RENDERED(BASE64QR)');
+
+    // Pairing completes: a stale QR must not be replayed to the next subscriber.
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
+    expect(session.qrFor(STORE)).toBeNull();
+  });
+
   test('records the paired number on open, as bare digits', async () => {
     await session.startSession(STORE);
     socket.emit('connection.update', { connection: 'open' });

@@ -107,6 +107,15 @@ export function classifyInbound(message: Record<string, unknown> | null | undefi
  */
 const lastStatus = new Map<string, WhatsappBaileysSessionStatus>();
 
+/**
+ * The most recent QR image per store, so a late SSE subscriber still gets one.
+ *
+ * A QR is emitted once and rotates only every ~20s. Without this, a dashboard that
+ * subscribes a moment after the frame was broadcast — or that subscribes twice while a
+ * status change churns its stream — shows nothing until the next rotation.
+ */
+const lastQr = new Map<string, string>();
+
 export type SessionEvent = {
   type: 'status' | 'qr';
   status?: WhatsappBaileysSessionStatus;
@@ -495,6 +504,11 @@ export function statusFor(storeId: string): WhatsappBaileysSessionStatus | null 
   return live.get(storeId)?.status ?? lastStatus.get(storeId) ?? null;
 }
 
+/** The last QR image shown for a store, for replay to a late SSE subscriber. */
+export function qrFor(storeId: string): string | null {
+  return lastQr.get(storeId) ?? null;
+}
+
 /** Subscribes to session events. Returns an unsubscribe function. */
 export function subscribe(storeId: string, fn: (e: SessionEvent) => void): () => void {
   const set = subscribers.get(storeId) ?? new Set();
@@ -744,13 +758,17 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
     // screen, and a stale image would just fail again.
     session.awaitingScan = true;
     await move('qr');
-    emit(storeId, { type: 'qr', qr: await qrToDataUrl(update.qr) });
+    const image = await qrToDataUrl(update.qr);
+    lastQr.set(storeId, image);
+    emit(storeId, { type: 'qr', qr: image });
     return;
   }
 
   if (update.connection === 'open') {
     session.attempts = 0;
     session.awaitingScan = false;
+    // A completed pairing has no QR left to replay.
+    lastQr.delete(storeId);
     if (session.connectTimer) {
       clearTimeout(session.connectTimer);
       session.connectTimer = null;
@@ -883,6 +901,7 @@ async function teardown(
     logger.warn({ err, storeId: session.storeId }, 'whatsapp: socket teardown failed');
   }
   live.delete(session.storeId);
+  lastQr.delete(session.storeId);
   await session.lock.release();
   if (!opts.keepState) {
     // Both halves. The row is what the next process reads, `liveAuth` is what the next
@@ -1098,6 +1117,7 @@ export function __resetLiveForTest(): void {
   live.clear();
   liveAuth.clear();
   lastStatus.clear();
+  lastQr.clear();
   subscribers.clear();
   lastInbound.clear();
   connectFailures.clear();

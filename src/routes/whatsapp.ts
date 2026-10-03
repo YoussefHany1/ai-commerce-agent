@@ -11,6 +11,7 @@ import {
   SessionBusyError,
   SessionLimitError,
   livePhone,
+  qrFor,
   startSession,
   statusFor,
   stopSession,
@@ -219,6 +220,10 @@ function registerQrRoutes(app: FastifyInstance): void {
       };
 
       send({ type: 'status', status: statusFor(storeId) ?? 'idle' });
+      // Replay the current QR, if any: it is emitted once and rotates only every ~20s, so
+      // a subscriber that connects a beat late would otherwise stare at an empty box.
+      const qr = qrFor(storeId);
+      if (qr) send({ type: 'qr', qr });
       const unsubscribe = subscribe(storeId, send);
 
       // Keeps intermediaries from closing an idle connection during a long pairing wait.

@@ -102,9 +102,15 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
     };
   }, [storeId, applyStatus]);
 
-  /** Subscribes to pairing events while the card is mounted. */
+  /**
+   * Subscribes to pairing events once, for the life of the card.
+   *
+   * Deliberately NOT keyed on `phase`: a QR is emitted once and rotates only every ~20s,
+   * so re-subscribing on each status change (logging out, connecting, …) closed the
+   * stream right before the QR frame and forced a ~20s wait for the next rotation. It was
+   * invisible locally, where the stream reconnects instantly, and only bit in production.
+   */
   useEffect(() => {
-    if (phase === 'loading' || phase === 'tos') return;
     const source = new EventSource(`/api/whatsapp/qr-stream?storeId=${encodeURIComponent(storeId)}`);
     sourceRef.current = source;
 
@@ -132,7 +138,7 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
       source.close();
       sourceRef.current = null;
     };
-  }, [storeId, phase, applyStatus]);
+  }, [storeId, applyStatus]);
 
   const run = async (fn: () => Promise<unknown>, failMessage: string) => {
     setBusy(true);
