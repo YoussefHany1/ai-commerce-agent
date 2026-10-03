@@ -42,6 +42,7 @@ whatsappChannels,
 } from './schema.js';
 import { decryptKey, encryptKey, keyVersionOf, isEncrypted } from '../lib/encryption.js';
 import { refreshProviderToken } from '../integrations/refresh.js';
+import { invalidateCommerceAdapter } from '../integrations/adapterCache.js';
 import { normalizeJid } from '../lib/phone.js';
 import type { Platform, Product, Order } from '../types.js';
 
@@ -436,6 +437,8 @@ export const storeRepo = {
       const [row] = await tx.delete(stores).where(eq(stores.id, storeId)).returning({ id: stores.id });
       return !!row;
     });
+    // Drop the memoized adapter: its token belongs to a store that no longer exists.
+    if (done) invalidateCommerceAdapter(storeId);
     return done;
   },
 
@@ -1381,6 +1384,9 @@ export const connectionRepo = {
         })
         .where(eq(platformConnections.storeId, storeId));
     });
+    // Reinstall/OAuth reconnect replaces the access token; a cached adapter would
+    // otherwise keep presenting the token the platform just superseded.
+    invalidateCommerceAdapter(storeId);
   },
 
   async refreshIfExpired(storeId: string): Promise<boolean> {

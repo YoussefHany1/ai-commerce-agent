@@ -1,5 +1,6 @@
 import type { CommerceAdapter, Platform } from '../types.js';
 import { connectionRepo, storeRepo } from '../db/repos.js';
+import { getCachedAdapter, setCachedAdapter } from './adapterCache.js';
 import { ShopifyAdapter } from './shopify.js';
 import { SallaAdapter } from './salla.js';
 import { ZidAdapter } from './zid.js';
@@ -92,6 +93,9 @@ export async function verifyStoreCredentials(input: {
 }
 
 export async function getCommerceAdapter(storeId: string): Promise<CommerceAdapter | null> {
+  const cached = getCachedAdapter(storeId);
+  if (cached) return cached;
+
   const store = await storeRepo.get(storeId);
   if (!store) return null;
 
@@ -110,5 +114,7 @@ export async function getCommerceAdapter(storeId: string): Promise<CommerceAdapt
   const zidAuthorization =
     store.platform === 'zid' ? await storeRepo.getSecret(storeId, 'zidAuthorization') : null;
 
-  return buildAdapter(store.platform, store.shopDomain, accessToken, zidAuthorization);
+  const adapter = buildAdapter(store.platform, store.shopDomain, accessToken, zidAuthorization);
+  if (adapter) setCachedAdapter(storeId, adapter);
+  return adapter;
 }
