@@ -113,6 +113,25 @@ export function toJid(digits: string | null | undefined): string | null {
 }
 
 /**
+ * Normalise a user-entered phone number to the bare international digits that
+ * Baileys' `requestPairingCode` expects.
+ *
+ * The value is handed straight to `jidEncode(..., 's.whatsapp.net')`, which does not
+ * strip separators: `'+966 50 123 4567'` becomes `'+966 50 123 4567@s.whatsapp.net'`,
+ * an invalid JID, and the code then never pairs. Only digits survive.
+ *
+ * This does NOT infer a country code. The merchant must enter the number in full
+ * international format — country code first, a leading `+` being optional.
+ *
+ * @returns the digits, or `null` when the input contains none.
+ */
+export function pairingDigits(input: string | null | undefined): string | null {
+  if (!input) return null;
+  const digits = String(input).replace(/\D/g, '');
+  return digits || null;
+}
+
+/**
  * Resolve the address to send to, preferring a known JID over bare digits.
  *
  * @param jid   the exact JID captured on inbound, when one was stored.

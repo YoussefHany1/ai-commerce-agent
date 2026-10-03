@@ -47,6 +47,7 @@ const ALLOWLIST: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   // pipes the stream through instead (web/app/api/whatsapp/qr-stream/route.ts).
   { method: 'GET', pattern: /^\/whatsapp\/qr-status$/ },
   { method: 'POST', pattern: /^\/whatsapp\/qr-connect$/ },
+  { method: 'POST', pattern: /^\/whatsapp\/qr-pair-code$/ },
   { method: 'POST', pattern: /^\/whatsapp\/qr-acknowledge$/ },
   { method: 'DELETE', pattern: /^\/whatsapp\/qr-disconnect$/ },
   { method: 'GET', pattern: /^\/automation\/rules\/[^/]+$/ },

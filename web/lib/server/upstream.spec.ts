@@ -35,6 +35,7 @@ const CLIENT_CALL_SITES: ReadonlyArray<[string, string]> = [
   // path segments only. The `?storeId=` in api.ts is applied after that.
   ['GET', '/whatsapp/qr-status'],
   ['POST', '/whatsapp/qr-connect'],
+  ['POST', '/whatsapp/qr-pair-code'],
   ['POST', '/whatsapp/qr-acknowledge'],
   ['DELETE', '/whatsapp/qr-disconnect'],
   ['GET', '/automation/rules/abc123'],

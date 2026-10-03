@@ -8,10 +8,14 @@ import { storeRateLimitWindow } from '../lib/rateLimit.js';
 import { requireOperator, requireDashboard } from '../lib/auth.js';
 import { logger } from '../lib/logger.js';
 import {
+  PairingNotReadyError,
+  PairingPhoneError,
   SessionBusyError,
   SessionLimitError,
   livePhone,
+  pairingCodeFor,
   qrFor,
+  requestPairingCode,
   startSession,
   statusFor,
   stopSession,
@@ -105,14 +109,14 @@ export function hasAcknowledgedTos(store: { settings: unknown } | null | undefin
 /**
  * QR pairing routes.
  *
- * All four 404 when `WHATSAPP_BAILEYS_ENABLED` is off, rather than 403: the feature is
+ * All five 404 when `WHATSAPP_BAILEYS_ENABLED` is off, rather than 403: the feature is
  * not part of this deployment at all, and a 403 invites a retry loop against an endpoint
  * that will never succeed.
  *
- * The ToS gate lives on `qr-connect` specifically — it is the route that mints a
- * session, so a client that skips the interstitial still cannot obtain a number. The
- * read-only routes stay open so the dashboard can render "unavailable" from real state
- * instead of guessing.
+ * The ToS gate lives on the routes that mint a session — `qr-connect` and
+ * `qr-pair-code` — so a client that skips the interstitial still cannot obtain a number.
+ * The read-only routes stay open so the dashboard can render "unavailable" from real
+ * state instead of guessing.
  */
 function registerQrRoutes(app: FastifyInstance): void {
   const dashboard = (req: any) => (req.body as { storeId?: string })?.storeId ?? (req.query as { storeId?: string })?.storeId;
@@ -154,6 +158,67 @@ function registerQrRoutes(app: FastifyInstance): void {
         if (err instanceof SessionBusyError) {
           return reply.code(409).send({ error: 'session_busy' });
         }
+        throw err;
+      }
+    },
+  );
+
+  /**
+   * Mints a pairing code for a phone number, for the mobile flow where a QR cannot be
+   * scanned on the same device.
+   *
+   * Additive to `qr-connect`, not a replacement: it starts (or resumes) the same socket
+   * and then asks Baileys for an 8-character code the merchant types into
+   * WhatsApp → Linked devices → Link with phone number. The ToS gate applies here too —
+   * this route mints a session just as `qr-connect` does.
+   */
+  app.post(
+    '/api/whatsapp/qr-pair-code',
+    {
+      preHandler: [
+        requireDashboard(dashboard, { allowStoreKey: true }),
+        storeRateLimitWindow('api', apiWindow),
+      ],
+    },
+    async (req, reply) => {
+      if (!config.whatsappBaileysEnabled) return reply.code(404).send({ error: 'not_available' });
+      const { storeId, phone } = z
+        .object({ storeId: z.string(), phone: z.string().min(1).max(40) })
+        .parse(req.body);
+
+      const store = await storeRepo.get(storeId);
+      if (!hasAcknowledgedTos(store)) {
+        return reply.code(403).send({
+          error: 'tos_not_acknowledged',
+          message: TOS_SUMMARY,
+          version: config.WHATSAPP_BAILEYS_TOS_VERSION,
+        });
+      }
+
+      // The code is minted against a live socket, so a session that is not already up is
+      // started here with the same 409s as qr-connect.
+      try {
+        await startSession(storeId);
+      } catch (err) {
+        if (err instanceof SessionLimitError) {
+          return reply.code(409).send({
+            error: 'session_limit_reached',
+            openSessions: err.openSessions,
+            maxSessions: config.WHATSAPP_BAILEYS_MAX_SESSIONS,
+          });
+        }
+        if (err instanceof SessionBusyError) {
+          return reply.code(409).send({ error: 'session_busy' });
+        }
+        throw err;
+      }
+
+      try {
+        return { ok: true, ...(await requestPairingCode(storeId, phone)) };
+      } catch (err) {
+        if (err instanceof PairingPhoneError) return reply.code(400).send({ error: 'invalid_phone' });
+        // Covers both "still connecting, wait a beat" and "already linked".
+        if (err instanceof PairingNotReadyError) return reply.code(409).send({ error: 'session_not_ready' });
         throw err;
       }
     },
@@ -230,6 +295,10 @@ function registerQrRoutes(app: FastifyInstance): void {
       // a subscriber that connects a beat late would otherwise stare at an empty box.
       const qr = qrFor(storeId);
       if (qr) send({ type: 'qr', qr });
+      // Replay a pending phone-pairing code too: a card remounted mid-pairing would
+      // otherwise lose the code the merchant is meant to type.
+      const pairingCode = pairingCodeFor(storeId);
+      if (pairingCode) send({ type: 'pairing_code', pairingCode });
       const unsubscribe = subscribe(storeId, send);
 
       // Keeps intermediaries from closing an idle connection during a long pairing wait.

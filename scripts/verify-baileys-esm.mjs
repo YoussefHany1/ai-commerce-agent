@@ -90,6 +90,13 @@ const stubs = {
       const d = String(digits ?? '').replace(/\D/g, '');
       return d ? `${d}@s.whatsapp.net` : null;
     },
+    // Mirrors src/lib/phone.ts: only digits survive, so a number with separators is not
+    // turned into an invalid JID by jidEncode. Does not infer a country code.
+    pairingDigits: (input) => {
+      if (!input) return null;
+      const digits = String(input).replace(/\D/g, '');
+      return digits || null;
+    },
   },
   './agent.js': { answerWithTools: async () => '', toChatHistory: () => [] },
   '../db/schema.js': {},
@@ -116,6 +123,7 @@ function stubUrl(spec) {
       `export const toJid = s.toJid;`,
       `export const parseJid = s.parseJid;`,
       `export const addressForSend = s.addressForSend;`,
+      `export const pairingDigits = s.pairingDigits;`,
       `export const answerWithTools = s.answerWithTools;`,
       `export const toChatHistory = s.toChatHistory;`,
       '',

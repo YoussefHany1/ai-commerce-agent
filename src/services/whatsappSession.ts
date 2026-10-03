@@ -2,7 +2,7 @@ import { logger } from '../lib/logger.js';
 import { config } from '../config.js';
 import { baileysSessionRepo, eventRepo } from '../db/repos.js';
 import type { WhatsappBaileysSessionStatus } from '../db/schema.js';
-import { normalizeJid, parseJid, addressForSend } from '../lib/phone.js';
+import { normalizeJid, parseJid, addressForSend, pairingDigits } from '../lib/phone.js';
 
 /**
  * The exact JID each contact last reached us on, keyed `storeId:digits`.
@@ -116,11 +116,22 @@ const lastStatus = new Map<string, WhatsappBaileysSessionStatus>();
  */
 const lastQr = new Map<string, string>();
 
+/**
+ * The most recent phone-pairing code per store, so a reloaded card still has it.
+ *
+ * A QR rotates and is replayed from `lastQr`; a pairing code does not rotate, so without
+ * this a card remounted mid-pairing loses the very code the merchant is typing into
+ * WhatsApp.
+ */
+const lastPairingCode = new Map<string, string>();
+
 export type SessionEvent = {
-  type: 'status' | 'qr';
+  type: 'status' | 'qr' | 'pairing_code';
   status?: WhatsappBaileysSessionStatus;
   /** Base64 QR payload, `type: 'qr'` only. */
   qr?: string;
+  /** 8-character phone-pairing code, `type: 'pairing_code'` only. */
+  pairingCode?: string;
   phone?: string | null;
   error?: string | null;
   at: string;
@@ -134,6 +145,12 @@ export type SocketLike = {
     on(event: 'messages.upsert', cb: (arg: { messages: AnyMessage[]; type: string }) => void): void;
   };
   sendMessage(jid: string, content: { text: string }): Promise<unknown>;
+  /**
+   * Mints an 8-character pairing code for a phone number, for the mobile flow where a
+   * QR cannot be scanned on the same device. Optional so a structurally-typed double
+   * without the method still satisfies this view.
+   */
+  requestPairingCode?(phoneNumber: string): Promise<string>;
   /** Unlinks the device from WhatsApp. This is the *disconnect* path. */
   logout?(): Promise<void>;
   /** Drops the local socket without unlinking. Used on replica handover. */
@@ -234,6 +251,31 @@ export class SessionBusyError extends Error {
   }
 }
 
+/** A phone-pairing request carried no usable number (empty, or outside E.164 length). */
+export class PairingPhoneError extends Error {
+  constructor() {
+    super('a full international phone number is required');
+    this.name = 'PairingPhoneError';
+  }
+}
+
+/** A pairing code was requested before the socket was at the QR stage, or after it linked. */
+export class PairingNotReadyError extends Error {
+  constructor() {
+    super('the whatsapp socket is not ready to pair yet');
+    this.name = 'PairingNotReadyError';
+  }
+}
+
+/**
+ * How long to wait for a freshly-started socket to reach the QR stage before giving up.
+ *
+ * `startSession` returns as soon as the socket object is built; the websocket then opens
+ * and receives its first server frame asynchronously. Exceeding a normal handshake on a
+ * cold deploy is why this is generous but bounded.
+ */
+export const PAIRING_READY_TIMEOUT_MS = 20_000;
+
 /** Minimum gap between two inbound messages from the same contact, per store. */
 const INBOUND_THROTTLE_MS = 1_000;
 
@@ -262,14 +304,16 @@ type LiveSession = {
    */
   auth: AuthState;
   /**
-   * True from the first QR until the socket opens — i.e. this socket has been through
-   * a merchant scan but has never completed a handshake.
+   * True from the first QR (or phone-pairing code) until the socket opens — i.e. this
+   * socket has been through a merchant scan but has never completed a handshake.
    *
-   * This, and not `phone`, is what distinguishes "pairing was rejected" from "a linked
-   * number was unlinked". `phone` is in-memory and only set on `open`, so it is null
-   * during the whole first handshake *and* for the window between restoring a paired
-   * session and its socket opening. A 401 in that window is a perfectly-paired number
-   * getting logged out and must not be reported as a failed scan.
+   * This, and not `phone` or `creds.me`, is what distinguishes "pairing was rejected"
+   * from "a linked number was unlinked". `phone` is in-memory and only set on `open`, so
+   * it is null during the whole first handshake *and* for the window between restoring a
+   * paired session and its socket opening. A 401 in that window is a perfectly-paired
+   * number getting logged out and must not be reported as a failed scan. `requestPairingCode`
+   * also pre-populates `creds.me` before any handshake completes, which is the second
+   * reason this flag — not `creds.me` — is the signal.
    */
   awaitingScan: boolean;
 };
@@ -509,6 +553,11 @@ export function qrFor(storeId: string): string | null {
   return lastQr.get(storeId) ?? null;
 }
 
+/** The last phone-pairing code minted for a store, for replay to a late SSE subscriber. */
+export function pairingCodeFor(storeId: string): string | null {
+  return lastPairingCode.get(storeId) ?? null;
+}
+
 /** Subscribes to session events. Returns an unsubscribe function. */
 export function subscribe(storeId: string, fn: (e: SessionEvent) => void): () => void {
   const set = subscribers.get(storeId) ?? new Set();
@@ -602,6 +651,79 @@ export async function startSession(
   wireSocket(session, auth);
   armConnectWatchdog(session);
   return { resumed: false };
+}
+
+/**
+ * Waits until a live socket is at the QR stage, i.e. its websocket is open and Baileys
+ * has emitted the first pairing frame.
+ *
+ * `requestPairingCode` sends an IQ over the socket and throws `Connection Closed` if the
+ * websocket is not open yet, while `startSession` returns as soon as the socket object is
+ * built. So a code request that arrives immediately after a connect races the handshake;
+ * waiting for the `qr` status waits for the first server frame that proves the socket is
+ * usable. A session that is already `open` is paired and cannot take a code at all.
+ */
+async function waitForPairingSocket(storeId: string, timeoutMs: number): Promise<LiveSession> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const session = live.get(storeId);
+    if (session && !session.closing) {
+      if (session.status === 'qr') return session;
+      if (session.status === 'open') throw new PairingNotReadyError();
+    }
+    if (Date.now() >= deadline) throw new PairingNotReadyError();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+/**
+ * Mints an 8-character WhatsApp pairing code for a phone number.
+ *
+ * Additive to the QR flow, not a replacement: a merchant on the very phone that runs
+ * WhatsApp cannot scan a QR displayed on that same screen, so this lets them type a code
+ * into WhatsApp → Linked devices → Link with phone number instead.
+ *
+ * The number is normalised to digits first (`pairingDigits`); Baileys hands the value
+ * straight to `jidEncode` and does not strip separators. `awaitingScan` is set before the
+ * call and restored if it fails, because the close handler's decision between "pairing
+ * rejected" and "number logged out" turns on that flag — and `requestPairingCode`
+ * pre-populates `creds.me`, which would otherwise make a rejected pairing look like a
+ * logged-out number.
+ */
+export async function requestPairingCode(
+  storeId: string,
+  input: string,
+): Promise<{ pairingCode: string; phone: string }> {
+  const phone = pairingDigits(input);
+  if (!phone || phone.length < 7 || phone.length > 15) throw new PairingPhoneError();
+
+  const session = await waitForPairingSocket(storeId, PAIRING_READY_TIMEOUT_MS);
+  const request = session.socket.requestPairingCode;
+  if (!request) throw new PairingNotReadyError();
+
+  const previousAwaitingScan = session.awaitingScan;
+  session.awaitingScan = true;
+
+  let pairingCode: string;
+  try {
+    pairingCode = await request.call(session.socket, phone);
+  } catch (err) {
+    session.awaitingScan = previousAwaitingScan;
+    // A socket that closed between the readiness check and the send is not a 500-worthy
+    // failure; the merchant can simply ask for a fresh code.
+    if (parseReason(err) === 428) throw new PairingNotReadyError();
+    throw err;
+  }
+
+  // From here the session awaits a link exactly as it does for a QR: record it so the
+  // card and the persisted status agree, and replay the code to a reloaded card.
+  session.status = 'qr';
+  lastStatus.set(storeId, 'qr');
+  await baileysSessionRepo.setStatus(storeId, 'qr').catch(() => undefined);
+  lastPairingCode.set(storeId, pairingCode);
+  emit(storeId, { type: 'pairing_code', pairingCode, status: 'qr', phone });
+  logger.info({ storeId, phone }, 'whatsapp: pairing code requested');
+  return { pairingCode, phone };
 }
 
 /**
@@ -767,8 +889,9 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
   if (update.connection === 'open') {
     session.attempts = 0;
     session.awaitingScan = false;
-    // A completed pairing has no QR left to replay.
+    // A completed pairing has no QR or code left to replay.
     lastQr.delete(storeId);
+    lastPairingCode.delete(storeId);
     if (session.connectTimer) {
       clearTimeout(session.connectTimer);
       session.connectTimer = null;
@@ -902,6 +1025,7 @@ async function teardown(
   }
   live.delete(session.storeId);
   lastQr.delete(session.storeId);
+  lastPairingCode.delete(session.storeId);
   await session.lock.release();
   if (!opts.keepState) {
     // Both halves. The row is what the next process reads, `liveAuth` is what the next
@@ -1118,6 +1242,7 @@ export function __resetLiveForTest(): void {
   liveAuth.clear();
   lastStatus.clear();
   lastQr.clear();
+  lastPairingCode.clear();
   subscribers.clear();
   lastInbound.clear();
   connectFailures.clear();

@@ -5,6 +5,7 @@ import { AlertTriangle, CheckCircle2, Loader2, QrCode, ShieldAlert, Smartphone, 
 import { api, type QrStatus } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Input';
 
 /**
  * WhatsApp Web (QR) pairing.
@@ -16,6 +17,11 @@ import { Button } from '@/components/ui/Button';
  *
  * The API enforces the same gate on `qr-connect` (403 `tos_not_acknowledged`), so
  * hiding the button here is courtesy rather than the control.
+ *
+ * Scanning stays the default. Phone-number pairing is additive and for the case the QR
+ * cannot serve: a merchant on the same phone that runs WhatsApp has nothing to point the
+ * camera at, so they can request an 8-character code and type it into
+ * WhatsApp → Linked devices → Link with phone number instead.
  */
 
 type Phase =
@@ -39,6 +45,8 @@ const TOS_POINTS = [
 export function WhatsAppQrCard({ storeId }: { storeId: string }) {
   const [phase, setPhase] = useState<Phase>('loading');
   const [qr, setQr] = useState<string | null>(null);
+  const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const [pairingPhone, setPairingPhone] = useState('');
   const [phone, setPhone] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -46,6 +54,9 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
 
   /** Live status arrives by SSE; this maps it onto the card's phases. */
   const applyStatus = useCallback((status: QrStatus['status']) => {
+    // A pairing code only means something while the session is awaiting a link. Any
+    // transition away from `qr` dates it, so drop it rather than show a dead code.
+    if (status !== 'qr') setPairingCode(null);
     switch (status) {
       case 'open':
         setPhase('open');
@@ -116,7 +127,17 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
 
     source.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data) as { type?: string; status?: QrStatus['status']; qr?: string };
+        const data = JSON.parse(event.data) as {
+          type?: string;
+          status?: QrStatus['status'];
+          qr?: string;
+          pairingCode?: string;
+        };
+        if (data.type === 'pairing_code' && data.pairingCode) {
+          setPairingCode(data.pairingCode);
+          setPhase('qr');
+          return;
+        }
         if (data.type === 'qr' && data.qr) {
           setQr(data.qr);
           setPhase('qr');
@@ -156,6 +177,15 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
         setPhase('limitReached');
         return;
       }
+      // Both are recoverable in place, so leave the phase alone and just explain.
+      if (e.message.includes('invalid_phone')) {
+        setMessage('Enter the number in full international format, digits only — e.g. 966501234567.');
+        return;
+      }
+      if (e.message.includes('session_not_ready')) {
+        setMessage('WhatsApp is still connecting. Give it a moment, then try again.');
+        return;
+      }
       setMessage(e.message || failMessage);
       setPhase('error');
     } finally {
@@ -185,6 +215,16 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
       setPhone(null);
       setPhase('idle');
     }, 'Could not disconnect.');
+
+  // Phone-number pairing, for a merchant who cannot scan the QR on the same device. The
+  // code is shown from local state if the response carries it, and the SSE stream replays
+  // it to a card that remounts mid-pairing.
+  const requestCode = () =>
+    run(async () => {
+      const res = await api.whatsappQrPairCode(storeId, pairingPhone.trim());
+      setPairingCode(res.pairingCode);
+      setPhase('qr');
+    }, 'Could not get a pairing code.');
 
   if (phase === 'tos') {
     return (
@@ -236,7 +276,8 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
             Connect a WhatsApp number
           </h3>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-            Pair by scanning a QR code from your phone. One number per store.
+            Pair by scanning a QR code from your phone, or use a phone number on mobile. One
+            number per store.
           </p>
         </div>
         {phase === 'open' && (
@@ -256,7 +297,7 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
 
       {/* Rendered as an <img> from a server-rendered data URL, so no QR library is
           pulled into the dashboard bundle. CSP already allows data: images. */}
-      {phase === 'qr' && qr && (
+      {phase === 'qr' && qr && !pairingCode && (
         <div className="mb-4 flex flex-col items-center gap-3">
           {/* eslint-disable-next-line @next/next/no-img-element -- next/image would
               recompress the image, and any lossy pass makes a QR unscannable. The QR
@@ -313,6 +354,56 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
 
       {message && phase === 'error' && (
         <p className="mb-4 text-sm text-red-600 dark:text-red-400">{message}</p>
+      )}
+
+      {phase !== 'open' && phase !== 'limitReached' && (
+        <div className="mb-4 rounded-xl border border-slate-200 p-4 dark:border-white/10">
+          {pairingCode ? (
+            <>
+              <p className="flex items-center gap-2 text-sm font-medium text-slate-900 dark:text-white">
+                <Smartphone className="h-4 w-4" />
+                Enter this code in WhatsApp
+              </p>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
+                Open WhatsApp &rarr; Linked devices &rarr; Link with phone number, then type:
+              </p>
+              <p className="mt-3 text-center font-mono text-3xl font-semibold tracking-[0.2em] text-slate-900 dark:text-white">
+                {pairingCode}
+              </p>
+              <p className="mt-2 text-xs text-slate-500">
+                This code expires in a few minutes. Keep this page open until it connects.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="flex items-center gap-2 text-sm font-medium text-slate-900 dark:text-white">
+                <Smartphone className="h-4 w-4" />
+                On mobile? Pair with your phone number
+              </p>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
+                If you cannot scan the QR on this device, get a code to type into WhatsApp instead.
+              </p>
+              <div className="mt-3 flex gap-2">
+                <Input
+                  value={pairingPhone}
+                  onChange={(e) => setPairingPhone(e.target.value)}
+                  placeholder="966501234567"
+                  inputMode="tel"
+                  autoComplete="tel"
+                  aria-label="WhatsApp phone number in international format"
+                />
+                <Button
+                  variant="secondary"
+                  onClick={requestCode}
+                  loading={busy}
+                  disabled={!pairingPhone.trim()}
+                >
+                  Get code
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
       )}
 
       <div className="flex flex-wrap gap-3">

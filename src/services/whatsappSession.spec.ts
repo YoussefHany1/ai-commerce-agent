@@ -78,6 +78,14 @@ function fakeSocket() {
   return {
     handlers,
     sent: [] as Array<{ jid: string; content: { text: string } }>,
+    // Phone-pairing: the numbers handed to Baileys (so a test can prove normalisation)
+    // and the code it returns. Overridable per test to simulate a rejected request.
+    pairedCodes: [] as string[],
+    pairingCode: 'ABCD-1234',
+    requestPairingCode(phoneNumber: string) {
+      this.pairedCodes.push(phoneNumber);
+      return Promise.resolve(this.pairingCode);
+    },
     ended: false,
     loggedOut: false,
     ev: {
@@ -560,6 +568,101 @@ describe('connection lifecycle', () => {
     const readsBefore = repo.get.mock.calls.length;
     await session.startSession(STORE);
     expect(repo.get.mock.calls.length).toBe(readsBefore + 1);
+  });
+});
+
+describe('phone pairing', () => {
+  /** A live session that has reached the QR stage, which is when a code can be minted. */
+  async function atQrStage() {
+    await session.startSession(STORE);
+    socket.emit('connection.update', { qr: 'BASE64QR' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('qr'));
+  }
+
+  test('normalises the number to digits before handing it to Baileys', async () => {
+    // Baileys passes the value straight to jidEncode without stripping separators, so a
+    // "+966 50 123 4567" from the merchant would otherwise build a malformed JID.
+    await atQrStage();
+    await expect(session.requestPairingCode(STORE, '+966 50 123 4567')).resolves.toMatchObject({
+      phone: '966501234567',
+    });
+    expect(socket.pairedCodes).toEqual(['966501234567']);
+  });
+
+  test('returns and emits the code, and reports the session as awaiting a scan', async () => {
+    const events: any[] = [];
+    session.subscribe(STORE, (e) => events.push(e));
+    await atQrStage();
+    socket.pairingCode = 'WXYZ-9876';
+
+    await expect(session.requestPairingCode(STORE, '966501234567')).resolves.toEqual({
+      pairingCode: 'WXYZ-9876',
+      phone: '966501234567',
+    });
+    expect(events.some((e) => e.type === 'pairing_code' && e.pairingCode === 'WXYZ-9876')).toBe(true);
+    expect(session.statusFor(STORE)).toBe('qr');
+    expect(session.pairingCodeFor(STORE)).toBe('WXYZ-9876');
+  });
+
+  test('rejects a phone that has no usable digits without touching the socket', async () => {
+    await session.startSession(STORE);
+    await expect(session.requestPairingCode(STORE, '+()- ')).rejects.toBeInstanceOf(session.PairingPhoneError);
+    expect(socket.pairedCodes).toHaveLength(0);
+  });
+
+  test('rejects a number that is too short to be international', async () => {
+    await session.startSession(STORE);
+    await expect(session.requestPairingCode(STORE, '12345')).rejects.toBeInstanceOf(session.PairingPhoneError);
+  });
+
+  test('refuses to mint a code on an already-linked number', async () => {
+    // There is nothing to link once the socket is open, and Baileys would send an IQ that
+    // the server rejects; fail early with a message the card can act on.
+    await session.startSession(STORE);
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
+    await expect(session.requestPairingCode(STORE, '966501234567')).rejects.toBeInstanceOf(
+      session.PairingNotReadyError,
+    );
+  });
+
+  test('explains a session that is not ready rather than hanging forever', async () => {
+    vi.useFakeTimers();
+    const pending = session.requestPairingCode(STORE, '966501234567');
+    const rejected = expect(pending).rejects.toBeInstanceOf(session.PairingNotReadyError);
+    await vi.advanceTimersByTimeAsync(session.PAIRING_READY_TIMEOUT_MS + 1_000);
+    await rejected;
+  });
+
+  test('a rejected pairing after a code is requested reports pairing, not a logout', async () => {
+    // The regression this guards: requestPairingCode pre-populates creds.me, which the
+    // close handler would read as "this number was already linked, so 401 means logged
+    // out". awaitingScan keeps the two apart.
+    const events: any[] = [];
+    session.subscribe(STORE, (e) => events.push(e));
+    await atQrStage();
+    await session.requestPairingCode(STORE, '966501234567');
+
+    socket.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 401 } } },
+    });
+    await vi.waitFor(() => {
+      const err = events.find((e) => e.type === 'status' && e.status === 'error');
+      expect(err?.error).toMatch(/pairing/i);
+    });
+    expect(session.statusFor(STORE)).toBe('error');
+    expect(repo.clear).toHaveBeenCalled();
+  });
+
+  test('the replayed code is dropped once the number opens', async () => {
+    await atQrStage();
+    await session.requestPairingCode(STORE, '966501234567');
+    expect(session.pairingCodeFor(STORE)).toBe('ABCD-1234');
+
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
+    expect(session.pairingCodeFor(STORE)).toBeNull();
   });
 });
 

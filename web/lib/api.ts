@@ -263,6 +263,20 @@ export const api = {
       body: { storeId },
     }),
 
+  /**
+   * Mints an 8-character code for pairing by phone number, for a merchant on the very
+   * phone that runs WhatsApp and therefore cannot scan the QR.
+   *
+   * The number must be in full international format (country code first); it is
+   * normalised to digits server-side. Rejects with `invalid_phone` and
+   * `session_not_ready` (still connecting, or already linked) rather than retrying.
+   */
+  whatsappQrPairCode: (storeId: string, phone: string) =>
+    request<{ ok: true; pairingCode: string; phone: string }>('/api/whatsapp/qr-pair-code', {
+      method: 'POST',
+      body: { storeId, phone },
+    }),
+
   /** Unlinks the number from WhatsApp and drops the stored pairing. */
   whatsappQrDisconnect: (storeId: string) =>
     request<{ ok: true }>('/api/whatsapp/qr-disconnect', {

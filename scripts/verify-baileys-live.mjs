@@ -96,6 +96,27 @@ const stubs = {
   '../lib/phone.js': {
     normalizeJid: (s) => String(s).split('@')[0].split(':')[0] || null,
     toJid: (d) => (d ? `${d}@s.whatsapp.net` : null),
+    // Mirror src/lib/phone.ts: a LID stays a LID, and only digits reach jidEncode.
+    parseJid: (s) => {
+      const raw = String(s ?? '').trim().toLowerCase();
+      const at = raw.lastIndexOf('@');
+      if (at === -1) return null;
+      const server = raw.slice(at + 1);
+      if (!['s.whatsapp.net', 'c.us', 'lid'].includes(server)) return null;
+      const digits = raw.slice(0, at).split(':')[0].replace(/\D/g, '');
+      if (!digits) return null;
+      return { digits, jid: server === 'lid' ? `${digits}@lid` : `${digits}@s.whatsapp.net` };
+    },
+    addressForSend: (jid, digits) => {
+      if (jid && String(jid).includes('@')) return String(jid).trim().toLowerCase();
+      const d = String(digits ?? '').replace(/\D/g, '');
+      return d ? `${d}@s.whatsapp.net` : null;
+    },
+    pairingDigits: (input) => {
+      if (!input) return null;
+      const digits = String(input).replace(/\D/g, '');
+      return digits || null;
+    },
   },
   './agent.js': { answerWithTools: async () => '', toChatHistory: () => [] },
   '../db/schema.js': {},
@@ -120,6 +141,9 @@ function stubUrl(spec) {
       `export const handleInboundText = s.handleInboundText;`,
       `export const normalizeJid = s.normalizeJid;`,
       `export const toJid = s.toJid;`,
+      `export const parseJid = s.parseJid;`,
+      `export const addressForSend = s.addressForSend;`,
+      `export const pairingDigits = s.pairingDigits;`,
       `export const answerWithTools = s.answerWithTools;`,
       `export const toChatHistory = s.toChatHistory;`,
       '',
