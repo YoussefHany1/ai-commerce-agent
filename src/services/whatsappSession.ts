@@ -1003,6 +1003,35 @@ async function onConnectionUpdate(session: LiveSession, auth: AuthState, update:
 }
 
 /**
+ * How long a graceful `logout()` may take before the socket is ended regardless.
+ *
+ * Baileys' logout sends an IQ and awaits the reply, bounded by `defaultQueryTimeoutMs`
+ * (60s). On a socket that is already wedged — the exact state a disconnect is meant to
+ * recover from — that reply never comes, so an awaited logout blocks the request for a
+ * full minute. The dashboard's "Reconnect" is a disconnect-then-connect, so it inherited
+ * the same stall: the fresh QR only appeared after ~70s. The unlink is best-effort here;
+ * what must not wait is closing the socket and clearing local state.
+ */
+const LOGOUT_TIMEOUT_MS = 5_000;
+
+/**
+ * Awaits `socket.logout()`, but never longer than `ms`.
+ *
+ * A logout that loses the race can still reject later; that rejection is swallowed so it
+ * cannot surface as an unhandled rejection after teardown has already moved on.
+ */
+async function logoutWithin(socket: SocketLike, ms: number): Promise<void> {
+  const logout = socket.logout?.() ?? Promise.resolve();
+  logout.catch(() => undefined);
+  await Promise.race([
+    logout,
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, ms).unref?.();
+    }),
+  ]);
+}
+
+/**
  * Tears down the socket and releases the lease.
  *
  * `logout` is the *disconnect* path (unlinks the number from WhatsApp) and is only
@@ -1020,10 +1049,17 @@ async function teardown(
     session.connectTimer = null;
   }
   try {
-    if (opts.logout) await session.socket.logout?.();
-    else session.socket.end();
+    if (opts.logout) await logoutWithin(session.socket, LOGOUT_TIMEOUT_MS);
   } catch (err) {
     logger.warn({ err, storeId: session.storeId }, 'whatsapp: socket teardown failed');
+  } finally {
+    // A completed logout already ends the socket; a timed-out or absent one does not, and
+    // a still-live old socket would keep fighting the new session for the same number.
+    try {
+      session.socket.end();
+    } catch {
+      // Already closed.
+    }
   }
   live.delete(session.storeId);
   lastQr.delete(session.storeId);

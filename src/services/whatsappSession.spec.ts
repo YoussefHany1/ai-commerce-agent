@@ -685,6 +685,29 @@ describe('disconnect', () => {
     await session.stopSession(STORE, { logout: true });
     expect(repo.clear).toHaveBeenCalledWith(STORE);
   });
+
+  test('a hung logout is abandoned so the disconnect still completes', async () => {
+    // The regression this guards: a wedged socket never answers the logout IQ, and Baileys
+    // waits defaultQueryTimeoutMs (60s) for it. The dashboard's Reconnect is a
+    // disconnect-then-connect, so that stall delayed the fresh QR by ~70s.
+    await session.startSession(STORE);
+    vi.useFakeTimers();
+    // Never settles: the IQ reply never arrives on a dead socket.
+    socket.logout = () => new Promise<void>(() => {});
+
+    const stopped = session.stopSession(STORE, { logout: true });
+    let settled = false;
+    void stopped.then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(6_000);
+    await stopped;
+
+    expect(settled).toBe(true);
+    expect(socket.ended).toBe(true);
+    expect(repo.clear).toHaveBeenCalledWith(STORE);
+    expect(session.statusFor(STORE)).toBe('logged_out');
+  });
 });
 
 describe('inbound', () => {
