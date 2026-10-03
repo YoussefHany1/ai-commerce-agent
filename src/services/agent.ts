@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import type { Product } from '../types.js';
 import { retrieve } from './retrieval.js';
-import { chatWithFallback, hasOpenAI, hasOpenRouter } from './llm.js';
+import { chatWithFallback, chatWithFallbackStream, hasOpenAI, hasOpenRouter } from './llm.js';
 import { customerRepo, orderRepo, catalogRepo } from '../db/repos.js';
 import { getCommerceAdapter } from '../integrations/factory.js';
 import { config } from '../config.js';
@@ -336,5 +336,61 @@ export async function answerWithTools(
     return fallbackReply(found.map((f) => f.product));
   } finally {
     clearTimeout(deadline);
+  }
+}
+
+/**
+ * Streaming sibling of `answerWithTools`. Text is forwarded as the model
+ * produces it, while the tool loop and persistence are otherwise identical.
+ *
+ * `signal` lets a caller (the chat route) stop generation as soon as the shopper
+ * disconnects; it is folded into the same controller as the wall-clock deadline.
+ */
+export async function answerWithToolsStream(
+  storeId: string,
+  message: string,
+  history: ChatMessage[] = [],
+  onDelta: (delta: string) => void = () => {},
+  signal?: AbortSignal,
+): Promise<string> {
+  if (!hasOpenAI && !hasOpenRouter) {
+    const found = await retrieve(message, storeId, { limit: 8 });
+    const reply = fallbackReply(found.map((f) => f.product));
+    onDelta(reply);
+    return reply;
+  }
+  const controller = new AbortController();
+  const onExternalAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  const deadline = setTimeout(() => controller.abort(), config.LLM_TOTAL_TIMEOUT_MS);
+  deadline.unref?.();
+  let emitted = false;
+  const emit = (delta: string) => {
+    if (!delta) return;
+    emitted = true;
+    onDelta(delta);
+  };
+  try {
+    const { reply } = await runToolLoop(
+      storeId,
+      message,
+      (input) => chatWithFallbackStream(input as any, TOOLS, { signal: controller.signal }, emit),
+      history,
+    );
+    return reply;
+  } catch (err) {
+    // Once any text has streamed, a fallback would append a second answer to the
+    // first; surface the failure instead and let the caller keep what it has.
+    if (emitted) throw err;
+    const found = await retrieve(message, storeId, { limit: 8 });
+    const reply = fallbackReply(found.map((f) => f.product));
+    emit(reply);
+    return reply;
+  } finally {
+    clearTimeout(deadline);
+    signal?.removeEventListener('abort', onExternalAbort);
   }
 }

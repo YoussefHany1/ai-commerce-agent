@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { randomBytes } from 'node:crypto';
+import { PassThrough } from 'node:stream';
 import { z } from 'zod';
 import {
   storeRepo,
@@ -10,7 +11,7 @@ import {
 } from '../db/repos.js';
 import { getCommerceAdapter, verifyStoreCredentials } from '../integrations/factory.js';
 import { recordImpressions } from '../services/analytics.js';
-import { answerWithTools, toChatHistory } from '../services/agent.js';
+import { answerWithTools, answerWithToolsStream, toChatHistory } from '../services/agent.js';
 import { retrieve, embedMissingCatalog } from '../services/retrieval.js';
 import { dbPing, redisPing, rlsPing } from '../lib/health.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
@@ -257,16 +258,61 @@ export async function api(app: FastifyInstance) {
       const list = found.map((f) => f.product);
       const history = toChatHistory(historyRows);
       await conversationRepo.addMessage({ storeId: sess.storeId, conversationId, role: 'user', content: body.message });
-      const reply = await answerWithTools(sess.storeId, body.message, history);
-      await conversationRepo.addMessage({ storeId: sess.storeId, conversationId, role: 'assistant', content: reply });
       // Record the recommendation without blocking the reply, so the funnel still
       // has a denominator even for a product the shopper never clicks. Best-effort:
       // a failed analytics write must not cost the shopper their answer.
-      void recordImpressions(sess.storeId, {
-        conversationId,
-        productIds: list.map((p) => p.id),
-      }).catch(() => 0);
-      return { reply, products: list };
+      const persistImpressions = () =>
+        void recordImpressions(sess.storeId, {
+          conversationId,
+          productIds: list.map((p) => p.id),
+        }).catch(() => 0);
+
+      // Content negotiation keeps the original JSON contract for every existing
+      // caller; the widget and dashboard opt into SSE with an Accept header.
+      const wantsStream = String(req.headers.accept ?? '').includes('text/event-stream');
+      if (!wantsStream) {
+        const reply = await answerWithTools(sess.storeId, body.message, history);
+        await conversationRepo.addMessage({ storeId: sess.storeId, conversationId, role: 'assistant', content: reply });
+        persistImpressions();
+        return { reply, products: list };
+      }
+
+      // Cards render from the `products` event while the answer streams in, and the
+      // terminal `done` event carries the authoritative, persisted reply.
+      const stream = new PassThrough();
+      rep.header('content-type', 'text/event-stream');
+      rep.header('cache-control', 'no-cache, no-transform');
+      rep.header('connection', 'keep-alive');
+      // Proxies that buffer would defeat the point of a stream.
+      rep.header('x-accel-buffering', 'no');
+      const send = (event: unknown) => {
+        if (!stream.destroyed) stream.write(`data: ${JSON.stringify(event)}\n\n`);
+      };
+      // Stop generation the moment the shopper navigates away; the deadline inside
+      // `answerWithToolsStream` still bounds the happy path. A normal completion also
+      // closes the response, so aborting here afterwards is a harmless no-op.
+      const disconnect = new AbortController();
+      rep.raw.on('close', () => disconnect.abort());
+      send({ type: 'products', products: list });
+      void (async () => {
+        try {
+          const reply = await answerWithToolsStream(
+            sess.storeId,
+            body.message,
+            history,
+            (delta) => send({ type: 'delta', delta }),
+            disconnect.signal,
+          );
+          send({ type: 'done', reply });
+          await conversationRepo.addMessage({ storeId: sess.storeId, conversationId, role: 'assistant', content: reply });
+          persistImpressions();
+        } catch {
+          send({ type: 'error', message: 'agent_error' });
+        } finally {
+          if (!stream.destroyed) stream.end();
+        }
+      })();
+      return rep.send(stream);
     },
   );
 }

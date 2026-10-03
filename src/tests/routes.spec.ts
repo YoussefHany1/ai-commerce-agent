@@ -87,7 +87,22 @@ const services = vi.hoisted(() => {
   return {
     health,
     retrieval: { retrieve: vi.fn(async () => []), embedMissingCatalog: vi.fn(async () => {}) },
-    agent: { answerWithTools: vi.fn(async () => 'مرحباً'), toChatHistory: vi.fn((rows: any[]) => rows) },
+    agent: {
+      answerWithTools: vi.fn(async () => 'مرحباً'),
+      answerWithToolsStream: vi.fn(
+        async (
+          _storeId: string,
+          _message: string,
+          _history: unknown[],
+          onDelta: (delta: string) => void,
+        ) => {
+          onDelta('مرح');
+          onDelta('با');
+          return 'مرحبا';
+        },
+      ),
+      toChatHistory: vi.fn((rows: any[]) => rows),
+    },
     analytics: {
       allowsAnalytics: vi.fn(),
       getDailyMetrics: vi.fn(async () => []),
@@ -484,6 +499,33 @@ describe('routes: chat + sessions', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ reply: 'مرحباً', products: [] });
+    expect(mocks.conversationRepo.addMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('streams products, deltas, and a done event when the client asks for SSE', async () => {
+    mocks.conversationRepo.history.mockResolvedValue([]);
+    mocks.conversationRepo.addMessage.mockResolvedValue(undefined);
+    services.retrieval.retrieve.mockResolvedValue([]);
+    const token = await mintSession(app);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/chat',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      payload: JSON.stringify({ message: 'أهلاً' }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('text/event-stream');
+    const frames = res.payload
+      .split('\n\n')
+      .filter(Boolean)
+      .map((frame) => JSON.parse(frame.replace(/^data: /, '')));
+    expect(frames[0]).toMatchObject({ type: 'products', products: [] });
+    expect(frames.filter((f) => f.type === 'delta').map((f) => f.delta)).toEqual(['مرح', 'با']);
+    expect(frames.at(-1)).toMatchObject({ type: 'done', reply: 'مرحبا' });
     expect(mocks.conversationRepo.addMessage).toHaveBeenCalledTimes(2);
   });
 

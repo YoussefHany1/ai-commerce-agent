@@ -197,24 +197,86 @@
     renderMessages();
     setBusy(true);
 
+    // The assistant bubble is created empty and filled by the stream, so the
+    // shopper sees tokens appear instead of waiting for the whole answer.
+    var assistant = null;
+
     ensureSession()
       .then(function (s) {
-        return post('/api/chat', { message: message }, { Authorization: 'Bearer ' + s.token });
+        // Not routed through post(): streaming needs the Accept header and the raw
+        // body reader, and the response is SSE rather than JSON.
+        return fetch(api + '/api/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-embed-key': key,
+            Accept: 'text/event-stream',
+            Authorization: 'Bearer ' + s.token,
+          },
+          credentials: 'omit',
+          body: JSON.stringify({ message: message }),
+        });
       })
       .then(function (res) {
-        return res.json();
-      })
-      .then(function (data) {
-        messages.push({
-          role: 'assistant',
-          content: data.reply || '',
-          products: (data.products || []).slice(0, 3),
-        });
+        if (!res.ok || !res.body) throw new Error('chat_failed');
+        assistant = { role: 'assistant', content: '', products: [] };
+        messages.push(assistant);
         setBusy(false);
         renderMessages();
+
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+
+        function handle(frame) {
+          var lines = frame.split('\n');
+          var dataLine = null;
+          for (var i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf('data:') === 0) { dataLine = lines[i]; break; }
+          }
+          if (!dataLine) return;
+          var evt;
+          try {
+            evt = JSON.parse(dataLine.slice(5));
+          } catch {
+            return;
+          }
+          if (evt.type === 'products') {
+            assistant.products = (evt.products || []).slice(0, 3);
+          } else if (evt.type === 'delta') {
+            assistant.content += evt.delta || '';
+          } else if (evt.type === 'done') {
+            assistant.content = evt.reply || assistant.content;
+          } else if (evt.type === 'error') {
+            throw new Error('agent_error');
+          }
+          renderMessages();
+        }
+
+        function pump() {
+          return reader.read().then(function (r) {
+            if (r.done) return;
+            buffer += decoder.decode(r.value, { stream: true });
+            var idx;
+            while ((idx = buffer.indexOf('\n\n')) !== -1) {
+              var frame = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 2);
+              handle(frame);
+            }
+            return pump();
+          });
+        }
+
+        return pump();
       })
       .catch(function () {
         setBusy(false);
+        // A failure after tokens streamed keeps the partial answer; only a turn that
+        // produced nothing gets the retry message.
+        if (assistant && assistant.content) {
+          renderMessages();
+          return;
+        }
         messages.push({ role: 'assistant', content: "Sorry — I couldn't reach the store just now. Please try again." });
         renderMessages();
       });

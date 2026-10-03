@@ -84,6 +84,18 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Incremental callbacks for a streamed chat turn.
+ *
+ * `onProducts` fires before any text because the backend sends the recommendation
+ * set it retrieved up front, so cards can render while the answer is still being
+ * generated. `onDelta` receives assistant text as it arrives.
+ */
+export type ChatStreamHandlers = {
+  onProducts?: (products: ChatResponse['products']) => void;
+  onDelta?: (delta: string) => void;
+};
+
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, query, headers, signal, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
   const qs = query
@@ -344,6 +356,86 @@ export const api = {
     // Hand the token back so a recommendation click on this turn can be
     // attributed. It is a short-lived guest token already in this tab's memory.
     return { ...res, token: sessionRes.token };
+  },
+
+  /**
+   * Streamed sibling of `chat`.
+   *
+   * Talks to the dedicated `/api/chat/stream` BFF route rather than the generic
+   * proxy, which buffers the response body. The returned promise resolves with the
+   * same shape as `chat` once the terminal `done` event arrives; handlers see the
+   * products and text in between.
+   */
+  chatStream: async (
+    storeId: string,
+    message: string,
+    handlers: ChatStreamHandlers = {},
+    signal?: AbortSignal,
+  ): Promise<ChatResult> => {
+    const sessionRes = await request<{ token: string; conversationId: string }>('/api/session', {
+      method: 'POST',
+      body: { storeId },
+    });
+    const res = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+        authorization: `Bearer ${sessionRes.token}`,
+      },
+      body: JSON.stringify({ message }),
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal,
+    });
+    if (!res.ok || !res.body) {
+      let payload: unknown = null;
+      try {
+        payload = await res.json();
+      } catch {
+        /* error body was not JSON */
+      }
+      throw new ApiError(res.status, payload);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let reply = '';
+    let products: ChatResponse['products'] = [];
+
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const line = frame.split('\n').find((l) => l.startsWith('data:'));
+        if (line) {
+          const event = JSON.parse(line.slice(5).trim()) as
+            | { type: 'products'; products: ChatResponse['products'] }
+            | { type: 'delta'; delta: string }
+            | { type: 'done'; reply: string }
+            | { type: 'error'; message?: string };
+          if (event.type === 'products') {
+            products = event.products ?? [];
+            handlers.onProducts?.(products);
+          } else if (event.type === 'delta') {
+            reply += event.delta;
+            handlers.onDelta?.(event.delta);
+          } else if (event.type === 'done') {
+            reply = event.reply ?? reply;
+          } else if (event.type === 'error') {
+            throw new ApiError(502, { error: event.message ?? 'agent_error' });
+          }
+        }
+        boundary = buffer.indexOf('\n\n');
+      }
+    }
+
+    return { reply, products, token: sessionRes.token };
   },
 
   attributionClick: (token: string, productId: string) =>

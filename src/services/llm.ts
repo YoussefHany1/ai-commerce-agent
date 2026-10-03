@@ -7,6 +7,9 @@ export type ChatToolDef = OpenAI.Responses.FunctionTool;
 
 export type LlmCallOptions = { signal?: AbortSignal };
 
+/** Receives streamed assistant text as it is produced. */
+export type DeltaHandler = (delta: string) => void;
+
 export type LlmItem = {
   type?: string;
   role?: string;
@@ -105,29 +108,62 @@ export function toChatTools(tools: ChatToolDef[] | undefined): unknown[] | undef
   }));
 }
 
+function openaiRequest(input: unknown[], tools: ChatToolDef[] | undefined) {
+  return {
+    model: config.OPENAI_MODEL,
+    input: input as never,
+    tools: (tools ?? undefined) as never,
+    // Do not retain responses server-side; this is a stateless sales agent.
+    store: false,
+    max_output_tokens: config.LLM_MAX_OUTPUT_TOKENS,
+    reasoning: { effort: config.LLM_REASONING_EFFORT },
+    // Stable key so repeated prefixes (the long Arabic developer prompt) hit the
+    // provider's prompt cache instead of being re-billed at full price.
+    prompt_cache_key: 'ai-commerce-agent',
+    // temperature is deliberately omitted: gpt-5-family reasoning models reject
+    // or ignore it, and the reasoning effort knob is the supported control.
+  };
+}
+
+function requestOptions(opts?: LlmCallOptions): { signal: AbortSignal } | undefined {
+  return opts?.signal ? { signal: opts.signal } : undefined;
+}
+
 async function openaiResponses(
   input: unknown[],
   tools: ChatToolDef[] | undefined,
   opts?: LlmCallOptions,
 ): Promise<LlmResult> {
-  const res = await openai!.responses.create(
-    {
-      model: config.OPENAI_MODEL,
-      input: input as never,
-      tools: (tools ?? undefined) as never,
-      // Do not retain responses server-side; this is a stateless sales agent.
-      store: false,
-      max_output_tokens: config.LLM_MAX_OUTPUT_TOKENS,
-      reasoning: { effort: config.LLM_REASONING_EFFORT },
-      // Stable key so repeated prefixes (the long Arabic developer prompt) hit the
-      // provider's prompt cache instead of being re-billed at full price.
-      prompt_cache_key: 'ai-commerce-agent',
-      // temperature is deliberately omitted: gpt-5-family reasoning models reject
-      // or ignore it, and the reasoning effort knob is the supported control.
-    },
-    opts?.signal ? { signal: opts.signal } : undefined,
-  );
+  const res = await openai!.responses.create(openaiRequest(input, tools), requestOptions(opts));
   return { output_text: res.output_text, output: res.output as unknown[] };
+}
+
+/**
+ * Streaming OpenAI variant. Text deltas are forwarded as they arrive, and the
+ * full response (including any function calls) is assembled from the terminal
+ * `response.completed` event, so the tool loop sees exactly what it would have
+ * non-streamed.
+ */
+async function openaiResponsesStream(
+  input: unknown[],
+  tools: ChatToolDef[] | undefined,
+  opts: LlmCallOptions | undefined,
+  onDelta: DeltaHandler,
+): Promise<LlmResult> {
+  const events = await openai!.responses.create(
+    { ...openaiRequest(input, tools), stream: true },
+    requestOptions(opts),
+  );
+  let final: OpenAI.Responses.Response | undefined;
+  for await (const event of events) {
+    if (event.type === 'response.output_text.delta') {
+      if (event.delta) onDelta(event.delta);
+    } else if (event.type === 'response.completed') {
+      final = event.response;
+    }
+  }
+  if (!final) throw new Error('llm_stream_incomplete');
+  return { output_text: final.output_text, output: final.output as unknown[] };
 }
 
 async function openrouterChat(
@@ -156,6 +192,53 @@ async function openrouterChat(
     arguments: tc.function?.arguments ?? '{}',
   }));
   return { output_text: msg.content ?? undefined, output };
+}
+
+/**
+ * Streaming OpenRouter variant. Chat-completions streams tool calls as deltas
+ * keyed by index, so they are accumulated here and only returned once the stream
+ * ends — a partially assembled tool call is not valid input for the next round.
+ */
+async function openrouterChatStream(
+  input: unknown[],
+  tools: ChatToolDef[] | undefined,
+  opts: LlmCallOptions | undefined,
+  onDelta: DeltaHandler,
+): Promise<LlmResult> {
+  const stream = await openrouter!.chat.completions.create(
+    {
+      model: config.OPENROUTER_MODEL,
+      messages: toChatMessages(input) as never,
+      tools: toChatTools(tools) as never,
+      max_tokens: config.LLM_MAX_OUTPUT_TOKENS,
+      stream: true,
+    },
+    requestOptions(opts),
+  );
+  let text = '';
+  const calls = new Map<number, { id: string; name: string; args: string }>();
+  for await (const chunk of stream) {
+    const delta = chunk.choices?.[0]?.delta;
+    if (delta?.content) {
+      text += delta.content;
+      onDelta(delta.content);
+    }
+    for (const tc of delta?.tool_calls ?? []) {
+      const idx = tc.index ?? 0;
+      const cur = calls.get(idx) ?? { id: '', name: '', args: '' };
+      if (tc.id) cur.id = tc.id;
+      if (tc.function?.name) cur.name = tc.function.name;
+      if (tc.function?.arguments) cur.args += tc.function.arguments;
+      calls.set(idx, cur);
+    }
+  }
+  const output: unknown[] = [...calls.values()].map((c) => ({
+    type: 'function_call',
+    call_id: c.id,
+    name: c.name,
+    arguments: c.args || '{}',
+  }));
+  return { output_text: text || undefined, output };
 }
 
 /**
@@ -192,5 +275,34 @@ export async function chatWithFallback(
     }
   }
   if (openrouter) return openrouterChat(input, tools, opts);
+  throw new Error('no_llm_provider');
+}
+
+/**
+ * Streaming sibling of `chatWithFallback`.
+ *
+ * Falling back after the first delta would duplicate text the shopper has already
+ * seen, so the other provider is only tried while nothing has been emitted yet.
+ */
+export async function chatWithFallbackStream(
+  input: unknown[],
+  tools: ChatToolDef[] | undefined,
+  opts: LlmCallOptions | undefined,
+  onDelta: DeltaHandler,
+): Promise<LlmResult> {
+  let emitted = false;
+  const wrapped: DeltaHandler = (delta) => {
+    emitted = true;
+    onDelta(delta);
+  };
+  if (openai) {
+    try {
+      return await openaiResponsesStream(input, tools, opts, wrapped);
+    } catch (err) {
+      if (opts?.signal?.aborted || emitted) throw err;
+      if (!openrouter || !isRetryable(err)) throw err;
+    }
+  }
+  if (openrouter) return openrouterChatStream(input, tools, opts, onDelta);
   throw new Error('no_llm_provider');
 }
