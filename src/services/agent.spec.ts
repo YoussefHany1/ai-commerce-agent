@@ -90,7 +90,7 @@ describe('agent tool loop', () => {
     const res = await runToolLoop('store-1', 'أرني منتجاتك', create);
     expect(create).toHaveBeenCalledTimes(3);
     expect(res.toolRuns.length).toBeGreaterThanOrEqual(1);
-    expect(res.reply).toBeTruthy();
+    expect(res.reply).toContain('توضيح');
   });
 
   test('rejects unknown tools with an error payload', async () => {
@@ -170,5 +170,85 @@ describe('agent tool loop', () => {
     expect(res.toolRuns[0].output).toContain('05****67');
     expect(res.toolRuns[0].output).toContain('m***@example.com');
     expect(res.toolRuns[0].output).not.toContain('0501234567');
+  });
+
+  test('runs multiple tool calls in one round and feeds both outputs back', async () => {
+    const { runToolLoop } = await import('./agent.js');
+    const catalogRepo = (await import('../db/repos.js')).catalogRepo;
+    const retrieval = (await import('./retrieval.js')).retrieve;
+    vi.mocked(retrieval).mockResolvedValueOnce([
+      {
+        product: { id: 'p1', title: 'سيروم', price: 50, currency: 'SAR', available: true },
+        score: 1,
+        source: 'fts',
+      },
+    ]);
+    vi.mocked(catalogRepo.list).mockResolvedValueOnce([
+      { id: 'p2', title: 'كريم', price: 30, currency: 'SAR', available: true },
+    ]);
+
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce({
+        output_text: undefined,
+        output: [
+          {
+            type: 'function_call',
+            call_id: 'c1',
+            name: 'search_products',
+            arguments: JSON.stringify({ query: 'سيروم' }),
+          },
+          { type: 'function_call', call_id: 'c2', name: 'list_products', arguments: '{}' },
+        ],
+      })
+      .mockResolvedValueOnce({ output_text: 'تفضل', output: [] });
+
+    const res = await runToolLoop('store-1', 'أرني منتجات', create);
+    expect(res.toolRuns.map((r) => r.name)).toEqual(['search_products', 'list_products']);
+    expect(res.toolRuns[0].output).toContain('سيروم');
+    expect(res.toolRuns[1].output).toContain('كريم');
+    const secondInput = create.mock.calls[1][0] as Array<{ type?: string; call_id?: string }>;
+    const outputs = secondInput.filter((i) => i.type === 'function_call_output');
+    expect(outputs.map((o) => o.call_id)).toEqual(['c1', 'c2']);
+  });
+
+  test('search_products drops heavy fields so results stay under the size cap', async () => {
+    const { runToolLoop } = await import('./agent.js');
+    const retrieval = (await import('./retrieval.js')).retrieve;
+    vi.mocked(retrieval).mockResolvedValueOnce([
+      {
+        product: {
+          id: 'p1',
+          title: 'سيروم',
+          description: 'x'.repeat(5000),
+          price: 50,
+          currency: 'SAR',
+          available: true,
+          sku: 'SKU-1',
+        },
+        score: 1,
+        source: 'fts',
+      },
+    ]);
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce({
+        output_text: undefined,
+        output: [
+          {
+            type: 'function_call',
+            call_id: 'c1',
+            name: 'search_products',
+            arguments: JSON.stringify({ query: 'سيروم' }),
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ output_text: 'تم', output: [] });
+
+    const res = await runToolLoop('store-1', 'سيروم', create);
+    const output = res.toolRuns[0].output;
+    expect(output).not.toContain('xxxx');
+    expect(output.length).toBeLessThan(3000);
+    expect(JSON.parse(output)[0]).toMatchObject({ id: 'p1', title: 'سيروم', price: 50, currency: 'SAR' });
   });
 });

@@ -9,6 +9,8 @@ import { describe, expect, test, vi, beforeEach } from 'vitest';
 const tx = {
   execute: vi.fn(),
   insert: () => ({ values: () => ({ onConflictDoUpdate: () => ({ getSQL: () => ({}) }) }) }),
+  // Read path used by getDailyMetrics: select(...).from(...).where(...).orderBy(...).
+  select: () => ({ from: () => ({ where: () => ({ orderBy: async () => [] }) }) }),
 };
 
 vi.mock('../db/client.js', () => ({
@@ -131,5 +133,29 @@ describe('rollupDailyMetrics order bucketing', () => {
       converted: 1,
       attributedRevenue: 90,
     });
+  });
+});
+
+describe('getDailyMetrics freshness gate', () => {
+  test('rolls up on the first read, then serves stored rows within the TTL', async () => {
+    tx.execute.mockClear();
+    const { getDailyMetrics } = await import('../services/analytics.js');
+    await getDailyMetrics('store-fresh', 7);
+    const afterFirst = tx.execute.mock.calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    await getDailyMetrics('store-fresh', 7);
+    // The second read within the TTL must not run the seven-query rollup again.
+    expect(tx.execute.mock.calls.length).toBe(afterFirst);
+  });
+
+  test('re-rolls when the requested window is wider than what was rolled up', async () => {
+    tx.execute.mockClear();
+    const { getDailyMetrics } = await import('../services/analytics.js');
+    await getDailyMetrics('store-wider', 3);
+    const afterNarrow = tx.execute.mock.calls.length;
+
+    await getDailyMetrics('store-wider', 30);
+    expect(tx.execute.mock.calls.length).toBeGreaterThan(afterNarrow);
   });
 });

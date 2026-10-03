@@ -245,19 +245,24 @@ export async function api(app: FastifyInstance) {
     async (req, rep) => {
       const body = z.object({ message: z.string().min(1).max(2000) }).parse(req.body);
       const sess = (req as any).session as CustomerSession;
-      const store = await storeRepo.get(sess.storeId);
-      if (!store) return rep.code(404).send({ error: 'store_not_found' });
-      const found = await retrieve(body.message, sess.storeId);
-      const list = found.map((f) => f.product);
       const conversationId = sess.conversationId;
-      const history = toChatHistory(await conversationRepo.history(sess.storeId, conversationId, 10));
+      // The store lookup, retrieval and transcript are independent; running them
+      // together removes two serial round-trips from every turn's critical path.
+      const [store, found, historyRows] = await Promise.all([
+        storeRepo.get(sess.storeId),
+        retrieve(body.message, sess.storeId),
+        conversationRepo.history(sess.storeId, conversationId, 10),
+      ]);
+      if (!store) return rep.code(404).send({ error: 'store_not_found' });
+      const list = found.map((f) => f.product);
+      const history = toChatHistory(historyRows);
       await conversationRepo.addMessage({ storeId: sess.storeId, conversationId, role: 'user', content: body.message });
       const reply = await answerWithTools(sess.storeId, body.message, history);
       await conversationRepo.addMessage({ storeId: sess.storeId, conversationId, role: 'assistant', content: reply });
-      // Record the recommendation before returning it, so the funnel has a
-      // denominator even for a product the shopper never clicks. Best-effort: a
-      // failed analytics write must not cost the shopper their answer.
-      await recordImpressions(sess.storeId, {
+      // Record the recommendation without blocking the reply, so the funnel still
+      // has a denominator even for a product the shopper never clicks. Best-effort:
+      // a failed analytics write must not cost the shopper their answer.
+      void recordImpressions(sess.storeId, {
         conversationId,
         productIds: list.map((p) => p.id),
       }).catch(() => 0);

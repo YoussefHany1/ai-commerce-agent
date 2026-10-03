@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'vitest';
-import { toChatMessages, toChatTools, hasOpenAI, hasOpenRouter } from './llm.js';
+import { toChatMessages, toChatTools, hasOpenAI, hasOpenRouter, isRetryable } from './llm.js';
 
 describe('llm chat-completions conversion', () => {
   test('maps developer role to system and keeps user content', () => {
@@ -76,5 +76,28 @@ describe('provider availability flags', () => {
   test('flags are booleans derived from config', () => {
     expect(typeof hasOpenAI).toBe('boolean');
     expect(typeof hasOpenRouter).toBe('boolean');
+  });
+});
+
+describe('llm fallback retry policy', () => {
+  test('retries only on transient HTTP statuses', () => {
+    expect(isRetryable({ status: 408 })).toBe(true);
+    expect(isRetryable({ status: 409 })).toBe(true);
+    expect(isRetryable({ status: 429 })).toBe(true);
+    expect(isRetryable({ status: 500 })).toBe(true);
+    expect(isRetryable({ status: 400 })).toBe(false);
+    expect(isRetryable({ status: 401 })).toBe(false);
+    expect(isRetryable({ status: 403 })).toBe(false);
+    expect(isRetryable({ status: 404 })).toBe(false);
+  });
+
+  test('treats status-less errors (network/timeout) as retryable', () => {
+    expect(isRetryable(new Error('fetch failed'))).toBe(true);
+    expect(isRetryable({ code: 'ETIMEDOUT' })).toBe(true);
+  });
+
+  test('accepts statusCode as an alias for status', () => {
+    expect(isRetryable({ statusCode: 503 })).toBe(true);
+    expect(isRetryable({ statusCode: 422 })).toBe(false);
   });
 });

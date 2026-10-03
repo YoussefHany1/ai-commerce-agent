@@ -5,8 +5,17 @@ import * as schema from './schema.js';
 import { config } from '../config.js';
 
 export const sql = postgres(config.DATABASE_URL, {
-  max: 10,
+  max: config.DB_POOL_MAX,
   prepare: false,
+  // Bounded connect/idle so a stalled network cannot pin a slot indefinitely,
+  // and a server-side statement_timeout so a runaway query is killed by Postgres
+  // rather than holding a transaction (and with it a tenant claim) open.
+  connect_timeout: config.DB_CONNECT_TIMEOUT_SECONDS,
+  idle_timeout: config.DB_IDLE_TIMEOUT_SECONDS,
+  connection: {
+    statement_timeout: config.DB_STATEMENT_TIMEOUT_MS,
+    application_name: 'ai-commerce-agent',
+  },
   onnotice: () => {},
 });
 

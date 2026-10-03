@@ -57,7 +57,13 @@ interface RequestOptions {
   body?: unknown;
   query?: Record<string, string | number | undefined>;
   headers?: Record<string, string>;
+  /** Caller-supplied abort signal, combined with the request timeout. */
+  signal?: AbortSignal;
+  /** Override the default per-request timeout. */
+  timeoutMs?: number;
 }
+
+const DEFAULT_TIMEOUT_MS = 20_000;
 
 export class ApiError extends Error {
   readonly status: number;
@@ -79,7 +85,7 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', body, query, headers } = opts;
+  const { method = 'GET', body, query, headers, signal, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
   const qs = query
     ? new URLSearchParams(
         Object.entries(query)
@@ -96,14 +102,40 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const reqHeaders: Record<string, string> = { ...(headers ?? {}) };
   if (body !== undefined) reqHeaders['Content-Type'] = 'application/json';
 
-  const res = await fetch(url, {
-    method,
-    headers: reqHeaders,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-    // Same-origin, so the HTTP-only session cookie rides along.
-    credentials: 'same-origin',
-    cache: 'no-store',
-  });
+  // A hung upstream otherwise pins the UI forever; race the fetch against a
+  // timeout and fold in any caller-provided signal.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: reqHeaders,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      // Same-origin, so the HTTP-only session cookie rides along.
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+  } catch (err) {
+    // Distinguish our timeout from a caller-driven abort (navigation/unmount).
+    if (controller.signal.aborted && !signal?.aborted) {
+      throw new ApiError(408, {
+        error: 'request_timeout',
+        message: 'The request timed out. Please try again.',
+      });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener('abort', onExternalAbort);
+  }
 
   const text = await res.text();
   const payload: unknown = text ? safeParse(text) : null;

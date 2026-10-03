@@ -175,6 +175,7 @@ export const platformConnections = pgTable(
   (t) => [
     { name: 'platform_connections_store_id_idx', columns: [t.storeId] },
     { name: 'platform_connections_orders_due_idx', columns: [t.ordersSyncedAt] },
+    { name: 'platform_connections_last_synced_idx', columns: [t.lastSyncedAt] },
   ],
 );
 
@@ -202,6 +203,7 @@ export const products = pgTable(
   (t) => [
     uniqueIndex('products_store_platform_uidx').on(t.storeId, t.platformProductId),
     index('products_store_id_idx').on(t.storeId),
+    index('products_store_title_idx').on(t.storeId, t.title),
     index('products_search_vector_gin').using('gin', t.searchVector),
     index('products_embedding_hnsw').using('hnsw', t.embedding.op('vector_cosine_ops')),
   ],
@@ -303,6 +305,7 @@ export const messages = pgTable(
   (t) => [
     index('messages_store_id_idx').on(t.storeId),
     index('messages_conversation_id_idx').on(t.conversationId),
+    index('messages_conversation_created_idx').on(t.conversationId, t.createdAt),
   ],
 );
 
@@ -365,7 +368,10 @@ export const automationRules = pgTable(
     lastFiredAt: timestamp('last_fired_at', { withTimezone: true }),
     createdAt: ts(),
   },
-  (t) => [{ name: 'automation_rules_store_id_idx', columns: [t.storeId] }],
+  (t) => [
+    { name: 'automation_rules_store_id_idx', columns: [t.storeId] },
+    { name: 'automation_rules_store_enabled_idx', columns: [t.storeId, t.enabled, t.triggerType] },
+  ],
 );
 
 export const automationLogs = pgTable(
@@ -426,6 +432,7 @@ export const jobs = pgTable(
   (t) => [
     index('jobs_store_id_idx').on(t.storeId),
     index('jobs_status_idx').on(t.status),
+    index('jobs_status_run_at_idx').on(t.status, t.runAt),
   ],
 );
 
@@ -456,6 +463,13 @@ export const attributions = pgTable(
   (t) => [
     index('attributions_store_id_idx').on(t.storeId),
     index('attributions_conv_idx').on(t.conversationId, t.productId),
+    index('attributions_store_created_idx').on(t.storeId, t.createdAt),
+    index('attributions_store_converted_idx')
+      .on(t.storeId, t.convertedAt)
+      .where(sql`${t.convertedAt} is not null`),
+    index('attributions_store_clicked_idx')
+      .on(t.storeId, t.clickedAt)
+      .where(sql`${t.clickedAt} is not null`),
   ],
 );
 

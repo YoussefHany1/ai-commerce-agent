@@ -4,6 +4,7 @@ import { retrieve } from './retrieval.js';
 import { chatWithFallback, hasOpenAI, hasOpenRouter } from './llm.js';
 import { customerRepo, orderRepo, catalogRepo } from '../db/repos.js';
 import { getCommerceAdapter } from '../integrations/factory.js';
+import { config } from '../config.js';
 
 type ToolDef = OpenAI.Responses.FunctionTool;
 type FunctionCall = OpenAI.Responses.ResponseFunctionToolCall;
@@ -22,6 +23,11 @@ function fallbackReply(products: Product[]): string {
   if (!products.length) return 'حالياً لا أستطيع الاطلاع على المنتجات. يرجى المحاولة لاحقاً.';
   return `مرحباً. هذه المنتجات الأقرب لطلبك:\n${list}`;
 }
+
+// Distinct from fallbackReply: when the model burns every tool round without
+// settling on an answer, the old reply claimed there were no products visible,
+// which is misleading. Ask the shopper for clarification instead.
+const TOOL_EXHAUSTED_REPLY = 'لم أتمكن من إكمال طلبك من البيانات المتاحة. هل يمكنك توضيح ما تبحث عنه أكثر؟';
 
 function formatProductContext(products: Product[]): string {
   return products
@@ -122,7 +128,28 @@ function maskEmail(email: string | null | undefined): string | null {
 }
 
 function clampJson(s: string): string {
-  return s.length <= MAX_TOOL_RESULT_LEN ? s : `${s.slice(0, MAX_TOOL_RESULT_LEN)}…truncated`;
+  if (s.length <= MAX_TOOL_RESULT_LEN) return s;
+  // Never slice JSON mid-object: a cut string is not parseable, so the model sees
+  // a syntax error instead of data. Emit a valid marker and let the tool itself
+  // bound its result size.
+  return JSON.stringify({ truncated: true, reason: `result exceeded ${MAX_TOOL_RESULT_LEN} characters` });
+}
+
+/**
+ * Serializes products for a tool result. Descriptions and unused fields are
+ * dropped so a full page of results stays under the size cap without truncation.
+ */
+function projectProducts(products: Product[], maxItems: number): string {
+  return JSON.stringify(
+    products.slice(0, maxItems).map((p) => ({
+      id: p.id,
+      title: p.title,
+      price: p.price,
+      currency: p.currency,
+      available: p.available,
+      url: p.url ?? null,
+    })),
+  );
 }
 
 async function runTool(storeId: string, name: string, args: ToolArgs): Promise<string> {
@@ -132,12 +159,12 @@ async function runTool(storeId: string, name: string, args: ToolArgs): Promise<s
       if (!query) return JSON.stringify({ error: 'query_required' });
       const limit = Math.min(Number(args.limit) || 8, 20);
       const found = await retrieve(query, storeId, { limit });
-      return clampJson(JSON.stringify(found.map((f) => f.product)));
+      return projectProducts(found.map((f) => f.product), limit);
     }
     case 'list_products': {
       const limit = Math.min(Number(args.limit) || 20, 50);
-      const products = await catalogRepo.list(storeId);
-      return clampJson(JSON.stringify(products.slice(0, limit)));
+      const products = await catalogRepo.list(storeId, limit);
+      return projectProducts(products, limit);
     }
     case 'get_order_status': {
       const platformOrderId = String(args.platform_order_id ?? '').trim();
@@ -170,23 +197,24 @@ async function runTool(storeId: string, name: string, args: ToolArgs): Promise<s
       if (!identifier) return JSON.stringify({ error: 'identifier_required' });
       const matches = await customerRepo.findByContact(storeId, identifier);
       if (!matches.length) return JSON.stringify({ error: 'customer_not_found' });
-      const customers = [];
-      for (const c of matches) {
-        const orders = await orderRepo.listByCustomer(storeId, c.id, 5);
-        customers.push({
-          id: c.id,
-          name: c.name ?? null,
-          phone: maskPhone(c.phone),
-          email: maskEmail(c.email),
-          recentOrders: orders.map((o) => ({
-            id: o.id,
-            status: o.status,
-            paymentStatus: o.paymentStatus ?? null,
-            total: o.total,
-            currency: o.currency,
-          })),
-        });
-      }
+      const customers = await Promise.all(
+        matches.map(async (c) => {
+          const orders = await orderRepo.listByCustomer(storeId, c.id, 5);
+          return {
+            id: c.id,
+            name: c.name ?? null,
+            phone: maskPhone(c.phone),
+            email: maskEmail(c.email),
+            recentOrders: orders.map((o) => ({
+              id: o.id,
+              status: o.status,
+              paymentStatus: o.paymentStatus ?? null,
+              total: o.total,
+              currency: o.currency,
+            })),
+          };
+        }),
+      );
       return clampJson(JSON.stringify(customers));
     }
     default:
@@ -228,26 +256,33 @@ export async function runToolLoop(
     if (!calls.length) {
       return { reply: res.output_text ?? fallbackReply([]), toolRuns };
     }
-    const outputs: { type: 'function_call_output'; call_id: string; output: string }[] = [];
-    for (const call of calls) {
-      let args: ToolArgs = {};
-      try {
-        args = JSON.parse(call.arguments ?? '{}');
-      } catch {
-        args = { _parse_error: call.arguments };
-      }
-      if (!TOOL_NAMES.has(call.name)) {
-        outputs.push({ type: 'function_call_output', call_id: call.call_id, output: JSON.stringify({ error: 'unknown_tool' }) });
-        continue;
-      }
-      const output = await runTool(storeId, call.name, args);
-      toolRuns.push({ name: call.name, args, output });
-      outputs.push({ type: 'function_call_output', call_id: call.call_id, output });
+    // Tool calls in one round are independent, so run them together. Promise.all
+    // preserves order, keeping each output lined up with its originating call.
+    const outputs = await Promise.all(
+      calls.map(async (call) => {
+        let args: ToolArgs = {};
+        try {
+          args = JSON.parse(call.arguments ?? '{}');
+        } catch {
+          args = { _parse_error: call.arguments };
+        }
+        if (!TOOL_NAMES.has(call.name)) {
+          return { call, args, output: JSON.stringify({ error: 'unknown_tool' }), run: false as const };
+        }
+        const output = await runTool(storeId, call.name, args);
+        return { call, args, output, run: true as const };
+      }),
+    );
+    for (const r of outputs) {
+      if (r.run) toolRuns.push({ name: r.call.name, args: r.args, output: r.output });
     }
-    input.push(...calls, ...outputs);
+    input.push(
+      ...calls,
+      ...outputs.map((r) => ({ type: 'function_call_output', call_id: r.call.call_id, output: r.output })),
+    );
   }
 
-  return { reply: fallbackReply([]), toolRuns };
+  return { reply: TOOL_EXHAUSTED_REPLY, toolRuns };
 }
 
 export async function answer(message: string, products: Product[]): Promise<string> {
@@ -274,18 +309,32 @@ export async function answer(message: string, products: Product[]): Promise<stri
   }
 }
 
-export async function answerWithTools(storeId: string, message: string, history: ChatMessage[] = []): Promise<string> {
+export async function answerWithTools(
+  storeId: string,
+  message: string,
+  history: ChatMessage[] = [],
+): Promise<string> {
   if (!hasOpenAI && !hasOpenRouter) {
     const found = await retrieve(message, storeId, { limit: 8 });
     return fallbackReply(found.map((f) => f.product));
   }
+  // Wall-clock deadline for the whole tool loop. Without it, three slow rounds
+  // each retried by the SDK could hold the request open for minutes.
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), config.LLM_TOTAL_TIMEOUT_MS);
+  deadline.unref?.();
   try {
-    const { reply } = await runToolLoop(storeId, message, (input) =>
-      chatWithFallback(input as any, TOOLS), history
+    const { reply } = await runToolLoop(
+      storeId,
+      message,
+      (input) => chatWithFallback(input as any, TOOLS, { signal: controller.signal }),
+      history,
     );
     return reply;
-  } catch (err: any) {
+  } catch {
     const found = await retrieve(message, storeId, { limit: 8 });
     return fallbackReply(found.map((f) => f.product));
+  } finally {
+    clearTimeout(deadline);
   }
 }

@@ -98,6 +98,28 @@ function window(days: number) {
   return { from, to };
 }
 
+/**
+ * Per-process freshness marker for daily rollups, keyed by store.
+ *
+ * A rollup covers the last N days, so an entry only satisfies a request when it
+ * covered at least as many days and is younger than the TTL. This stops
+ * `/api/metrics` from running the seven-query rollup plus upsert on every read,
+ * while bounding staleness to the TTL. Multi-replica deployments each keep their
+ * own copy, so the worst case is one rollup per store per replica per TTL.
+ */
+const ROLLUP_FRESH_MS = 60_000;
+const rollupState = new Map<string, { days: number; at: number }>();
+
+function markRolledUp(storeId: string, days: number): void {
+  const prev = rollupState.get(storeId);
+  rollupState.set(storeId, { days: Math.max(prev?.days ?? 0, days), at: Date.now() });
+}
+
+function rollupIsFresh(storeId: string, days: number): boolean {
+  const s = rollupState.get(storeId);
+  return !!s && s.days >= days && Date.now() - s.at < ROLLUP_FRESH_MS;
+}
+
 function mergeCounts(
   acc: Map<string, DailyMetricRow>,
   key: string,
@@ -256,12 +278,15 @@ export async function rollupDailyMetrics(storeId: string, days: number): Promise
         },
       });
     await tx.execute(stmt.getSQL());
+    markRolledUp(storeId, days);
     return rows;
   });
 }
 
 export async function getDailyMetrics(storeId: string, days: number): Promise<DailyMetricRow[]> {
-  await rollupDailyMetrics(storeId, days);
+  if (!rollupIsFresh(storeId, days)) {
+    await rollupDailyMetrics(storeId, days);
+  }
   const { from, to } = window(days);
   return withTenant(storeId, async (tx) => {
     const rows = await tx

@@ -498,9 +498,10 @@ export const storeRepo = {
 };
 
 export const catalogRepo = {
-  async list(storeId: string): Promise<Product[]> {
+  async list(storeId: string, limit?: number): Promise<Product[]> {
     return withTenant(storeId, async (tx) => {
-      const rows = await tx.select().from(products).where(eq(products.storeId, storeId)).orderBy(products.title);
+      const query = tx.select().from(products).where(eq(products.storeId, storeId)).orderBy(products.title);
+      const rows = limit === undefined ? await query : await query.limit(limit);
       return rows.map((r) => ({
         id: r.id,
         title: r.title,

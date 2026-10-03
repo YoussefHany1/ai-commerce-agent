@@ -20,6 +20,13 @@ const schema = z.object({
   DATABASE_URL: z
     .string()
     .default("postgres://postgres:postgres@localhost:5432/ai_commerce_agent"),
+  // Pool/tuning knobs. Kept at 10 by default: production points at a Supabase
+  // pooler behind a 512 MB Render instance, and a larger client pool just moves
+  // contention upstream while risking pooler exhaustion.
+  DB_POOL_MAX: z.coerce.number().int().positive().default(10),
+  DB_CONNECT_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(10),
+  DB_IDLE_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(20),
+  DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   REDIS_URL: z.string().default("redis://localhost:6379"),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_MODEL: z.string().default("gpt-5-mini"),
@@ -29,6 +36,13 @@ const schema = z.object({
   OPENROUTER_EMBEDDING_MODEL: z
     .string()
     .default("openai/text-embedding-3-small"),
+  // Latency/cost bounds for the LLM calls. The per-request timeout caps a single
+  // provider call; the total timeout is a wall-clock deadline across the whole
+  // tool loop, so a slow model cannot hold a chat request open indefinitely.
+  LLM_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  LLM_TOTAL_TIMEOUT_MS: z.coerce.number().int().positive().default(45_000),
+  LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(800),
+  LLM_REASONING_EFFORT: z.enum(["minimal", "low", "medium", "high"]).default("low"),
   SHOPIFY_API_VERSION: z.string().default("2026-07"),
   SHOPIFY_CLIENT_ID: z.string().optional(),
   SHOPIFY_CLIENT_SECRET: z.string().optional(),
