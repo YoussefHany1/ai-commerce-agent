@@ -66,6 +66,7 @@ const mocks = vi.hoisted(() => {
     setSupabaseUid: vi.fn(async () => true),
     create: vi.fn(),
     setStatus: vi.fn(async () => true),
+    remove: vi.fn(async () => true),
     list: vi.fn<(...args: any[]) => Promise<any[]>>(async () => []),
   };
   // The client side is consulted on create, so a merchant address or identity cannot be
@@ -81,6 +82,8 @@ const mocks = vi.hoisted(() => {
           createUser: vi.fn(),
           updateUserById: vi.fn(),
           deleteUser: vi.fn(),
+          listUsers: vi.fn(),
+          getUserById: vi.fn(),
         },
       },
     },
@@ -170,7 +173,7 @@ beforeEach(() => {
   mocks.operatorRepo.create.mockResolvedValue(NEW_ID);
 });
 
-function key(method: 'GET' | 'POST' | 'PATCH', url: string, payload?: unknown) {
+function key(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, payload?: unknown) {
   return {
     method,
     url,
@@ -182,7 +185,7 @@ function key(method: 'GET' | 'POST' | 'PATCH', url: string, payload?: unknown) {
   };
 }
 
-function as(method: 'GET' | 'POST' | 'PATCH', url: string, sid: string, payload?: unknown) {
+function as(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, sid: string, payload?: unknown) {
   return {
     method,
     url,
@@ -355,7 +358,34 @@ describe('operator management: suspension', () => {
   });
 
   it('refuses to suspend the last person who can sign in', async () => {
-    mocks.operatorRepo.list.mockResolvedValue([operatorRow()]);
+  mocks.operatorRepo.list.mockResolvedValue([operatorRow()]);
+  mocks.operatorRepo.remove.mockReset();
+  mocks.operatorRepo.remove.mockResolvedValue(true);
+  mocks.supabase.admin.auth.admin.listUsers.mockResolvedValue({
+    data: {
+      users: [
+        {
+          id: SUPABASE_UID,
+          email: 'youssef@example.com',
+          user_metadata: { name: 'Youssef' },
+          created_at: '2026-01-01T00:00:00.000Z',
+          last_sign_in_at: '2026-02-01T00:00:00.000Z',
+        },
+      ],
+    },
+    error: null,
+  });
+  mocks.supabase.admin.auth.admin.getUserById.mockResolvedValue({
+    data: {
+      user: {
+        id: SUPABASE_UID,
+        email: 'new@example.com',
+        user_metadata: { full_name: 'New Person' },
+        created_at: '2026-01-01T00:00:00.000Z',
+      },
+    },
+    error: null,
+  });
     const { app } = await buildApp();
     const res = await app.inject(key('PATCH', `/api/operators/${OPERATOR_ID}/status`, { status: 'suspended' }));
     expect(res.statusCode).toBe(400);
@@ -469,5 +499,128 @@ describe('operator management: credentials', () => {
     } finally {
       infra.redis.set = set;
     }
+  });
+});
+
+describe('operator management: admins from Supabase', () => {
+  it('lists every Supabase user joined to their local grant', async () => {
+    mocks.supabase.admin.auth.admin.listUsers.mockResolvedValue({
+      data: {
+        users: [
+          {
+            id: SUPABASE_UID,
+            email: 'youssef@example.com',
+            user_metadata: { name: 'Youssef' },
+            created_at: '2026-01-01T00:00:00.000Z',
+            last_sign_in_at: null,
+          },
+          {
+            id: '00000000-0000-4000-8000-0000000000bb',
+            email: 'merchant@example.com',
+            user_metadata: {},
+            created_at: null,
+            last_sign_in_at: null,
+          },
+        ],
+      },
+      error: null,
+    });
+    const { app } = await buildApp();
+    const res = await app.inject(key('GET', '/api/operators/supabase-users'));
+    expect(res.statusCode).toBe(200);
+    const users = res.json().users;
+    expect(users).toHaveLength(2);
+    expect(users[0]).toMatchObject({ uid: SUPABASE_UID, isAdmin: true, operatorId: OPERATOR_ID });
+    expect(users[1]).toMatchObject({ isAdmin: false, operatorId: null });
+  });
+
+  it('reports an auth outage rather than an empty directory', async () => {
+    // An empty list would read as "nobody is an admin", which is a dangerous thing to
+    // show when the truth is that the provider could not be reached.
+    mocks.supabase.admin.auth.admin.listUsers.mockResolvedValue({
+      data: null,
+      error: { message: 'down' },
+    });
+    const { app } = await buildApp();
+    const res = await app.inject(key('GET', '/api/operators/supabase-users'));
+    expect(res.statusCode).toBe(503);
+  });
+
+  it('grants admin to an existing identity without creating one', async () => {
+    const { app } = await buildApp();
+    const res = await app.inject(key('POST', '/api/operators/from-supabase', { uid: SUPABASE_UID }));
+    expect(res.statusCode).toBe(201);
+    expect(mocks.supabase.admin.auth.admin.createUser).not.toHaveBeenCalled();
+    expect(mocks.operatorRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'new@example.com', supabaseUid: SUPABASE_UID, name: 'New Person' }),
+    );
+  });
+
+  it('refuses a uid that already administers this install', async () => {
+    mocks.operatorRepo.getBySupabaseUid.mockResolvedValue(operatorRow());
+    const { app } = await buildApp();
+    const res = await app.inject(key('POST', '/api/operators/from-supabase', { uid: SUPABASE_UID }));
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: 'operator_already_exists' });
+    expect(mocks.operatorRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses a uid that already belongs to a merchant', async () => {
+    mocks.clientRepo.getBySupabaseUid.mockResolvedValue({ id: 'c1', email: 'other@example.com' });
+    const { app } = await buildApp();
+    const res = await app.inject(key('POST', '/api/operators/from-supabase', { uid: SUPABASE_UID }));
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: 'email_in_use_by_client' });
+    expect(mocks.operatorRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('returns 404 when the Supabase user does not exist', async () => {
+    mocks.supabase.admin.auth.admin.getUserById.mockResolvedValue({ data: { user: null }, error: null });
+    const { app } = await buildApp();
+    const res = await app.inject(key('POST', '/api/operators/from-supabase', { uid: SUPABASE_UID }));
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: 'supabase_user_not_found' });
+  });
+
+  it('rejects a malformed uid before calling the provider', async () => {
+    const { app } = await buildApp();
+    const res = await app.inject(key('POST', '/api/operators/from-supabase', { uid: 'nope' }));
+    expect(res.statusCode).toBe(400);
+    expect(mocks.supabase.admin.auth.admin.getUserById).not.toHaveBeenCalled();
+  });
+
+  it('revokes a grant and leaves the Supabase identity alone', async () => {
+    mocks.operatorRepo.list.mockResolvedValue([operatorRow(), operatorRow({ id: OTHER_ID })]);
+    const { app } = await buildApp();
+    const res = await app.inject(key('DELETE', `/api/operators/${OTHER_ID}`));
+    expect(res.statusCode).toBe(200);
+    expect(mocks.operatorRepo.remove).toHaveBeenCalledWith(OTHER_ID);
+    // The identity may still be a merchant; revoking the grant must not delete it.
+    expect(mocks.supabase.admin.auth.admin.deleteUser).not.toHaveBeenCalled();
+  });
+
+  it('refuses to let an operator revoke themselves', async () => {
+    mocks.operatorRepo.list.mockResolvedValue([operatorRow(), operatorRow({ id: OTHER_ID })]);
+    const { app, mint } = await buildApp();
+    const { sid } = await mint(OPERATOR_ID);
+    const res = await app.inject(as('DELETE', `/api/operators/${OPERATOR_ID}`, sid));
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: 'cannot_remove_self' });
+    expect(mocks.operatorRepo.remove).not.toHaveBeenCalled();
+  });
+
+  it('refuses to revoke the last active admin', async () => {
+    mocks.operatorRepo.list.mockResolvedValue([operatorRow()]);
+    const { app } = await buildApp();
+    const res = await app.inject(key('DELETE', `/api/operators/${OPERATOR_ID}`));
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: 'last_active_operator' });
+    expect(mocks.operatorRepo.remove).not.toHaveBeenCalled();
+  });
+
+  it('404s for an unknown grant', async () => {
+    const { app } = await buildApp();
+    const res = await app.inject(key('DELETE', `/api/operators/${UNKNOWN_ID}`));
+    expect(res.statusCode).toBe(404);
   });
 });

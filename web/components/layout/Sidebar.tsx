@@ -8,6 +8,7 @@ import {
   CreditCard,
   LayoutDashboard,
   Settings,
+  ShieldCheck,
   Sparkles,
   Store,
   Users,
@@ -40,6 +41,7 @@ const MANAGE_NAV: NavItem[] = [
 /** Operator-only: tenants of this install are managed here, never by the tenants themselves. */
 const ADMIN_NAV: NavItem[] = [
   { href: '/dashboard/clients', key: 'navClients', icon: Users, mobile: true },
+  { href: '/dashboard/admins', key: 'navAdmins', icon: ShieldCheck, mobile: false },
 ];
 
 interface SidebarProps {
@@ -187,7 +189,9 @@ export function Sidebar({ collapsed }: SidebarProps) {
 
       {/* Mobile bottom nav */}
       <nav className="fixed inset-x-0 bottom-0 z-40 flex h-16 items-stretch justify-around border-t border-slate-200/80 bg-white/90 px-1 backdrop-blur-xl md:hidden dark:border-white/5 dark:bg-[#0D0D14]/90">
-        {[...MAIN_NAV, ...MANAGE_NAV, ...(showAdmin ? ADMIN_NAV : [])].map((item) => {
+        {[...MAIN_NAV, ...MANAGE_NAV, ...(showAdmin ? ADMIN_NAV : [])]
+          .filter((item) => item.mobile)
+          .map((item) => {
           const active = pathname === item.href || pathname.startsWith(item.href + '/');
           const Icon = item.icon;
           return (

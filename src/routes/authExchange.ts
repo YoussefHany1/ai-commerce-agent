@@ -1,6 +1,6 @@
 import { FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { clientRepo, operatorRepo } from '../db/repos.js';
+import { resolveSupabaseIdentity, type ResolvedIdentity } from '../lib/localIdentity.js';
 import {
   bumpClientSessionEpoch,
   createClientSession,
@@ -14,7 +14,6 @@ import {
   revokeOperatorSession,
 } from '../lib/operatorSession.js';
 import { supabaseAdmin } from '../lib/supabase.js';
-import { normalizeEmail } from './clientAuth.js';
 
 /**
  * The one way a Supabase session token becomes one of ours, plus the one logout.
@@ -48,13 +47,6 @@ const exchangeBody = z.object({
   /** Bump the identity's epoch first: use on password reset, never on plain sign-in. */
   rotate: z.boolean().optional(),
 });
-
-type ResolvedIdentity = {
-  kind: 'operator' | 'client';
-  id: string;
-  name: string;
-  email: string;
-};
 
 export async function authExchange(app: FastifyInstance) {
   /**
@@ -187,60 +179,35 @@ async function resolveIdentity(
   }
 
   try {
-    // Both sides in one round trip: deciding "which kind" is only meaningful once both
-    // have been asked.
-    const [operator, clientByUid] = await Promise.all([
-      operatorRepo.getBySupabaseUid(userId),
-      clientRepo.getBySupabaseUid(userId),
-    ]);
+    const resolution = await resolveSupabaseIdentity({
+      userId,
+      email: userEmail,
+      name: userName,
+      // OAuth sign-in is the one flow that may create a merchant for a valid identity
+      // that reaches no row; the password path never does. It also deliberately does
+      // not bind an unlinked operator by email — see {@link resolveSupabaseIdentity}.
+      autoProvision: true,
+      linkOperatorByEmail: false,
+    });
 
-    if (operator && clientByUid) {
+    if (resolution.status === 'conflict') {
       // Refuse rather than pick. Whichever side won, the other would be unreachable for
       // as long as the duplicate stands, and the operator-first order would mean the
       // merchant's session silently administering the install.
       req.log.error(
-        { supabaseUserId: userId, operatorId: operator.id, clientId: clientByUid.id },
+        { supabaseUserId: userId, operatorId: resolution.operatorId, clientId: resolution.clientId },
         'supabase identity linked to both an operator and a client; refusing to resolve',
       );
       rep.code(401).send({ error: 'invalid_credentials' });
       return null;
     }
 
-    if (operator) {
-      if (operator.status !== 'active') {
-        rep.code(401).send({ error: 'invalid_credentials' });
-        return null;
-      }
-      return { kind: 'operator', id: operator.id, name: operator.name, email: operator.email };
-    }
-
-    // A client matched by uid is authoritative even when suspended: falling through to
-    // the email fallback here would let a suspended account sign in through its address.
-    let client = clientByUid;
-    if (!client && userEmail) {
-      const email = normalizeEmail(userEmail);
-      const [byEmail, operatorByEmail] = await Promise.all([
-        clientRepo.findByEmail(email),
-        operatorRepo.findByEmail(email),
-      ]);
-      if (byEmail && !operatorByEmail) {
-        await clientRepo.setSupabaseUid(byEmail.id, userId);
-        client = byEmail;
-      } else if (!byEmail && !operatorByEmail) {
-        // Auto-provision a new client account for OAuth sign-ins
-        const name = userName || email.split('@')[0];
-        req.log.info({ name, email, userId }, 'Auto-provisioning new client from OAuth');
-        const newId = await clientRepo.create({ name, email, passwordHash: null, supabaseUid: userId });
-        client = await clientRepo.get(newId);
-        req.log.info({ newId, client }, 'Auto-provisioned client result');
-      }
-    }
-    if (!client || client.status !== 'active') {
-      req.log.error({ client, email: userEmail }, 'Client not found or not active after resolution');
+    if (resolution.status === 'none') {
       rep.code(401).send({ error: 'invalid_credentials' });
       return null;
     }
-    return { kind: 'client', id: client.id, name: client.name, email: client.email };
+
+    return resolution.identity;
   } catch (err) {
     req.log.error({ err }, 'Error in identity resolution / auto-provisioning');
     rep.code(503).send({ error: 'auth_unavailable' });

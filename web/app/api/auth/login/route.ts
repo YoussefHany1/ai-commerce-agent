@@ -11,19 +11,11 @@ const EMAIL_LIMIT = 320;
 /**
  * Exchanges an email and password for a session cookie.
  *
- * Both principals post the same shape — `kind`, `email`, `password` — because both
- * authenticate the same way now. An operator used to post a password with no username,
- * to a `/verify` route that answered `{ok}` and nothing else; there was nowhere in that
- * exchange to put an identity, so the cookie could only carry the install-wide epoch and
- * the shell could not say who was signed in. Asking for the email costs one field and
- * makes the operator a person; Supabase checks the credential, and the API decides
- * whether the address belongs to an operator.
- *
- * The `kind` is still explicit because the two login routes are different upstream
- * endpoints with different lockout buckets and different rows, not because the
- * credential says so. What it must never be is inferred from a successful password:
- * the API answers 401 for a client who typed an operator's address, and this route
- * passes that through unchanged.
+ * There is one form and one upstream endpoint now. It used to post a `kind` that chose
+ * between `/api/auth/operator/login` and `/api/auth/client/login`, but the credential
+ * was identical — both were email and password against Supabase — so the field only made
+ * the person declare a role they should not have to know. The API verifies the password
+ * and resolves the kind itself, and the answer's `kind` is what decides the cookie.
  *
  * Nothing here sees a stored credential. The password is forwarded once to the API,
  * which owns the Supabase call, the Redis attempt counter and the per-IP/per-account
@@ -34,21 +26,16 @@ export async function POST(request: Request): Promise<NextResponse> {
   const apiBase = authApiBase();
   if (!apiBase) return NextResponse.json({ error: 'upstream_not_configured' }, { status: 503 });
 
-  let kind: 'operator' | 'client';
   let email: string;
   let password: string;
   try {
-    const parsed = (await request.json()) as { kind?: unknown; email?: unknown; password?: unknown };
-    if (parsed.kind !== 'operator' && parsed.kind !== 'client') {
-      return NextResponse.json({ error: 'invalid_request' }, { status: 400 });
-    }
+    const parsed = (await request.json()) as { email?: unknown; password?: unknown };
     if (typeof parsed.email !== 'string' || !parsed.email || parsed.email.length > EMAIL_LIMIT) {
       return NextResponse.json({ error: 'invalid_request' }, { status: 400 });
     }
     if (typeof parsed.password !== 'string' || !parsed.password || parsed.password.length > PASSWORD_LIMIT) {
       return NextResponse.json({ error: 'invalid_request' }, { status: 400 });
     }
-    kind = parsed.kind;
     email = parsed.email;
     password = parsed.password;
   } catch {
@@ -57,7 +44,7 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${apiBase}/api/auth/${kind}/login`, {
+    upstream = await fetch(`${apiBase}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ email, password }),
@@ -82,10 +69,9 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
   }
 
-  // The API names the kind it actually authenticated, and that is what gets written.
-  // The request's `kind` only chose the endpoint; taking it from the answer is what
-  // stops a client from minting an operator cookie by posting `kind: 'operator'`
-  // alongside a client account's password.
+  // The API names the kind it resolved — operator or client — and that is what gets
+  // written. There is no request field left to forge, so a merchant can no longer be
+  // handed the operator cookie by posting a kind alongside their own password.
   const payload = (await upstream.json().catch(() => null)) as Partial<AuthApiResponse> | null;
   const built = payload ? buildPayload(payload) : null;
   if (!built) return NextResponse.json({ error: 'invalid_credentials' }, { status: 401 });

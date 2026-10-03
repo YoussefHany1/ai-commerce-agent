@@ -20,7 +20,9 @@ export function useSession() {
   });
 }
 
-export function isOperator(session: SessionInfo | undefined): boolean {
+export function isOperator(
+  session: SessionInfo | undefined,
+): session is Extract<SessionInfo, { kind: 'operator' }> {
   return session?.authenticated === true && session.kind === 'operator';
 }
 

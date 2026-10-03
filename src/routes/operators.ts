@@ -44,6 +44,9 @@ const apiWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
 const idParam = z.object({ id: z.string().uuid() });
 const statusBody = z.object({ status: z.enum(['active', 'suspended']) });
 const passwordBody = z.object({ password: z.string().min(MIN_PASSWORD_LENGTH).max(MAX_PASSWORD_LENGTH) });
+const fromSupabaseBody = z.object({ uid: z.string().uuid() });
+/** Cap on `listUsers` pages when building the admin-picker directory. */
+const DIRECTORY_PAGE_CAP = 20;
 const createBody = z.object({
   name: z.string().trim().min(1).max(200),
   email: z.string().trim().max(320),
@@ -56,6 +59,90 @@ export async function operators(app: FastifyInstance) {
     const rows = await operatorRepo.list();
     return rows.map(operatorToPublic);
   });
+
+  /**
+   * The Supabase directory, joined to the local admin grants, for the "choose admins
+   * from Supabase" page. Every auth user is listed — this is the pool the operator picks
+   * from — annotated with whether it currently administers the install.
+   *
+   * Orphan grants (an operator row whose identity is missing or no longer in Supabase)
+   * are appended too, keyed by their operator id, so a grant can always be revoked even
+   * when its identity has gone away. Without them a stale admin would be invisible and
+   * therefore unremovable from the one surface built to remove admins.
+   *
+   * A Supabase user reaches no data here beyond what the Admin API exposes to a service
+   * role; the route itself is operator-guarded like the rest of this surface.
+   */
+  app.get(
+    '/api/operators/supabase-users',
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
+    async (_req, rep) => {
+      const admin = supabaseAdmin();
+      if (!admin) return rep.code(503).send({ error: 'auth_unavailable' });
+
+      let grants: Awaited<ReturnType<typeof operatorRepo.list>>;
+      try {
+        grants = await operatorRepo.list();
+      } catch {
+        return rep.code(503).send({ error: 'auth_unavailable' });
+      }
+      const byUid = new Map(grants.filter((g) => g.supabaseUid).map((g) => [g.supabaseUid as string, g]));
+
+      const users: Array<{
+        uid: string | null;
+        email: string | null;
+        name: string | null;
+        createdAt: string | null;
+        lastSignInAt: string | null;
+        isAdmin: boolean;
+        operatorId: string | null;
+        status: string | null;
+      }> = [];
+      const seen = new Set<string>();
+
+      try {
+        for (let page = 1; page <= DIRECTORY_PAGE_CAP; page++) {
+          const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 1000 });
+          if (error) return rep.code(503).send({ error: 'auth_unavailable' });
+          const batch = data?.users ?? [];
+          for (const u of batch) {
+            if (!u.id) continue;
+            seen.add(u.id);
+            const grant = byUid.get(u.id);
+            users.push({
+              uid: u.id,
+              email: u.email ?? null,
+              name: (u.user_metadata?.name as string) || (u.user_metadata?.full_name as string) || null,
+              createdAt: u.created_at ?? null,
+              lastSignInAt: u.last_sign_in_at ?? null,
+              isAdmin: !!grant,
+              operatorId: grant?.id ?? null,
+              status: grant?.status ?? null,
+            });
+          }
+          if (batch.length < 1000) break;
+        }
+      } catch {
+        return rep.code(503).send({ error: 'auth_unavailable' });
+      }
+
+      for (const grant of grants) {
+        if (grant.supabaseUid && seen.has(grant.supabaseUid)) continue;
+        users.push({
+          uid: grant.supabaseUid,
+          email: grant.email,
+          name: grant.name,
+          createdAt: grant.createdAt instanceof Date ? grant.createdAt.toISOString() : null,
+          lastSignInAt: null,
+          isAdmin: true,
+          operatorId: grant.id,
+          status: grant.status,
+        });
+      }
+
+      return { users };
+    },
+  );
 
   /**
    * Invites an operator. Mirrors the client invite: a Supabase auth user
@@ -126,6 +213,63 @@ export async function operators(app: FastifyInstance) {
     },
   );
 
+  /**
+   * Grants admin to a Supabase user that already exists — the "pick from Supabase" path.
+   *
+   * No identity is created and no password is issued: the person already has a sign-in,
+   * and this only adds the local grant that lets it administer the install. The invite
+   * route above stays for when no Supabase user exists yet. The one-identity-one-person
+   * refusals are the invite route's, because the duplicate it prevents is the same.
+   */
+  app.post(
+    '/api/operators/from-supabase',
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
+    async (req, rep) => {
+      const { uid } = fromSupabaseBody.parse(req.body);
+      const admin = supabaseAdmin();
+      if (!admin) return rep.code(503).send({ error: 'auth_unavailable' });
+
+      type DirectoryUser = { id: string; email?: string | null; user_metadata?: Record<string, unknown> };
+      let user: DirectoryUser | null = null;
+      try {
+        const { data, error } = await admin.auth.admin.getUserById(uid);
+        if (!error && data?.user) user = data.user as DirectoryUser;
+      } catch {
+        return rep.code(503).send({ error: 'auth_unavailable' });
+      }
+      if (!user) return rep.code(404).send({ error: 'supabase_user_not_found' });
+
+      const email = normalizeEmail(user.email ?? '');
+      if (!email.includes('@')) {
+        return rep.code(400).send({ error: 'validation_error', issues: [{ message: 'user has no email' }] });
+      }
+
+      const [operatorByUid, clientByUid, operatorByEmail, clientByEmail] = await Promise.all([
+        operatorRepo.getBySupabaseUid(uid),
+        clientRepo.getBySupabaseUid(uid),
+        operatorRepo.findByEmail(email),
+        clientRepo.findByEmail(email),
+      ]);
+      if (operatorByUid || operatorByEmail) return rep.code(409).send({ error: 'operator_already_exists' });
+      if (clientByUid || clientByEmail) return rep.code(409).send({ error: 'email_in_use_by_client' });
+
+      const name =
+        (user.user_metadata?.name as string) ||
+        (user.user_metadata?.full_name as string) ||
+        email.split('@')[0];
+
+      let id: string;
+      try {
+        id = await operatorRepo.create({ name, email, supabaseUid: uid });
+      } catch {
+        return rep.code(503).send({ error: 'auth_unavailable' });
+      }
+      const operator = await operatorRepo.get(id);
+      if (!operator) throw Object.assign(new Error('operator_creation_failed'), { statusCode: 500 });
+      return rep.code(201).send(operatorToPublic(operator));
+    },
+  );
+
   app.get(
     '/api/operators/:id',
     { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
@@ -134,6 +278,37 @@ export async function operators(app: FastifyInstance) {
       const operator = await operatorRepo.get(id);
       if (!operator) return rep.code(404).send({ error: 'operator_not_found' });
       return { operator: operatorToPublic(operator) };
+    },
+  );
+
+  /**
+   * Revokes an admin grant — the remove half of "pick admins from Supabase".
+   *
+   * Only the local row is deleted; the Supabase identity stays, because it may be a
+   * merchant or an ordinary user and the grant was the only thing this surface added to
+   * it. Deleting the row is enough to end access: `resolveOperatorSession` re-reads the
+   * row on every guarded request and refuses when it is gone, so no explicit epoch bump
+   * is needed and no live sid outlives the grant.
+   *
+   * This is the one destructive operation on the directory, and it reverses the earlier
+   * no-delete stance deliberately: the directory is now a grant list, and a revoked
+   * grant has no reason to keep occupying the list. The two self-lockout guards mirror
+   * suspension — nobody may revoke themselves, and the last active admin stays.
+   */
+  app.delete(
+    '/api/operators/:id',
+    { preHandler: [requireOperator, storeRateLimitWindow('api', apiWindow)] },
+    async (req, rep) => {
+      const { id } = idParam.parse(req.params);
+      const operator = await operatorRepo.get(id);
+      if (!operator) return rep.code(404).send({ error: 'operator_not_found' });
+      if (id === callerOperatorId(req)) return rep.code(400).send({ error: 'cannot_remove_self' });
+      if (operator.status === 'active' && (await activeOperatorCount()) <= 1) {
+        return rep.code(400).send({ error: 'last_active_operator' });
+      }
+      const removed = await operatorRepo.remove(id);
+      if (!removed) return rep.code(404).send({ error: 'operator_not_found' });
+      return { ok: true };
     },
   );
 

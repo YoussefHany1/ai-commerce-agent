@@ -6,30 +6,27 @@ import Link from "next/link";
 import { AtSign, Lock } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { cn } from "@/lib/utils";
 import { useLocale } from "@/lib/locale";
 import { makeTranslator } from "@/lib/i18n";
 
 type State = "idle" | "submitting" | "locked" | "error";
-type Kind = "operator" | "client";
 
 /**
  * Exchanges email and password for the HTTP-only session cookie.
  *
- * Two kinds of account sign in here, and they differ in exactly one respect: an operator
- * is a person who runs this install, a client is an invited merchant. Both now sign in
- * with an email and a password against Supabase — the operator's address used to be
- * irrelevant, because one shared password was the credential — so the two tabs differ
- * only in which endpoint the form posts to, not in what it asks for.
+ * One form, both principals. A person signs in the same way whether they administer this
+ * install or are an invited merchant: email and password against Supabase. The API
+ * decides which they are after the credential is proved — there is no tab left to make
+ * the person declare a role they should not have to know, and no `kind` field left for
+ * one to claim the other's session.
  *
  * The password is never persisted here: it goes to this app's own login route and is
  * dropped. Whether it was correct, and how many attempts remain before a lockout, is
  * decided by the API.
  *
- * Google is offered to both, deliberately. The callback has no way to know which kind of
- * person is arriving — it is one redirect either way — so it hands the token to the API
- * and writes whichever session that token earned. Gating the button by tab would only
- * mean the operator had to arrive with a password.
+ * Google is offered too. The callback has no way to know which kind of person is
+ * arriving — it is one redirect either way — so it hands the token to the API and writes
+ * whichever session that token earned.
  */
 export function LoginForm() {
   const router = useRouter();
@@ -38,7 +35,6 @@ export function LoginForm() {
   const { locale } = useLocale();
   const t = makeTranslator(locale);
 
-  const [kind, setKind] = useState<Kind>("operator");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [state, setState] = useState<State>("idle");
@@ -53,7 +49,7 @@ export function LoginForm() {
     setState("submitting");
     setMessage(null);
 
-    const body = { kind, email, password };
+    const body = { email, password };
 
     try {
       const res = await fetch("/api/auth/login", {
@@ -104,38 +100,6 @@ export function LoginForm() {
 
   return (
     <form onSubmit={onSubmit} className="mt-5 space-y-5">
-      {/* Which kind of account is being used. It selects the endpoint, not the
-          credential: both tabs ask for the same two fields. */}
-      <div className="grid grid-cols-2 gap-1 rounded-xl bg-slate-100 p-1 dark:bg-white/5">
-        {(
-          [
-            { value: "operator", label: "Operator" },
-            { value: "client", label: "Store login" },
-          ] as const
-        ).map((option) => (
-          <button
-            key={option.value}
-            type="button"
-            onClick={() => {
-              setKind(option.value);
-              setMessage(null);
-              setState("idle");
-              setRetryAfter(null);
-              setPassword("");
-              setEmail("");
-            }}
-            className={cn(
-              "rounded-lg px-3 py-1.5 text-sm font-semibold transition",
-              kind === option.value
-                ? "bg-white text-slate-900 shadow-sm dark:bg-white/10 dark:text-white"
-                : "text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200",
-            )}
-          >
-            {option.label}
-          </button>
-        ))}
-      </div>
-
       <Input
         label="Email"
         name="email"
@@ -223,16 +187,15 @@ export function LoginForm() {
           >
             {t("authForgotPassword")}
           </Link>
-          {/* Self-signup is for merchants; operators are provisioned by an
-              existing one, so an invite is the only way in. */}
-          {kind === "client" && (
-            <Link
-              href="/register"
-              className="font-medium text-violet-600 hover:text-violet-500 dark:text-violet-400"
-            >
-              {t("authCreateAccount")}
-            </Link>
-          )}
+          {/* Self-signup is for merchants; operators are provisioned from the Admins
+              page, so an invite is the only way in on that side. Showing the link to
+              everyone is safe now that the form no longer asks which kind you are. */}
+          <Link
+            href="/register"
+            className="font-medium text-violet-600 hover:text-violet-500 dark:text-violet-400"
+          >
+            {t("authCreateAccount")}
+          </Link>
         </div>
       </div>
 

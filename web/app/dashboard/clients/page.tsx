@@ -284,7 +284,7 @@ function ClientsAdmin() {
             <p className="font-mono text-sm font-semibold tracking-wide">{credential?.temporaryPassword}</p>
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            The invite holder signs in on the Store login tab and should change this immediately.
+            The invite holder signs in and should change this immediately.
           </p>
         </div>
       </Modal>

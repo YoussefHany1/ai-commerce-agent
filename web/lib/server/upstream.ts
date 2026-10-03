@@ -69,7 +69,12 @@ const ALLOWLIST: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   { method: 'POST', pattern: /^\/clients\/[^/]+\/reset-password$/ },
   { method: 'GET', pattern: /^\/operators$/ },
   { method: 'POST', pattern: /^\/operators$/ },
+  // Picking an admin from the Supabase directory: `supabase-users` is the read side, and
+  // `from-supabase` grants an existing identity. Revoking is a plain DELETE of the grant.
+  { method: 'GET', pattern: /^\/operators\/supabase-users$/ },
+  { method: 'POST', pattern: /^\/operators\/from-supabase$/ },
   { method: 'GET', pattern: /^\/operators\/[^/]+$/ },
+  { method: 'DELETE', pattern: /^\/operators\/[^/]+$/ },
   { method: 'PATCH', pattern: /^\/operators\/[^/]+\/status$/ },
   { method: 'POST', pattern: /^\/operators\/[^/]+\/reset-password$/ },
   { method: 'POST', pattern: /^\/operators\/[^/]+\/revoke-sessions$/ },

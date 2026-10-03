@@ -25,9 +25,9 @@ export default function LoginPage() {
 
         <Card>
           <div className="space-y-1.5 text-center">
-            <h1 className="text-lg font-semibold text-slate-900 dark:text-white">Operator sign in</h1>
+            <h1 className="text-lg font-semibold text-slate-900 dark:text-white">Sign in</h1>
             <p className="text-sm text-slate-500 dark:text-slate-400">
-              Enter the operator password to manage your stores.
+              Sign in to manage your stores.
             </p>
           </div>
 

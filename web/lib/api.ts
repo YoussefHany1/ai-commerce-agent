@@ -18,6 +18,7 @@ import type {
   SessionInfo,
   SourcesResponse,
   Store,
+  SupabaseUser,
   TopProductsResponse,
 } from '@/lib/types';
 
@@ -327,6 +328,24 @@ export const api = {
    * so the dashboard gates the page in the UI as well.
    */
   listClients: () => request<ClientAccount[]>('/clients'),
+
+  /**
+   * The Supabase directory joined to local admin grants, for the Admins page. Lists
+   * every Supabase user and whether they currently administer this install, so an
+   * operator can grant or revoke without creating identities by hand.
+   */
+  listSupabaseUsers: () => request<{ users: SupabaseUser[] }>('/operators/supabase-users'),
+
+  /** Grants admin to an existing Supabase user. The identity is not created here. */
+  grantAdmin: (uid: string) =>
+    request<{ id: string; name: string; email: string; status: 'active' | 'suspended' }>(
+      '/operators/from-supabase',
+      { method: 'POST', body: { uid } },
+    ),
+
+  /** Revokes an admin grant. The Supabase identity itself is left alone. */
+  revokeAdmin: (operatorId: string) =>
+    request<{ ok: true }>(`/operators/${operatorId}`, { method: 'DELETE' }),
 
   createClient: (input: { name: string; email: string; password?: string }) =>
     request<ClientCreateResult>('/clients', { method: 'POST', body: input }),

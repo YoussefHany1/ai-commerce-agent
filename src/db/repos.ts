@@ -263,6 +263,25 @@ export const operatorRepo = {
     });
     return done;
   },
+
+  /**
+   * Removes a row from the operator directory — the revoke half of "choose admins from
+   * Supabase". This is the one destructive operation on this table, and it exists
+   * because the directory is now a grant list: access is created by picking a Supabase
+   * identity and revoked by taking the grant back. The Supabase identity is untouched;
+   * it may still be a merchant or nothing at all. Suspension (`setStatus`) remains for a
+   * reversible, audited disable where the row should stay visible.
+   */
+  async remove(operatorId: string): Promise<boolean> {
+    const done = await withOperator(async (tx) => {
+      const [r] = await tx
+        .delete(operators)
+        .where(eq(operators.id, operatorId))
+        .returning({ id: operators.id });
+      return !!r;
+    });
+    return done;
+  },
 };
 
 export const storeRepo = {

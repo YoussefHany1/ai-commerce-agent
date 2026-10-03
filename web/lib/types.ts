@@ -234,6 +234,24 @@ export interface ClientCreateResult extends ClientAccount {
   temporaryPassword?: string;
 }
 
+/**
+ * One Supabase Auth user, joined to this install's admin grant.
+ *
+ * `uid` is null only for an orphan grant — an operator row whose Supabase identity is
+ * missing or gone. Those are surfaced so a grant can always be revoked, keyed by
+ * `operatorId` instead.
+ */
+export interface SupabaseUser {
+  uid: string | null;
+  email: string | null;
+  name: string | null;
+  createdAt: string | null;
+  lastSignInAt: string | null;
+  isAdmin: boolean;
+  operatorId: string | null;
+  status: 'active' | 'suspended' | null;
+}
+
 export interface ChatResponse {
   reply: string;
   products: Array<{
