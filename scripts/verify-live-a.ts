@@ -37,46 +37,27 @@ async function api(path: string, opts: { method?: string; body?: unknown; sid?: 
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
 
-const redirectTo = new URL('login/reset', process.env.APP_BASE_URL).toString();
-
 try {
-  // ---- Check 1: self-service register -> email-confirm OTP -> exchange -> login ----
+  // ---- Check 1: self-service register -> immediate login (auto-confirmed) ----
+  // Registration creates the identity already confirmed, so the account is usable on
+  // the spot: no signup OTP to verify and no confirmation link to wait on.
   const pw1 = `pw-${randomBytes(6).toString('hex')}-Ab1!`;
-  let r = await api('/api/auth/client/register', { body: { name: 'Live Reg A', email: emailA, password: pw1 } });
-  mark('register (email_confirm:false, uniform 200)', r.status === 200 && r.body.ok === true, `HTTP ${r.status}`);
+  const r = await api('/api/auth/client/register', { body: { name: 'Live Reg A', email: emailA, password: pw1 } });
+  mark('register (auto-confirmed, uniform 200)', r.status === 200 && r.body.ok === true, `HTTP ${r.status}`);
 
-  const { data: linkData, error: linkErr } = await admin.auth.admin.generateLink({
-    type: 'signup',
-    email: emailA,
-    // The API never reads this — the link is verified as a signup OTP, not used as a
-    // password — but supabase-js requires a password on a signup link to be valid.
-    password: pw1,
-    options: { redirectTo },
-  });
-  const signupToken = linkData?.properties?.hashed_token ?? null;
-  mark('admin.generateLink(signup) delivers OTP', !linkErr && !!signupToken, linkErr?.message ?? '');
-
-  const { data: otpData } = await anon.auth.verifyOtp({ email: emailA, token: signupToken!, type: 'signup' });
-  const signupAccessToken = otpData?.session?.access_token ?? null;
-  mark('verifyOtp(signup) confirms identity + session', !!signupAccessToken);
-
-  if (signupAccessToken) {
-    const ex = await api('/api/auth/exchange', { body: { accessToken: signupAccessToken } });
-    mark('exchange trades confirmed session for sid', ex.status === 200 && !!ex.body.sid, `HTTP ${ex.status}`);
-  }
+  const usersA = (await admin.auth.admin.listUsers({ page: 1, perPage: 1000 })).data.users;
+  const registered = usersA.find((u) => u.email === emailA);
+  const uidA = registered?.id ?? null;
+  if (uidA) createdUids.push(uidA);
+  mark('registered identity is already confirmed', !!registered?.email_confirmed_at);
 
   const ln = await api('/api/auth/client/login', { body: { email: emailA, password: pw1 } });
-  mark('login works post-confirmation (Supabase path)', ln.status === 200 && !!ln.body.sid, `HTTP ${ln.status}`);
+  mark('login works immediately without email confirmation', ln.status === 200 && !!ln.body.sid, `HTTP ${ln.status}`);
   const wrong = await api('/api/auth/client/login', { body: { email: emailA, password: 'definitely-wrong-pw' } });
   mark('login wrong password -> uniform 401', wrong.status === 401 && wrong.body.error === 'invalid_credentials');
 
   const me = await api('/api/auth/client/me', { sid: ln.body.sid });
   mark('guarded /me resolves sid to account (client RLS)', me.status === 200 && me.body.client?.email === emailA, `HTTP ${me.status}`);
-
-  const uidA = signupAccessToken
-    ? ((await admin.auth.admin.listUsers({ page: 1, perPage: 1000 })).data.users.find((u) => u.email === emailA)?.id ?? null)
-    : null;
-  if (uidA) createdUids.push(uidA);
 
   // ---- Check 2: legacy import + recovery link round-trip ----
   const legacyPw = 'legacy-scrypt-pass-1';

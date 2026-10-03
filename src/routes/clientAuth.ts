@@ -28,9 +28,9 @@ import { config } from '../config.js';
 /**
  * Client identity for the dashboard.
  *
- * Credentials live in Supabase Auth: passwords, email confirmation and recovery
- * are Supabase's, while this API keeps the session layer that sits on top (the
- * Redis `sid` bound to the account's session epoch, via src/lib/clientSession.ts).
+ * Credentials live in Supabase Auth: passwords and recovery are Supabase's, while
+ * this API keeps the session layer that sits on top (the Redis `sid` bound to the
+ * account's session epoch, via src/lib/clientSession.ts).
  *
  * Mirrors `operatorAuth` structurally — uniform failures, escalating per-bucket
  * lockout keyed per IP *and* per account — with three ways in:
@@ -38,8 +38,8 @@ import { config } from '../config.js';
  *   - `login`     checks email/password (scrypt for legacy accounts still holding a
  *                 local hash; Supabase `signInWithPassword` once an account has a
  *                 `supabase_uid`), then mints a session.
- *   - `register`  Self-service invite path: the confirmation mail is Supabase's and
- *                 this API only records her row.
+ *   - `register`  Self-service registration: the identity is created already
+ *                 confirmed, so the account is usable the moment signup returns.
  *   - `password`  Rotates the credential and re-mints this sid against a new epoch,
  *                 so she stays signed in here and nowhere else.
  *
@@ -219,10 +219,11 @@ export async function clientAuth(app: FastifyInstance) {
   });
 
   /**
-   * Self-service registration. Creates the identity in Supabase (`email_confirm:
-   * false`, so Supabase mails the confirmation link) and records the account row.
-   * The response is uniformly successful: revealing that an email is already
-   * registered would hand out a user-existence oracle.
+   * Self-service registration. Creates the identity in Supabase already confirmed
+   * (`email_confirm: true`) and records the account row, so a new account is accepted
+   * immediately — no confirmation link to wait on before the first sign-in. The
+   * response is uniformly successful: revealing that an email is already registered
+   * would hand out a user-existence oracle.
    */
   app.post('/api/auth/client/register', async (req, rep) => {
     const parsed = registerBody.safeParse(req.body ?? {});
@@ -250,18 +251,20 @@ export async function clientAuth(app: FastifyInstance) {
       const { data, error } = await admin.auth.admin.createUser({
         email,
         password,
-        email_confirm: false,
+        email_confirm: true,
         user_metadata: { name },
       });
       if (error) {
         if (error.code === 'user_already_exists') {
           // A registration raced an existing identity (e.g. an invited account
-          // created before this email ever signed up). Reuse the identity, resend
-          // the confirmation link so the invite still resolves, and link the
-          // account row — the response stays uniformly successful.
+          // created before this email ever signed up). Reuse it, confirm it so the
+          // account is immediately usable too, and link the account row — the
+          // response stays uniformly successful.
           const existing = await findSupabaseUserByEmail(admin, email);
-          if (existing) await linkExistingClient(email, existing.id);
-          await anon.auth.resend({ type: 'signup', email });
+          if (existing) {
+            await admin.auth.admin.updateUserById(existing.id, { email_confirm: true }).catch(() => {});
+            await linkExistingClient(email, existing.id);
+          }
           return rep.code(200).send({ ok: true });
         }
         return rep.code(503).send({ error: 'auth_unavailable' });

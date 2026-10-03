@@ -22,7 +22,7 @@ export default function RegisterPage() {
           <div className="space-y-1.5 text-center">
             <h1 className="text-lg font-semibold text-slate-900 dark:text-white">Create your account</h1>
             <p className="text-sm text-slate-500 dark:text-slate-400">
-              Invited merchants activate their account here.
+              Create your merchant account and sign in right away.
             </p>
           </div>
 

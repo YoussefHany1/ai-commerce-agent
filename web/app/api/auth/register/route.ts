@@ -10,7 +10,8 @@ const PASSWORD_MAX = 1024;
 
 /**
  * Self-service registration. Body {name, email, password}; the API creates the
- * Supabase identity (email confirmation sent by Supabase) and the account row.
+ * Supabase identity already confirmed and the account row, so the account is usable
+ * immediately — no confirmation link to wait on.
  * Failures map to the API's own codes so the form can show the right message:
  * 503 while Supabase is unavailable, otherwise a uniform success like the API's.
  */

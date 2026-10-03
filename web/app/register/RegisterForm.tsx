@@ -12,10 +12,10 @@ import { makeTranslator } from "@/lib/i18n";
 type State = "idle" | "submitting" | "error" | "created";
 
 /**
- * Activates an invited merchant account. The call goes to this app's own
- * `/api/auth/register` BFF route, which creates the Supabase identity (with the
- * confirmation email sent by Supabase, not this pod) and the account row. There
- * is no session minted here — the first real sign-in does that.
+ * Creates a merchant account. The call goes to this app's own `/api/auth/register`
+ * BFF route, which creates the Supabase identity already confirmed and the account
+ * row. The account is usable immediately — there is no confirmation link to wait on —
+ * and the first sign-in mints the session.
  */
 export function RegisterForm() {
   const { locale } = useLocale();
@@ -54,7 +54,7 @@ export function RegisterForm() {
     try {
       await api.register({ name: name.trim(), email: email.trim(), password });
       setState("created");
-      setMessage(t("registerCheckEmail"));
+      setMessage(t("registerReady"));
     } catch (error) {
       fail(error);
     }
@@ -64,7 +64,7 @@ export function RegisterForm() {
     return (
       <div className="mt-5 space-y-4 text-center">
         <p className="text-sm text-slate-500 dark:text-slate-400">
-          {t("registerCheckEmail")}
+          {t("registerReady")}
         </p>
         <Link
           href="/login"

@@ -419,7 +419,7 @@ describe('client auth: register / forgot / exchange', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ ok: true });
     expect(mocks.supabase.admin.auth.admin.createUser).toHaveBeenCalledWith(
-      expect.objectContaining({ email: 'new@ace.com', password: PASSWORD, email_confirm: false }),
+      expect.objectContaining({ email: 'new@ace.com', password: PASSWORD, email_confirm: true }),
     );
     expect(mocks.clientRepo.create).toHaveBeenCalledWith({
       name: 'New Co',
@@ -429,17 +429,22 @@ describe('client auth: register / forgot / exchange', () => {
     });
   });
 
-  it('reuses an existing identity and never leaks that the email is taken', async () => {
+  it('reuses an existing identity, confirming it, and never leaks that the email is taken', async () => {
     mocks.supabase.admin.auth.admin.createUser.mockResolvedValue({
       data: null,
       error: Object.assign(new Error('User already registered'), { code: 'user_already_exists' }),
     });
     mocks.supabase.findSupabaseUserByEmail.mockResolvedValue({ id: SUPABASE_UID } as never);
-    mocks.supabase.anon.auth.resend.mockResolvedValue({ data: {}, error: null });
+    mocks.supabase.admin.auth.admin.updateUserById.mockResolvedValue({ data: { user: dbRow }, error: null });
     const res = await app.inject(post('/api/auth/client/register', { name: 'Dup', email: 'taken@ace.com', password: PASSWORD }));
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ ok: true });
-    expect(mocks.supabase.anon.auth.resend).toHaveBeenCalled();
+    // The identity is confirmed rather than sent a link, so an account that already
+    // exists becomes immediately usable too — there is no confirmation step left.
+    expect(mocks.supabase.admin.auth.admin.updateUserById).toHaveBeenCalledWith(SUPABASE_UID, {
+      email_confirm: true,
+    });
+    expect(mocks.supabase.anon.auth.resend).not.toHaveBeenCalled();
   });
 
   it('links an invited-but-unlinked account when a registration races it', async () => {

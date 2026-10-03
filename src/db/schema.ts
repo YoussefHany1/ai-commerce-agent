@@ -26,8 +26,9 @@ const tsvectorType = customType<{ data: string; driverData: string }>({
 /**
  * A dashboard customer — the account a merchant or agency signs in with.
  *
- * Credentials are managed by Supabase Auth: clients self-register, confirm their
- * email, reset via email links, and can sign in with Google there. The row below
+ * Credentials are managed by Supabase Auth: clients self-register (auto-confirmed,
+ * so the account is usable immediately), reset via email links, and can sign in with
+ * Google there. The row below
  * is the application-side account — the ownership link between the auth identity
  * (`supabaseUid` = `auth.users.id`) and the merchant's stores.
  *
