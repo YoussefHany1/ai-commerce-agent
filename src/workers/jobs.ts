@@ -9,6 +9,21 @@ import { config } from '../config.js';
 
 const POLL_INTERVAL_MS = 3_000;
 const LOCK_TTL_MS = 60_000;
+
+// Run up to `limit` workers over `items`, each pulling the next index until the
+// list is drained. Keeps at most `limit` promises in flight without materializing
+// per-batch arrays.
+async function runBounded<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const runners = Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      await worker(items[i]);
+    }
+  });
+  await Promise.all(runners);
+}
 // Upper bound on lease renewal. This tick drains the queue and each job makes
 // third-party HTTP calls, so a busy queue legitimately runs long — but a stalled
 // one must not hold the lease, and the worker, for every replica, indefinitely.
@@ -25,6 +40,11 @@ export async function runCatalogSync(storeId: string): Promise<void> {
   const nextVersion = (await catalogRepo.syncVersion(storeId)) + 1;
   await catalogRepo.upsert(storeId, products, nextVersion);
   await catalogRepo.markSynced(storeId);
+  // Freshly upserted rows arrive without embeddings, and vector/hybrid retrieval
+  // skips null-embedding products. Queue a backfill here so it follows every sync
+  // instead of being triggered inline from a read (see GET /api/products/:storeId).
+  // `enqueue` is a no-op when one is already pending or running.
+  await jobsRepo.enqueue(storeId, 'embedding.backfill', {}, { runAt: new Date() });
 }
 
 // Re-read this much before the cursor. Platforms timestamp an order slightly
@@ -167,7 +187,7 @@ export function startJobsWorker(): { stop(): void } {
       LOCK_TTL_MS,
       async () => {
         const due = await jobsRepo.listDue(new Date());
-        for (const job of due) {
+        await runBounded(due, config.JOBS_CONCURRENCY, async (job) => {
           try {
             const fn = resolveHandler(job.type);
             const outcome = await jobsRepo.run(job.storeId, job, () => fn(job.storeId, job.payload));
@@ -175,7 +195,7 @@ export function startJobsWorker(): { stop(): void } {
           } catch (err) {
             logger.error({ jobId: job.id, jobType: job.type, err }, 'job dispatch error');
           }
-        }
+        });
       },
       { maxDurationMs: MAX_DURATION_MS },
     );

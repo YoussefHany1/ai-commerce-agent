@@ -44,7 +44,13 @@ export async function whatsapp(app: FastifyInstance) {
     } catch {
       throw Object.assign(new Error('invalid_json'), { statusCode: 400 });
     }
-    await handleWhatsappPayload(body);
+    // Ack Meta before doing the work. Processing runs the agent and sends the
+    // reply, which routinely outlasts Meta's webhook timeout — and a timeout makes
+    // Meta redeliver the same message, so the customer would get duplicate replies.
+    // Signature and JSON are already validated above, so a 200 here is honest.
+    void handleWhatsappPayload(body).catch((err) =>
+      logger.error({ err }, 'whatsapp: webhook processing failed'),
+    );
     return { received: true };
   });
 

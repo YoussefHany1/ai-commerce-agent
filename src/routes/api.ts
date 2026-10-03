@@ -6,13 +6,14 @@ import {
   storeRepo,
   catalogRepo,
   conversationRepo,
+  connectionRepo,
   storeToPublic,
   jobsRepo,
 } from '../db/repos.js';
-import { getCommerceAdapter, verifyStoreCredentials } from '../integrations/factory.js';
+import { verifyStoreCredentials } from '../integrations/factory.js';
 import { recordImpressions } from '../services/analytics.js';
 import { answerWithTools, answerWithToolsStream, toChatHistory } from '../services/agent.js';
-import { retrieve, embedMissingCatalog } from '../services/retrieval.js';
+import { retrieve } from '../services/retrieval.js';
 import { dbPing, redisPing, rlsPing } from '../lib/health.js';
 import { storeRateLimitWindow } from '../lib/rateLimit.js';
 import { requireOperator, requireDashboard, sha256Hex, type Principal } from '../lib/auth.js';
@@ -228,15 +229,15 @@ export async function api(app: FastifyInstance) {
       const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);
       if (!store) return rep.code(404).send({ error: 'store_not_found' });
-      let list = await catalogRepo.list(storeId);
-      const adapter = await getCommerceAdapter(storeId);
-      if (adapter) {
-        list = await adapter.listProducts();
-        await catalogRepo.upsert(storeId, list, (await catalogRepo.syncVersion(storeId)) + 1);
-        await catalogRepo.markSynced(storeId);
-      }
-      await embedMissingCatalog(storeId);
-      return list;
+      // Serve the synced catalog straight from the DB. Fetching the platform,
+      // re-upserting, and re-embedding inline made every read as slow as the
+      // remote API (and could hold the request open on a stalled platform). That
+      // work is a worker concern now: queue a catalog sync and return. `enqueue`
+      // dedupes against a pending/running job of the same type, so a polled
+      // endpoint cannot pile up work.
+      const conn = await connectionRepo.get(storeId);
+      if (conn) await jobsRepo.enqueue(storeId, 'catalog.sync', {}, { runAt: new Date() });
+      return catalogRepo.list(storeId);
     },
   );
 

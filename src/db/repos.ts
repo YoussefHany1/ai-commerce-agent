@@ -497,6 +497,10 @@ export const storeRepo = {
   },
 };
 
+// Rows per multi-row catalog upsert statement. Bounds bind parameters and
+// statement size while still collapsing the old per-row loop into a few queries.
+const CATALOG_UPSERT_CHUNK = 500;
+
 export const catalogRepo = {
   async list(storeId: string, limit?: number): Promise<Product[]> {
     return withTenant(storeId, async (tx) => {
@@ -527,8 +531,12 @@ export const catalogRepo = {
 
   async upsert(storeId: string, items: Product[], syncVersion: number): Promise<void> {
     await withTenant(storeId, async (tx) => {
-      for (const p of items) {
-        const row: NewProductRow = {
+      // One statement per chunk instead of one per product. A 500-row catalog was
+      // 500 round-trips inside the transaction; this makes it a handful. The chunk
+      // keeps each statement well under Postgres' 65535 bind-parameter ceiling
+      // (10 params/row) and bounds statement size on huge catalogs.
+      for (let i = 0; i < items.length; i += CATALOG_UPSERT_CHUNK) {
+        const chunk: NewProductRow[] = items.slice(i, i + CATALOG_UPSERT_CHUNK).map((p) => ({
           storeId,
           platformProductId: p.id,
           title: p.title,
@@ -539,25 +547,29 @@ export const catalogRepo = {
           url: p.url,
           sku: p.sku,
           syncVersion,
-        };
+        }));
         await tx
           .insert(products)
-          .values(row)
+          .values(chunk)
           .onConflictDoUpdate({
             target: [products.storeId, products.platformProductId],
+            // excluded.* reads the incoming row for *this* conflict; a captured JS
+            // value would apply the last item's fields to every conflicting row.
             set: {
-              title: p.title,
-              description: p.description,
-              price: p.price,
-              currency: p.currency,
-              available: p.available,
-              url: p.url,
-              sku: p.sku,
-              syncVersion,
+              title: sql`excluded.title`,
+              description: sql`excluded.description`,
+              price: sql`excluded.price`,
+              currency: sql`excluded.currency`,
+              available: sql`excluded.available`,
+              url: sql`excluded.url`,
+              sku: sql`excluded.sku`,
+              syncVersion: sql`excluded.sync_version`,
               updatedAt: sql`now()`,
             },
           });
       }
+      // Runs even when `items` is empty, so a store that dropped its whole catalog
+      // still gets the stale rows purged.
       await tx.delete(products).where(sql`store_id = ${storeId} and sync_version <> ${syncVersion}`);
     });
   },
@@ -612,12 +624,19 @@ export const catalogRepo = {
   },
 
   async updateEmbeddings(storeId: string, rows: { id: string; embedding: number[] }[]): Promise<void> {
+    if (!rows.length) return;
     await withTenant(storeId, async (tx) => {
-      for (const r of rows) {
-        await tx
-          .update(products)
-          .set({ embedding: sql`${`[${r.embedding.join(',')}]`}::vector` })
-          .where(eq(products.id, r.id));
+      // A single `update ... from (values ...)` per chunk replaces the old one
+      // UPDATE per row, which was the bulk of an embedding backfill's wall time.
+      for (let i = 0; i < rows.length; i += CATALOG_UPSERT_CHUNK) {
+        const tuples = rows
+          .slice(i, i + CATALOG_UPSERT_CHUNK)
+          .map((r) => sql`(${r.id}::uuid, ${`[${r.embedding.join(',')}]`}::vector)`);
+        await tx.execute(
+          sql`update products as p set embedding = v.embedding
+              from (values ${sql.join(tuples, sql`, `)}) as v(id, embedding)
+              where p.id = v.id`,
+        );
       }
     });
   },

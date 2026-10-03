@@ -105,6 +105,10 @@ const schema = z.object({
     .default(730),
   RETENTION_ENABLED: z.enum(["1", "0", "true", "false"]).default("true"),
   WORKERS_ENABLED: z.enum(["1", "0", "true", "false"]).default("true"),
+  // How many due jobs one worker tick may run at once. Jobs claim conditionally in
+  // the DB, so parallel execution is safe; the cap keeps a large backlog from
+  // saturating the connection pool or a single platform's API rate limit at once.
+  JOBS_CONCURRENCY: z.coerce.number().int().positive().default(4),
 });
 
 // aes-256-gcm needs exactly 32 bytes. Buffer.from(key, 'hex') silently drops

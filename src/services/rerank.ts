@@ -121,11 +121,14 @@ export async function embeddingReRank(
   query: string,
   storeId: string,
   candidates: Candidate[],
+  queryEmbedding?: number[] | null,
 ): Promise<Candidate[]> {
   if (!config.OPENAI_API_KEY) return lexicalReRank(query, candidates);
-  const emb = await embedTexts([query.trim()]);
-  if (!emb?.[0]) return lexicalReRank(query, candidates);
-  const v = `[${emb[0].join(',')}]`;
+  // Reuse the caller's query vector when available; `undefined` means unresolved,
+  // while an explicit null means "already attempted" and falls straight through.
+  const vec = queryEmbedding !== undefined ? queryEmbedding : (await embedTexts([query.trim()]))?.[0];
+  if (!vec) return lexicalReRank(query, candidates);
+  const v = `[${vec.join(',')}]`;
   const ids = candidates.map((c) => c.product.id);
   if (!ids.length) return [];
   const sims = new Map<string, number>();
@@ -152,10 +155,13 @@ export async function rerank(
   candidates: Candidate[],
   mode: string,
   limit: number,
+  queryEmbedding?: number[] | null,
 ): Promise<Candidate[]> {
   if (mode === 'off') return candidates.slice(0, limit);
   const recall = await synonymRecall(query, storeId, limit);
   const pool = dedupeById([...candidates, ...recall]);
-  if (mode === 'embedding') return embeddingReRank(query, storeId, pool).then((r) => r.slice(0, limit));
+  if (mode === 'embedding') {
+    return embeddingReRank(query, storeId, pool, queryEmbedding).then((r) => r.slice(0, limit));
+  }
   return lexicalReRank(query, pool).slice(0, limit);
 }
