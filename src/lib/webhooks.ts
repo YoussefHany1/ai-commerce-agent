@@ -61,10 +61,16 @@ export function verifyPlatformSignature(
   for (const name of PLATFORM_HEADERS[platform]) {
     const provided = getHeader(headers, name);
     if (!provided) continue;
-    const digest = createHmac('sha256', secret).update(raw).digest('hex');
     const value = String(provided);
     const expected = value.startsWith('sha256=') ? value.slice('sha256='.length) : value;
-    return safeEqual(digest, expected);
+    // Shopify sends the digest base64-encoded; Salla, Zid and the Meta-style
+    // `x-hub-signature-256` header send hex. Comparing a hex digest against Shopify's
+    // base64 header can never match, so every Shopify delivery was rejected with a 401
+    // and orders only ever arrived via the slow poll. Accept either encoding: it is the
+    // same keyed MAC over the same body, so the encoding is not a security boundary.
+    const base64 = createHmac('sha256', secret).update(raw).digest('base64');
+    const hex = createHmac('sha256', secret).update(raw).digest('hex');
+    return safeEqual(base64, expected) || safeEqual(hex, expected);
   }
   return false;
 }

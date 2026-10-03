@@ -167,8 +167,9 @@ vi.mock('../services/automation.js', () => services.automation);
 vi.mock('../lib/webhookApply.js', () => services.webhookApply);
 vi.mock('../integrations/factory.js', () => services.factory);
 
+// Shopify's webhook header is base64 (unlike the hex OAuth `hmac` query param below).
 function shopifyHmac(body: Buffer | string): string {
-  return createHmac('sha256', SHOPIFY_SECRET).update(body).digest('hex');
+  return createHmac('sha256', SHOPIFY_SECRET).update(body).digest('base64');
 }
 
 function shopifyOAuthQuery(params: Record<string, string>): string {

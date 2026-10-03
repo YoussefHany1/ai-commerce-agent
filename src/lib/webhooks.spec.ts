@@ -7,6 +7,11 @@ function hmac(raw: string): string {
   return createHmac('sha256', SECRET).update(raw).digest('hex');
 }
 
+/** Shopify's `X-Shopify-Hmac-Sha256` is base64, not hex. */
+function hmacB64(raw: string): string {
+  return createHmac('sha256', SECRET).update(raw).digest('base64');
+}
+
 async function loadWebhooks(env: Record<string, string>) {
   vi.resetModules();
   const saved = { ...process.env };
@@ -22,17 +27,17 @@ async function loadWebhooks(env: Record<string, string>) {
 describe('verifyWebhook', () => {
   afterEach(() => vi.resetModules());
 
-  it('accepts a valid Shopify HMAC signature', async () => {
+  it('accepts a valid base64 Shopify HMAC signature', async () => {
     const { verifyWebhook } = await loadWebhooks({});
     const raw = Buffer.from('{"id":1}');
-    const ok = verifyWebhook('shopify', raw, { 'x-shopify-hmac-sha256': hmac('{"id":1}') });
+    const ok = verifyWebhook('shopify', raw, { 'x-shopify-hmac-sha256': hmacB64('{"id":1}') });
     expect(ok).toBe(true);
   });
 
   it('rejects a tampered body', async () => {
     const { verifyWebhook } = await loadWebhooks({});
     const ok = verifyWebhook('shopify', Buffer.from('{"id":2}'), {
-      'x-shopify-hmac-sha256': hmac('{"id":1}'),
+      'x-shopify-hmac-sha256': hmacB64('{"id":1}'),
     });
     expect(ok).toBe(false);
   });
