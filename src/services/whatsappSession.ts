@@ -271,10 +271,12 @@ export class PairingNotReadyError extends Error {
  * How long to wait for a freshly-started socket to reach the QR stage before giving up.
  *
  * `startSession` returns as soon as the socket object is built; the websocket then opens
- * and receives its first server frame asynchronously. Exceeding a normal handshake on a
- * cold deploy is why this is generous but bounded.
+ * and receives its first server frame asynchronously. The wait must stay under the
+ * reverse-proxy request timeout in front of the API (a killed request surfaces as an
+ * opaque browser error), while the client's own timeout sits well above this so the API
+ * always answers first with either the code or `session_not_ready`.
  */
-export const PAIRING_READY_TIMEOUT_MS = 20_000;
+export const PAIRING_READY_TIMEOUT_MS = 25_000;
 
 /** Minimum gap between two inbound messages from the same contact, per store. */
 const INBOUND_THROTTLE_MS = 1_000;
