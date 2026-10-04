@@ -34,6 +34,8 @@ const mocks = vi.hoisted(() => {
     get: vi.fn(),
     list: vi.fn(),
     byRef: vi.fn(),
+    byRefs: vi.fn<(refs: string[], platform: string) => Promise<{ id: string } | null>>(async () => null),
+    listByPlatform: vi.fn<(platform: string) => Promise<{ id: string }[]>>(async () => []),
     findByPlatformAndDomain: vi.fn(async () => null),
     create: vi.fn(),
     remove: vi.fn(),
@@ -185,6 +187,15 @@ vi.mock('../integrations/factory.js', () => services.factory);
 // Shopify's webhook header is base64 (unlike the hex OAuth `hmac` query param below).
 function shopifyHmac(body: Buffer | string): string {
   return createHmac('sha256', SHOPIFY_SECRET).update(body).digest('base64');
+}
+
+// Salla and Zid sign with the same client secret used for OAuth, hex-encoded.
+function sallaHmac(body: Buffer | string): string {
+  return createHmac('sha256', 'salla-client-secret').update(body).digest('hex');
+}
+
+function zidHmac(body: Buffer | string): string {
+  return createHmac('sha256', 'zid-client-secret').update(body).digest('hex');
 }
 
 function shopifyOAuthQuery(params: Record<string, string>): string {
@@ -617,7 +628,8 @@ describe('routes: platform webhooks', () => {
   });
 
   it('rejects a valid payload for an unknown store', async () => {
-    mocks.storeRepo.byRef.mockResolvedValue(null);
+    mocks.storeRepo.byRefs.mockResolvedValue(null);
+    mocks.storeRepo.listByPlatform.mockResolvedValue([]);
     const body = JSON.stringify({ id: 'prod-9' });
     const res = await app.inject({
       method: 'POST',
@@ -635,7 +647,7 @@ describe('routes: platform webhooks', () => {
   });
 
   it('records and applies a valid signed event', async () => {
-    mocks.storeRepo.byRef.mockImplementation(async () => ({ id: 's-web' }));
+    mocks.storeRepo.byRefs.mockImplementation(async () => ({ id: 's-web' }));
     mocks.eventRepo.record.mockResolvedValue(true);
     const body = JSON.stringify({ id: 'prod-42', title: 'المنتج' });
     const res = await app.inject({
@@ -658,7 +670,7 @@ describe('routes: platform webhooks', () => {
   });
 
   it('routes an app/uninstalled event to the apply layer', async () => {
-    mocks.storeRepo.byRef.mockImplementation(async () => ({ id: 's-web' }));
+    mocks.storeRepo.byRefs.mockImplementation(async () => ({ id: 's-web' }));
     mocks.eventRepo.record.mockResolvedValue(true);
     const body = JSON.stringify({ id: 42 });
     const res = await app.inject({
@@ -679,7 +691,8 @@ describe('routes: platform webhooks', () => {
   it('answers 200 for an uninstall whose store is already gone', async () => {
     // 404 made Shopify retry an uninstall that had already reached its desired end state,
     // each retry failing the same way against a store that no longer existed.
-    mocks.storeRepo.byRef.mockResolvedValue(null);
+    mocks.storeRepo.byRefs.mockResolvedValue(null);
+    mocks.storeRepo.listByPlatform.mockResolvedValue([]);
     mocks.eventRepo.record.mockResolvedValue(true);
     const body = JSON.stringify({ id: 42 });
     const res = await app.inject({
@@ -701,7 +714,8 @@ describe('routes: platform webhooks', () => {
   it('still 404s a non-uninstall webhook for an unknown store', async () => {
     // Only the uninstall is safe to swallow: an order for a store we cannot resolve is a
     // real missed order, and answering 200 would tell Shopify the delivery succeeded.
-    mocks.storeRepo.byRef.mockResolvedValue(null);
+    mocks.storeRepo.byRefs.mockResolvedValue(null);
+    mocks.storeRepo.listByPlatform.mockResolvedValue([]);
     const body = JSON.stringify({ id: 42 });
     const res = await app.inject({
       method: 'POST',
@@ -718,7 +732,7 @@ describe('routes: platform webhooks', () => {
   });
 
   it('returns duplicate for an already-recorded event with no side effects', async () => {
-    mocks.storeRepo.byRef.mockImplementation(async () => ({ id: 's-web' }));
+    mocks.storeRepo.byRefs.mockImplementation(async () => ({ id: 's-web' }));
     mocks.eventRepo.record.mockResolvedValue(false);
     const body = JSON.stringify({ id: 'prod-7' });
     const res = await app.inject({
@@ -735,6 +749,81 @@ describe('routes: platform webhooks', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ received: true, duplicate: true });
     expect(services.webhookApply.applyWebhook).not.toHaveBeenCalled();
+  });
+
+  it('resolves a Zid store from the manager id the callback stored it under', async () => {
+    // The bug this covers: the Zid callback writes `zid-<managerId>` into shop_domain while
+    // the delivery carries the bare manager id, so reading a single field never matched and
+    // every live event 404'd. The prefixed candidate is what closes the gap.
+    mocks.storeRepo.byRefs.mockImplementation(async (refs: string[]) =>
+      refs.includes('zid-77') ? { id: 's-zid' } : null,
+    );
+    mocks.eventRepo.record.mockResolvedValue(true);
+    const body = JSON.stringify({ event: 'order.updated', merchant_id: 77, id: 'o-1' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/zid',
+      headers: { 'content-type': 'application/json', 'x-zid-signature': zidHmac(body) },
+      payload: body,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(mocks.storeRepo.byRefs).toHaveBeenCalledWith(expect.arrayContaining(['77', 'zid-77']), 'zid');
+    expect(mocks.storeRepo.get).not.toHaveBeenCalled();
+    expect(mocks.eventRepo.record).toHaveBeenCalledWith(expect.objectContaining({ storeId: 's-zid' }));
+  });
+
+  it('attributes an unresolvable delivery to the only store on the platform', async () => {
+    mocks.storeRepo.byRefs.mockResolvedValue(null);
+    mocks.storeRepo.listByPlatform.mockResolvedValue([{ id: 's-only' }]);
+    mocks.storeRepo.get.mockImplementation(async () => ({ id: 's-only' }));
+    mocks.eventRepo.record.mockResolvedValue(true);
+    const body = JSON.stringify({ topic: 'product.updated', id: 'p-1' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/salla',
+      headers: { 'content-type': 'application/json', 'x-salla-signature': sallaHmac(body) },
+      payload: body,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(mocks.storeRepo.listByPlatform).toHaveBeenCalledWith('salla');
+    expect(mocks.eventRepo.record).toHaveBeenCalledWith(expect.objectContaining({ storeId: 's-only' }));
+    expect(services.webhookApply.applyWebhook).toHaveBeenCalledOnce();
+  });
+
+  it('404s instead of guessing when the platform has more than one store', async () => {
+    // Falling back to the first store here would write another merchant's order to the
+    // wrong tenant — a data leak, which is strictly worse than the 404 this replaced.
+    mocks.storeRepo.byRefs.mockResolvedValue(null);
+    mocks.storeRepo.listByPlatform.mockResolvedValue([{ id: 's-a' }, { id: 's-b' }]);
+    const body = JSON.stringify({ topic: 'product.updated', id: 'p-2' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/salla',
+      headers: { 'content-type': 'application/json', 'x-salla-signature': sallaHmac(body) },
+      payload: body,
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ error: 'store_not_found' });
+    expect(mocks.eventRepo.record).not.toHaveBeenCalled();
+    expect(services.webhookApply.applyWebhook).not.toHaveBeenCalled();
+  });
+
+  it('rejects a Salla delivery signed with the wrong secret', async () => {
+    const body = JSON.stringify({ topic: 'product.updated', id: 'p-3' });
+    const bad = createHmac('sha256', 'not-the-secret').update(body).digest('hex');
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/salla',
+      headers: { 'content-type': 'application/json', 'x-salla-signature': bad },
+      payload: body,
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(mocks.storeRepo.byRefs).not.toHaveBeenCalled();
+    expect(mocks.storeRepo.listByPlatform).not.toHaveBeenCalled();
   });
 });
 

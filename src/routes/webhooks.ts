@@ -4,6 +4,7 @@ import { storeRepo, eventRepo } from '../db/repos.js';
 import { extractEvent, verifyWebhook } from '../lib/webhooks.js';
 import { applyWebhook } from '../lib/webhookApply.js';
 import { config } from '../config.js';
+import { logger } from '../lib/logger.js';
 import type { Platform } from '../types.js';
 
 const PLATFORMS = ['shopify', 'salla', 'zid'] as const;
@@ -30,7 +31,36 @@ export async function webhooks(app: FastifyInstance) {
     }
 
     const event = extractEvent(p, raw, req.headers as Record<string, string | string[] | undefined>, body);
-    const store = event.storeRef ? await storeRepo.byRef(event.storeRef, p) : null;
+    const refs = event.storeRefs ?? (event.storeRef ? [event.storeRef] : []);
+    let store = refs.length ? await storeRepo.byRefs(refs, p) : null;
+
+    if (!store) {
+      // Salla and Zid deliver events whose identifier field is not the one we store the
+      // shop under, and the exact wrapper keys are only knowable from a live store. When
+      // the platform has a single connected store there is nothing to confuse it with, so
+      // attributing the event is correct rather than a guess — and with more than one,
+      // guessing would write another merchant's order to the wrong store.
+      const candidates = await storeRepo.listByPlatform(p);
+      if (candidates.length === 1) {
+        store = await storeRepo.get(candidates[0].id);
+        logger.warn(
+          { platform: p, storeRef: refs[0], storeRefs: refs, storeId: candidates[0].id, type: event.type },
+          'webhook: store not matched by ref; attributed to the only store on this platform',
+        );
+      } else {
+        // Name both sides so the mismatch is fixable from the log alone. `connected: 0` is
+        // a different fault from a genuine ambiguity — the platform has no store at all,
+        // so the install never completed or was deleted — and collapsing the two into one
+        // message would send whoever reads it looking for an ambiguous multi-store account
+        // that does not exist.
+        const reason = candidates.length === 0 ? 'no_store_on_platform' : 'ambiguous_store';
+        logger.error(
+          { platform: p, storeRef: refs[0], storeRefs: refs, connected: candidates.length, type: event.type, reason },
+          'store_not_found',
+        );
+      }
+    }
+
     if (!store) {
       // An uninstall whose store is already gone is the desired end state, so answer 2xx.
       // Returning 404 made Shopify retry the same uninstall several times against a store

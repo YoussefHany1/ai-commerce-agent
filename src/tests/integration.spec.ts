@@ -110,6 +110,52 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
     await expect(adminCount('products', b)).resolves.toBe(0);
   });
 
+  it('resolves a store by any one of several candidate refs', async () => {
+    // The webhook path passes every identifier the payload carried, so this is the query
+    // that has to work for Salla/Zid deliveries whose wrapper keys we cannot predict.
+    const s = await storeRepo.create({ name: 'REFS S', platform: 'salla', shopDomain: 'zid-4242' });
+    const other = await storeRepo.create({ name: 'REFS O', platform: 'salla', shopDomain: 'refs-other.sa' });
+    createdStores.push(s, other);
+
+    expect((await storeRepo.byRefs(['4242', 'zid-4242'], 'salla'))?.id).toBe(s);
+    // A candidate set that includes a real ref still resolves; order must not matter.
+    expect((await storeRepo.byRefs(['nope', 'zid-4242', '4242'], 'salla'))?.id).toBe(s);
+    // Our own primary key is a valid ref too.
+    expect((await storeRepo.byRefs([s], 'salla'))?.id).toBe(s);
+    // No candidates, and no match, are both null rather than an error.
+    expect(await storeRepo.byRefs([], 'salla')).toBeNull();
+    expect(await storeRepo.byRefs(['absent'], 'salla')).toBeNull();
+    // Platform scoping holds: the same ref on another platform must not match.
+    expect(await storeRepo.byRefs(['zid-4242'], 'zid')).toBeNull();
+  });
+
+  it('lists only stores holding a usable token for the given platform', async () => {
+    // A store created without a token still gets a `platform_connections` row, with
+    // `access_token_enc` null. Counting it would turn a resolvable single-store account
+    // into an ambiguity and 404 the delivery — and it is exactly what a merchant who opens
+    // the add-store modal and backs out leaves behind.
+    const connected = await storeRepo.create({
+      name: 'PLAT C',
+      platform: 'zid',
+      shopDomain: 'plat-c.zid.sa',
+      accessToken: 'zid_access_token_c',
+    });
+    const tokenless = await storeRepo.create({ name: 'PLAT U', platform: 'zid', shopDomain: 'plat-u.zid.sa' });
+    const otherPlatform = await storeRepo.create({
+      name: 'PLAT S',
+      platform: 'salla',
+      shopDomain: 'plat-s.sa',
+      accessToken: 'salla_access_token_s',
+    });
+    createdStores.push(connected, tokenless, otherPlatform);
+
+    // The tokenless store does have a connection row — that is the point.
+    await expect(adminCount('platform_connections', tokenless)).resolves.toBe(1);
+
+    expect((await storeRepo.listByPlatform('zid')).map((r) => r.id)).toEqual([connected]);
+    expect((await storeRepo.listByPlatform('salla')).map((r) => r.id)).toEqual([otherPlatform]);
+  });
+
   it('tenant writes to another store are prevented by policies', async () => {
     const a = await storeRepo.create({ name: 'RLS W A', platform: 'shopify', shopDomain: 'rls-w-a.myshopify.com' });
     const b = await storeRepo.create({ name: 'RLS W B', platform: 'shopify', shopDomain: 'rls-w-b.myshopify.com' });
@@ -248,16 +294,31 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
     const { acquireLock } = await import('../lib/lock.js');
     const name = 'test:worker-lease';
 
-    // Two independent acquisitions, as two API replicas would attempt.
+    // Every acquisition is released. These keys are fixed strings on a shared Redis, so a
+    // lease left behind outlives the file by its whole TTL and makes the *next* run of
+    // this spec fail its first assertion — which reads as a real failure rather than the
+    // leak it is. `release()` is best-effort and never throws, so the finally is safe.
     const first = await acquireLock(name, 30_000);
-    expect(first).not.toBeNull();
-    expect(await acquireLock(name, 30_000)).toBeNull();
+    try {
+      // Two independent acquisitions, as two API replicas would attempt.
+      expect(first).not.toBeNull();
+      expect(await acquireLock(name, 30_000)).toBeNull();
 
-    // The Lua release script must be token-scoped: a non-holder cannot free it.
-    const stray = await acquireLock('test:other-lease', 30_000);
-    expect(stray).not.toBeNull();
-    await first!.release();
-    expect(await acquireLock(name, 30_000)).not.toBeNull();
+      // The Lua release script must be token-scoped: a non-holder cannot free it.
+      const stray = await acquireLock('test:other-lease', 30_000);
+      try {
+        expect(stray).not.toBeNull();
+      } finally {
+        await stray!.release();
+      }
+      await first!.release();
+
+      const reacquired = await acquireLock(name, 30_000);
+      expect(reacquired).not.toBeNull();
+      await reacquired!.release();
+    } finally {
+      await first?.release();
+    }
   });
 
   it('keeps a lease held across work longer than the ttl, then releases it', async () => {
@@ -271,7 +332,9 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
 
     // Renewal held it against a TTL the work outlasted several times over.
     expect(rival).toBeNull();
-    expect(await acquireLock(name, 400)).not.toBeNull();
+    const after = await acquireLock(name, 400);
+    expect(after).not.toBeNull();
+    await after!.release();
   });
 
   it('seeds a fresh operator session epoch and survives concurrent creation', async () => {

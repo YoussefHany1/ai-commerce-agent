@@ -25,6 +25,14 @@ const PLATFORM_OPTIONS = [
   { value: 'zid', label: 'Zid' },
 ];
 
+/**
+ * Platforms with a merchant-initiated OAuth install served by
+ * `/api/oauth/<platform>/start`. Every option in `PLATFORM_OPTIONS` belongs here today;
+ * the list exists so adding a platform without an install flow cannot silently fall
+ * through to a button that 404s.
+ */
+const OAUTH_PLATFORMS = ['shopify', 'salla', 'zid'];
+
 interface FormState {
   name: string;
   platform: string;
@@ -100,19 +108,22 @@ export default function StoresPage() {
   };
 
   /**
-   * Starts the Shopify install. `redirectAfter` sends the merchant back to this
-   * dashboard once the callback completes — without it the API answers with raw
-   * JSON, which is a dead end for the person installing. The API only honours it
-   * for origins listed in OAUTH_REDIRECT_ALLOWLIST.
+   * Starts an OAuth install. `redirectAfter` sends the merchant back to this dashboard once
+   * the callback completes — without it the API answers with raw JSON, which is a dead end
+   * for the person installing. The API only honours it for origins listed in
+   * OAUTH_REDIRECT_ALLOWLIST.
    *
-   * Same-origin on purpose: `/api/oauth/shopify/start` is proxied by this app so the
+   * Same-origin on purpose: `/api/oauth/<platform>/start` is proxied by this app so the
    * session cookie is attached and the API can scope the new store to the signed-in
-   * account. Navigating straight at the API would drop the cookie and install the
-   * store as operator-owned, which the client cannot then see.
+   * account. Navigating straight at the API would drop the cookie and install the store as
+   * operator-owned, which the client cannot then see.
+   *
+   * Shopify alone needs `shop`, which identifies the shop being installed; Salla and Zid
+   * learn it from the merchant who authorizes, so they take no shop parameter.
    */
-  const startShopifyOAuth = (shopDomain: string) => {
-    const url = new URL('/api/oauth/shopify/start', window.location.origin);
-    url.searchParams.set('shop', shopDomain);
+  const startOAuth = (platform: string, shopDomain?: string) => {
+    const url = new URL(`/api/oauth/${platform}/start`, window.location.origin);
+    if (platform === 'shopify' && shopDomain) url.searchParams.set('shop', shopDomain);
     url.searchParams.set('redirectAfter', `${window.location.origin}/dashboard/stores`);
     window.location.href = url.toString();
   };
@@ -214,34 +225,38 @@ export default function StoresPage() {
             onChange={(e) => setForm((f) => ({ ...f, platform: e.target.value }))}
           />
 
-          {form.platform === 'shopify' && (
+          {OAUTH_PLATFORMS.includes(form.platform) ? (
             <div className="flex flex-col gap-2 rounded-xl border border-violet-200/70 bg-violet-50/40 p-4 dark:border-violet-400/20 dark:bg-violet-500/[0.06]">
               <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
-                Recommended: connect with Shopify
+                Recommended: connect with {PLATFORM_OPTIONS.find((p) => p.value === form.platform)?.label} OAuth
               </p>
               <p className="text-xs text-slate-500 dark:text-slate-400">
                 Grants the app the scopes it needs and registers webhooks, so orders and
                 catalog updates arrive live. Paste a token below only if you cannot
                 install the app.
               </p>
-              {form.shopDomain.trim() ? (
+              {/* Shopify alone needs the shop up front: its authorize URL is per-shop, so
+                  without a domain there is nowhere to send the merchant. Salla and Zid
+                  identify the store from whoever authorizes, so requiring the field
+                  first would block the only install path they have. */}
+              {form.platform !== 'shopify' || form.shopDomain.trim() ? (
                 <Button
                   variant="secondary"
                   className="w-full"
-                  onClick={() => startShopifyOAuth(form.shopDomain.trim())}
+                  onClick={() => startOAuth(form.platform, form.shopDomain.trim())}
                 >
-                  Connect with Shopify OAuth
+                  Connect with OAuth
                 </Button>
               ) : (
                 <p className="text-xs text-slate-400">Enter your shop domain to enable OAuth.</p>
               )}
             </div>
-          )}
+          ) : null}
 
           <Input
             label="Shop domain"
             placeholder="shop.myshopify.com"
-            hint="e.g. shop.myshopify.com"
+            hint="e.g. shop.myshopify.com — only needed for a manual Shopify connection; OAuth identifies the store for you"
             value={form.shopDomain}
             onChange={(e) => setForm((f) => ({ ...f, shopDomain: e.target.value }))}
             error={errors.shopDomain}

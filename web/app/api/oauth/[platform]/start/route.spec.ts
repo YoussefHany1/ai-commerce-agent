@@ -28,6 +28,8 @@ vi.mock('next/server', async (orig) => {
 
 import { GET } from './route';
 
+const ctx = (platform: string) => ({ params: Promise.resolve({ platform }) });
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubGlobal('fetch', fetchMock);
@@ -40,12 +42,15 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('GET /api/oauth/shopify/start', () => {
+describe('GET /api/oauth/[platform]/start', () => {
   test('forwards a client session so the API can scope the new store', async () => {
     fetchMock.mockResolvedValue(
       new Response(null, { status: 302, headers: { location: 'https://demo.myshopify.com/admin/oauth/authorize?state=abc' } }),
     );
-    const res = await GET(new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'));
+    const res = await GET(
+      new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'),
+      ctx('shopify'),
+    );
 
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toContain('state=abc');
@@ -60,7 +65,7 @@ describe('GET /api/oauth/shopify/start', () => {
   test('forwards an operator session in the operator header', async () => {
     session.payload = { kind: 'operator', sid: 'op-1' };
     fetchMock.mockResolvedValue(new Response(null, { status: 302, headers: { location: 'https://x/authorize' } }));
-    await GET(new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'));
+    await GET(new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'), ctx('shopify'));
     const headers = fetchMock.mock.calls[0]![1]!.headers as Headers;
     expect(headers.get('x-operator-session')).toBe('op-1');
     expect(headers.get('x-client-session')).toBeNull();
@@ -68,7 +73,10 @@ describe('GET /api/oauth/shopify/start', () => {
 
   test('refuses a stale session instead of starting an unauthenticated install', async () => {
     Object.assign(session, { ok: false, reason: 'expired' });
-    const res = await GET(new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'));
+    const res = await GET(
+      new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'),
+      ctx('shopify'),
+    );
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: 'session_expired' });
     // Crucially: no upstream call, so no operator-scoped store can be created.
@@ -77,7 +85,10 @@ describe('GET /api/oauth/shopify/start', () => {
 
   test('surfaces a 503 when the session check itself is unavailable', async () => {
     Object.assign(session, { ok: false, reason: 'unavailable' });
-    const res = await GET(new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'));
+    const res = await GET(
+      new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'),
+      ctx('shopify'),
+    );
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ error: 'auth_unavailable' });
     expect(fetchMock).not.toHaveBeenCalled();
@@ -87,8 +98,37 @@ describe('GET /api/oauth/shopify/start', () => {
     fetchMock.mockResolvedValue(
       Response.json({ error: 'invalid_redirect_after' }, { status: 400 }),
     );
-    const res = await GET(new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'));
+    const res = await GET(
+      new Request('http://localhost:3001/api/oauth/shopify/start?shop=demo.myshopify.com'),
+      ctx('shopify'),
+    );
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: 'invalid_redirect_after' });
+  });
+
+  // Salla and Zid are the reason this route is generic. Their install flows existed in the
+  // API with no same-origin start proxy, so the only way in was typing the API's URL — which
+  // drops the cookie and installs the store operator-owned, invisible to the signed-in client.
+  test.each(['salla', 'zid'])('starts a %s install with the session attached', async (platform) => {
+    fetchMock.mockResolvedValue(
+      new Response(null, { status: 302, headers: { location: `https://example.test/${platform}/authorize` } }),
+    );
+    const res = await GET(
+      new Request(`http://localhost:3001/api/oauth/${platform}/start?redirectAfter=http://localhost:3001/dashboard/stores`),
+      ctx(platform),
+    );
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe(`https://example.test/${platform}/authorize`);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toContain(`/api/oauth/${platform}/start?redirectAfter=`);
+    expect((init!.headers as Headers).get('x-client-session')).toBe('cli-1');
+  });
+
+  test('rejects a platform with no install flow instead of proxying the segment', async () => {
+    const res = await GET(new Request('http://localhost:3001/api/oauth/../etc/start'), ctx('..'));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'not_found' });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

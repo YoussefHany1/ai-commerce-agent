@@ -1,4 +1,4 @@
-import { and, count, desc, eq, inArray, isNull, lt, or, sql, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, isNotNull, isNull, lt, or, sql, type SQL } from 'drizzle-orm';
 import { withClient, withOperator, withTenant, type Db } from './client.js';
 import { encryptPii, decryptPii } from '../services/pii.js';
 import {
@@ -462,17 +462,72 @@ export const storeRepo = {
   },
 
   async byRef(ref: string, platform: Platform): Promise<Store | null> {
+    return storeRepo.byRefs([ref], platform);
+  },
+
+  /**
+   * The store matching any one of `refs`.
+   *
+   * Candidates are OR-ed into a single query rather than tried one at a time: a webhook
+   * that carries several plausible identifiers should cost one indexed lookup, not one per
+   * candidate. Order is irrelevant because a payload's fields are alternatives naming the
+   * same merchant, not a hierarchy to respect.
+   */
+  async byRefs(refs: string[], platform: Platform): Promise<Store | null> {
+    const wanted = [...new Set(refs.filter((r) => typeof r === 'string' && r.length > 0))];
+    if (!wanted.length) return null;
     return withOperator(async (tx) => {
-      const conds = [eq(stores.shopDomain, ref)];
-      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ref)) {
-        conds.push(eq(stores.id, ref));
-      }
+      const conds = wanted.map((ref) => {
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ref)) {
+          // A ref can be either the shop domain or our own primary key.
+          return or(eq(stores.shopDomain, ref), eq(stores.id, ref))!;
+        }
+        return eq(stores.shopDomain, ref);
+      });
       const [row] = await tx
         .select()
         .from(stores)
         .where(and(eq(stores.platform, platform), or(...conds)))
         .limit(1);
       return row ?? null;
+    });
+  },
+
+  /**
+   * Stores on a platform that can actually service a delivery, for the case where a
+   * webhook's own identifier cannot be matched.
+   *
+   * Filtered on a *present access token*, not merely on having a `platform_connections`
+   * row: `create()` inserts that row for every store, with `access_token_enc` left null
+   * when the caller supplied no token. Joining on row existence therefore excluded
+   * nothing, and a store still sitting in the dashboard with no credentials — the normal
+   * state after a merchant opens the add-store modal and backs out — still counted as a
+   * candidate. Counting it turned a resolvable single-store account into a spurious
+   * ambiguity and 404'd the delivery. A store with no token cannot sync anyway: every
+   * adapter call on it fails with `no_connection`.
+   *
+   * Expiry is deliberately not filtered. `refreshIfExpired` renews against the stored
+   * refresh token, so an expired access token is still a working store.
+   *
+   * Joined on `platform` as well as `storeId`: the row records which platform it is for,
+   * and matching on the store alone would let a Salla delivery be attributed via a store
+   * holding only a Shopify connection.
+   */
+  async listByPlatform(platform: Platform): Promise<Array<{ id: string; shopDomain: string | null }>> {
+    return withOperator(async (tx) => {
+      const rows = await tx
+        .select({ id: stores.id, shopDomain: stores.shopDomain })
+        .from(stores)
+        .innerJoin(
+          platformConnections,
+          and(
+            eq(platformConnections.storeId, stores.id),
+            eq(platformConnections.platform, platform),
+            isNotNull(platformConnections.accessTokenEnc),
+          ),
+        )
+        .where(eq(stores.platform, platform));
+      return rows.map((r) => ({ id: r.id, shopDomain: r.shopDomain ?? null }));
     });
   },
 

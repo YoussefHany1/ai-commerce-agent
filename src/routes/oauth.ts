@@ -16,8 +16,26 @@ const oauthWindow = { limit: config.RATE_LIMIT_PER_MIN, windowSec: 60 };
 // back ACCESS_DENIED rather than null, so a token that predates this scope would
 // import no orders at all; the adapter also degrades gracefully in that case.
 const SCOPES = ['read_products', 'write_products', 'read_orders', 'read_inventory', 'read_customers'];
+/**
+ * `offline_access` is the only scope name this codebase can assert: it is what earns the
+ * refresh token, without which the 14-day access token silently ends the integration.
+ * The product/order scopes are whatever the app registered on the Salla Partner Portal and
+ * must be supplied through `SALLA_SCOPES` — guessing names here would only produce an
+ * authorize URL Salla rejects outright.
+ */
 const SALLA_SCOPES_DEFAULT = 'offline_access';
-const ZID_SCOPES_DEFAULT = '';
+/**
+ * Zid embedded apps require `embedded_apps_tokens_write`. The default used to be `''`, and
+ * `??` only falls back on `null`/`undefined` — so a `ZID_SCOPES=` line copied from
+ * `.env.example` (which is exactly that) overrode the default with nothing, the authorize
+ * URL went out with no `scope` parameter at all, and the install produced a token the API
+ * could not use. Resolve empty-as-unset everywhere instead.
+ */
+const ZID_SCOPES_DEFAULT = 'embedded_apps_tokens_write';
+/** Trimmed, and treating a blank value as unset so `KEY=` cannot defeat the default. */
+function scopesFrom(raw: string | undefined, fallback: string): string {
+  return raw?.trim() || fallback;
+}
 
 function normalizeShop(input: string): string {
   return input.replace(/^https?:\/\//, '').split('/')[0].trim();
@@ -351,7 +369,7 @@ export async function oauth(app: FastifyInstance) {
         EX: STATE_TTL,
       },
     );
-    const scopes = config.SALLA_SCOPES ?? SALLA_SCOPES_DEFAULT;
+    const scopes = scopesFrom(config.SALLA_SCOPES, SALLA_SCOPES_DEFAULT);
     const url =
       `https://accounts.salla.sa/oauth2/auth?client_id=${encodeURIComponent(config.SALLA_CLIENT_ID)}` +
       `&response_type=code` +
@@ -421,7 +439,7 @@ export async function oauth(app: FastifyInstance) {
         accessToken: token.access_token,
         refreshToken: token.refresh_token,
         expiresAt: parseExpiry(token),
-        scopes: (config.SALLA_SCOPES ?? SALLA_SCOPES_DEFAULT).split(',').map((s) => s.trim()).filter(Boolean),
+        scopes: scopesFrom(config.SALLA_SCOPES, SALLA_SCOPES_DEFAULT).split(',').map((s) => s.trim()).filter(Boolean),
         clientId: stored.clientId ?? null,
       });
     } catch (err) {
@@ -454,7 +472,7 @@ export async function oauth(app: FastifyInstance) {
         EX: STATE_TTL,
       },
     );
-    const scopes = config.ZID_SCOPES ?? ZID_SCOPES_DEFAULT;
+    const scopes = scopesFrom(config.ZID_SCOPES, ZID_SCOPES_DEFAULT);
     const url =
       `https://oauth.zid.sa/oauth/authorize?client_id=${encodeURIComponent(config.ZID_CLIENT_ID)}` +
       `&response_type=code` +
@@ -527,7 +545,7 @@ export async function oauth(app: FastifyInstance) {
         accessToken: token.access_token,
         refreshToken: token.refresh_token,
         expiresAt: parseExpiry(token),
-        scopes: (config.ZID_SCOPES ?? ZID_SCOPES_DEFAULT).split(',').map((s) => s.trim()).filter(Boolean),
+        scopes: scopesFrom(config.ZID_SCOPES, ZID_SCOPES_DEFAULT).split(',').map((s) => s.trim()).filter(Boolean),
         clientId: stored.clientId ?? null,
       });
     } catch (err) {

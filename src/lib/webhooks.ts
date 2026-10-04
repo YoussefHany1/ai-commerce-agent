@@ -108,9 +108,55 @@ export function verifyWebhook(
 export type WebhookEvent = {
   type: string;
   storeRef?: string;
+  /**
+   * Every identifier in the payload that could name the store, in confidence order.
+   *
+   * Salla and Zid do not tell us which field identifies the merchant: a delivery has been
+   * seen with the numeric store id at the top level and only the merchant id nested under
+   * `store`. Reading only the first match meant a store whose `shop_domain` was written
+   * from the merchant profile (`salla-<username>` / `zid-<managerId>`, or a Salla domain)
+   * could not be found by its own store id, and every live event 404'd. Resolution is
+   * exact-match-only — never a prefix guess — so over-collecting candidates is safe.
+   */
+  storeRefs?: string[];
   dedupKey?: string;
   payload: Record<string, unknown>;
 };
+
+/** Appends `v` when it is a non-empty scalar, which is the only thing worth matching on. */
+function pushRef(out: string[], v: unknown): void {
+  if (v == null) return;
+  if (typeof v !== 'string' && typeof v !== 'number') return;
+  const s = String(v).trim();
+  if (s) out.push(s);
+}
+
+/**
+ * Every store identifier a Salla/Zid payload might carry.
+ *
+ * `zid-<id>` is included because that is literally the shape the Zid callback writes into
+ * `shop_domain` (`zid-<managerId>`), so a payload carrying the manager id resolves exactly.
+ */
+function sallaZidRefs(p: Record<string, any>): string[] {
+  const out: string[] = [];
+  pushRef(out, p?.store_id);
+  pushRef(out, p?.storeId);
+  pushRef(out, p?.merchant_id);
+  pushRef(out, p?.merchantId);
+  pushRef(out, p?.store?.id);
+  pushRef(out, p?.merchant?.id);
+  // Some deliveries carry the subdomain rather than the numeric id.
+  pushRef(out, p?.store_domain);
+  pushRef(out, p?.storeDomain);
+  pushRef(out, p?.domain);
+  if (out.length) {
+    for (const ref of [...out]) {
+      out.push(`zid-${ref}`);
+      out.push(`salla-${ref}`);
+    }
+  }
+  return out;
+}
 
 export function extractEvent(
   platform: Platform,
@@ -126,15 +172,16 @@ export function extractEvent(
       typeof payload.id === 'string' || typeof payload.id === 'number'
         ? String(payload.id)
         : createHmac('sha256', webhookSecretFor('shopify') ?? '').update(raw).digest('hex').slice(0, 24);
-    return { type, storeRef, dedupKey, payload };
+    return { type, storeRef, storeRefs: storeRef ? [storeRef] : undefined, dedupKey, payload };
   }
   const p = payload as Record<string, any>;
   const type = p?.topic ?? p?.type ?? p?.event ?? 'unknown';
-  const storeRef = p?.store_id ?? p?.storeId ?? p?.merchant_id ?? p?.store?.id;
+  const refs = sallaZidRefs(p);
   const dedupKey = p?.id ?? p?.order_id ?? p?.product_id;
   return {
     type: String(type),
-    storeRef: storeRef != null ? String(storeRef) : undefined,
+    storeRef: refs[0],
+    storeRefs: refs.length ? [...new Set(refs)] : undefined,
     dedupKey: dedupKey != null ? String(dedupKey) : undefined,
     payload,
   };

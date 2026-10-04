@@ -80,6 +80,28 @@ describe('POST /webhooks/[platform]', () => {
     expect(headers['x-shopify-webhook-id']).toBe('wh-1');
   });
 
+  test.each([
+    ['salla', 'x-salla-signature'],
+    ['zid', 'x-zid-signature'],
+  ])('forwards the %s signature header the API verifies', async (platform, header) => {
+    // The regression: the relay forwarded only Shopify's HMAC and the shared
+    // `x-hub-signature-256` fallback. On Salla and Zid that fallback header is usually
+    // absent, so the delivery arrived with no header the API accepts and was rejected 401
+    // before it could ever be attributed to a store — every order arriving only by poll.
+    await POST(
+      new Request(`http://localhost:3001/webhooks/${platform}`, {
+        method: 'POST',
+        body: '{"id":"o-1"}',
+        headers: { 'content-type': 'application/json', [header]: 'deadbeef' },
+      }),
+      params(platform),
+    );
+
+    const headers = fetchMock.mock.calls[0]![1]!.headers as Record<string, string>;
+    expect(headers[header]).toBe('deadbeef');
+    expect(headers['content-type']).toBe('application/json');
+  });
+
   test('sends no session credential — the HMAC is the authenticator', async () => {
     await POST(
       new Request('http://localhost:3001/webhooks/shopify', { method: 'POST', body: '{}' }),

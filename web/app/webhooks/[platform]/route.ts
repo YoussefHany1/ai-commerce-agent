@@ -49,7 +49,14 @@ export async function POST(
   // Relaying only the signature therefore made every webhook an unknown-topic event for
   // no store: order sync stopped updating live, and `app/uninstalled` never reached its
   // handler, so a store the merchant had deleted in Shopify still showed as connected in
-  // the dashboard. Forward the whole identifying set, plus Salla's equivalent header.
+  // the dashboard.
+  //
+  // `x-salla-signature` and `x-zid-signature` are the whole authenticator on those two
+  // platforms — `src/lib/webhooks.ts` lists them as the primary header, with
+  // `x-hub-signature-256` only as a fallback. This list omitted both, so a Salla or Zid
+  // delivery relayed through this app arrived with no signature the API would accept and
+  // was rejected 401 before it could be attributed to a store. Every signature the API
+  // verifies has to appear here or the relay silently breaks that platform.
   const forwarded = [
     'x-shopify-hmac-sha256',
     'x-shopify-topic',
@@ -57,6 +64,8 @@ export async function POST(
     'x-shopify-webhook-id',
     'x-shopify-triggered-at',
     'x-shopify-api-version',
+    'x-salla-signature',
+    'x-zid-signature',
     'x-hub-signature-256',
     'x-hub-signature',
   ];

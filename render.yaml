@@ -179,6 +179,19 @@ services:
         sync: false
       - key: ZID_CLIENT_SECRET
         sync: false
+      # Optional scope overrides. Declared here so they are visible in the Blueprint and
+      # settable from the dashboard: an env var the Blueprint omits can only be added by
+      # hand, which is how both of these stayed unset and only surfaced as a broken install.
+      # SALLA_SCOPES must list the product/order permissions the app registered on the
+      # Salla Partner Portal; the fallback is `offline_access` alone, which earns the
+      # refresh token but no data access.
+      - key: SALLA_SCOPES
+        sync: false
+      # Leave unset to get the built-in default. Zid embedded apps require
+      # `embedded_apps_tokens_write`; a blank value here falls back to that default rather
+      # than sending an authorize URL with no scope.
+      - key: ZID_SCOPES
+        sync: false
 
   - type: web
     name: agent-web
