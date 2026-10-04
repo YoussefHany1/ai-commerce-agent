@@ -30,6 +30,18 @@ describe('config', () => {
     expect(config.ENCRYPTION_KEY_VERSION).toBe('v1');
   });
 
+  test('strips a trailing slash from APP_BASE_URL', () => {
+    // Every consumer concatenates, so a trailing slash produced
+    // `https://host//api/oauth/salla/callback`. OAuth providers compare redirect_uri exactly,
+    // so that surfaces only as "does not match any of the pre-registered redirect urls" —
+    // an error that points at the portal rather than at the stray character here.
+    expect(loadConfig(base({ APP_BASE_URL: 'https://host.example/' })).APP_BASE_URL).toBe('https://host.example');
+    expect(loadConfig(base({ APP_BASE_URL: 'https://host.example' })).APP_BASE_URL).toBe('https://host.example');
+    expect(loadConfig(base({ APP_BASE_URL: 'http://localhost:3001///' })).APP_BASE_URL).toBe(
+      'http://localhost:3001',
+    );
+  });
+
   test('rejects a non-hex ENCRYPTION_KEY at boot', () => {
     expect(() => loadConfig(base({ ENCRYPTION_KEY: 'z'.repeat(64) }))).toThrow(/64 hex characters/);
   });

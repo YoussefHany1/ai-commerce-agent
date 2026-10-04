@@ -2,7 +2,17 @@ import { z } from "zod";
 
 const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
-  APP_BASE_URL: z.string().url().default("http://localhost:3000"),
+  // Trailing slashes are stripped. Every consumer builds absolute URLs by string
+  // concatenation — `${APP_BASE_URL}/api/oauth/salla/callback`, `${APP_BASE_URL}/webhooks/...`
+  // — so a configured `https://host/` yields `https://host//api/oauth/salla/callback`. No
+  // OAuth provider will have that registered, and the failure surfaces as the provider's
+  // "redirect_uri does not match any of the pre-registered redirect urls", which points at
+  // the portal rather than at the one-character difference actually responsible.
+  APP_BASE_URL: z
+    .string()
+    .url()
+    .default("http://localhost:3000")
+    .transform((u) => u.replace(/\/+$/, "")),
   OAUTH_REDIRECT_ALLOWLIST: z.string().optional(),
   CORS_ORIGINS: z.string().optional(),
   // Supabase Auth + Postgres. Every human credential in this system now belongs to
