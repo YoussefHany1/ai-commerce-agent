@@ -656,6 +656,54 @@ export async function startSession(
 }
 
 /**
+ * Discards a stored pairing and starts a handshake that cannot replay it.
+ *
+ * A store that has never paired emits its first QR in a few seconds. A store that *has*
+ * stored credentials takes a different path: Baileys replays them and waits for the login
+ * reply, and a session WhatsApp no longer honours never sends one. That request fails only
+ * when Baileys' own query timeout expires, and `createSocket` deliberately leaves
+ * `defaultQueryTimeoutMs` at its default — so the merchant watches "Connecting…" for
+ * roughly a minute before a QR appears. A fresh local database has no blob to replay, which
+ * is why this only ever showed up in production.
+ *
+ * "Show QR code" means *pair me now*, so a session that is not `open` is torn down and its
+ * stored state dropped before the replacement socket is built. An `open` session is left
+ * alone: that is a working pairing, and discarding it would unlink a number the merchant
+ * never asked to unlink.
+ *
+ * Teardown deliberately does not `logout`. A socket that never opened cannot log out, and
+ * a socket that did open is not the one this path discards — so the only thing waiting here
+ * would be an IQ reply that is never coming.
+ */
+export async function startFreshPairing(storeId: string): Promise<{ resumed: boolean }> {
+  const session = live.get(storeId);
+  if (session && !session.closing) {
+    if (session.status === 'open') return { resumed: true };
+    await teardown(session, { logout: false, keepState: false });
+  } else {
+    // Both halves, same reason as `keepState: false` above: the row is what the next
+    // process reads, `liveAuth` is what the next socket in this one reads.
+    forgetAuth(storeId);
+    await baileysSessionRepo.clear(storeId).catch(() => undefined);
+  }
+  return startSession(storeId);
+}
+
+/**
+ * `startFreshPairing`, except a socket already sitting at the QR stage is kept.
+ *
+ * Minting a code needs no new handshake, and restarting one would rotate the QR the
+ * merchant is looking at every time they pressed the button.
+ */
+export async function ensurePairableSession(storeId: string): Promise<{ resumed: boolean }> {
+  const session = live.get(storeId);
+  if (session && !session.closing && (session.status === 'qr' || session.status === 'open')) {
+    return { resumed: true };
+  }
+  return startFreshPairing(storeId);
+}
+
+/**
  * Waits until a live socket is at the QR stage, i.e. its websocket is open and Baileys
  * has emitted the first pairing frame.
  *
@@ -1203,6 +1251,14 @@ export async function sendTextOverSocket(storeId: string, to: string, body: stri
 }
 
 /**
+ * Statuses whose stored credentials are still worth replaying at boot.
+ *
+ * The mirror image of `listOpen`'s exclusion: `logged_out` / `replaced` / `error` describe
+ * a handshake WhatsApp has already ended, so resuming one can only burn a query timeout.
+ */
+const RESTORABLE_STATUSES = new Set<string>(['idle', 'connecting', 'qr', 'open']);
+
+/**
  * Reconnects every persisted session at boot.
  *
  * Called once, after the server is listening and only when the feature flag is on.
@@ -1218,6 +1274,15 @@ export async function restoreAllSessions(): Promise<void> {
     if (started >= max) {
       logger.warn({ storeId: row.storeId }, 'whatsapp: session limit reached at boot, leaving store offline');
       await baileysSessionRepo.setStatus(row.storeId, 'idle', { lastError: 'session limit reached' }).catch(() => undefined);
+      continue;
+    }
+    // A terminal status means the stored credentials cannot work: the number was logged
+    // out, or WhatsApp moved the session to another device. Replaying them costs a full
+    // Baileys query timeout before the socket gives up and finally emits a QR, and it
+    // occupies the one session slot for that whole minute. Re-pairing is a deliberate act
+    // from the dashboard (`startFreshPairing`), not something to do on every boot.
+    if (!RESTORABLE_STATUSES.has(row.status)) {
+      logger.info({ storeId: row.storeId, status: row.status }, 'whatsapp: skipping boot restore of a terminal session');
       continue;
     }
     try {

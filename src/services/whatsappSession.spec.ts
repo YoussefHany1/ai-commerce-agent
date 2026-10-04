@@ -710,6 +710,76 @@ describe('disconnect', () => {
   });
 });
 
+describe('fresh pairing', () => {
+  /** Counts socket builds so a restart is distinguishable from a resume. */
+  function countingSockets() {
+    let made = 0;
+    session.__setSocketFactory(() => {
+      made += 1;
+      return socket;
+    });
+    return () => made;
+  }
+
+  test('an explicit pairing discards stored credentials instead of replaying them', async () => {
+    // The regression this guards: a store that has already been linked makes Baileys
+    // replay its saved creds and wait for a login reply that a dead session never sends,
+    // which only fails when Baileys' query timeout expires (~60s). Production stores have
+    // a blob; a fresh local database does not, which is why this only ever showed up there.
+    const made = countingSockets();
+    await session.startSession(STORE);
+
+    await expect(session.startFreshPairing(STORE)).resolves.toEqual({ resumed: false });
+
+    expect(repo.clear).toHaveBeenCalledWith(STORE);
+    expect(made()).toBe(2);
+    expect(session.statusFor(STORE)).toBe('connecting');
+  });
+
+  test('a store with no live session still drops its stored credentials', async () => {
+    const made = countingSockets();
+    await expect(session.startFreshPairing(STORE)).resolves.toEqual({ resumed: false });
+    expect(repo.clear).toHaveBeenCalledWith(STORE);
+    expect(made()).toBe(1);
+  });
+
+  test('a working pairing is never discarded', async () => {
+    // `open` is a live pairing. Discarding it would unlink a number the merchant never
+    // asked to unlink, so an explicit re-pair must be a no-op here.
+    await session.startSession(STORE);
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
+
+    await expect(session.startFreshPairing(STORE)).resolves.toEqual({ resumed: true });
+
+    expect(repo.clear).not.toHaveBeenCalled();
+    expect(session.statusFor(STORE)).toBe('open');
+  });
+
+  test('minting a code keeps a socket that is already at the QR stage', async () => {
+    // Restarting here would rotate the QR the merchant is looking at for no gain.
+    const made = countingSockets();
+    await session.startSession(STORE);
+    socket.emit('connection.update', { qr: 'BASE64QR' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('qr'));
+
+    await expect(session.ensurePairableSession(STORE)).resolves.toEqual({ resumed: true });
+
+    expect(made()).toBe(1);
+    expect(repo.clear).not.toHaveBeenCalled();
+  });
+
+  test('minting a code discards a resume that is still stuck connecting', async () => {
+    const made = countingSockets();
+    await session.startSession(STORE);
+
+    await expect(session.ensurePairableSession(STORE)).resolves.toEqual({ resumed: false });
+
+    expect(repo.clear).toHaveBeenCalledWith(STORE);
+    expect(made()).toBe(2);
+  });
+});
+
 describe('inbound', () => {
   test('routes a text message to the shared inbound handler with bare digits', async () => {
     await session.startSession(STORE);
@@ -918,6 +988,32 @@ describe('boot restore', () => {
     });
     await expect(session.restoreAllSessions()).resolves.toBeUndefined();
     expect(session.isLive(OTHER_STORE)).toBe(true);
+  });
+
+  test('does not resume a session WhatsApp has already ended', async () => {
+    // A logged_out/replaced/error row describes a handshake that is over. Replaying its
+    // creds costs a full Baileys query timeout before the socket finally emits a QR, and
+    // it holds the one session slot for that whole minute — on a Render free tier that is
+    // paid again on every cold start.
+    for (const status of ['logged_out', 'replaced', 'error']) {
+      session.__resetLiveForTest();
+      vi.clearAllMocks();
+      repo.listAll.mockResolvedValue([
+        { storeId: STORE, stateEnc: 'enc:x', status, phone: '966501234567' } as never,
+      ]);
+      repo.listOpen.mockResolvedValue([]);
+      repo.clear.mockResolvedValue(undefined);
+      repo.setStatus.mockResolvedValue(undefined);
+      lock.acquireLock.mockImplementation(async () => ({
+        renew: vi.fn().mockResolvedValue(true),
+        release: vi.fn().mockResolvedValue(undefined),
+      }));
+      session.__setSocketFactory(() => socket);
+
+      await session.restoreAllSessions();
+
+      expect(session.isLive(STORE)).toBe(false);
+    }
   });
 
   test('leaves sessions offline when the cap is already met', async () => {

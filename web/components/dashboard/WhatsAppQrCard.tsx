@@ -202,12 +202,11 @@ export function WhatsAppQrCard({ storeId }: { storeId: string }) {
       setPhase('connecting');
     }, 'Could not record your acceptance.');
 
-  // Force a genuinely new handshake rather than reusing the live socket: startSession
-  // otherwise answers `resumed: true`, so clicking Reconnect while the backend is stuck
-  // in a reconnect loop changes nothing and looks like a dead button.
+  // One request, not a disconnect-then-connect. `qr-connect` now discards any stored
+  // pairing itself (so it cannot wait out a doomed credential replay), and the explicit
+  // disconnect this used to make first cost a second round trip plus the logout IQ timeout.
   const connect = () =>
     run(async () => {
-      await api.whatsappQrDisconnect(storeId).catch(() => undefined);
       await api.whatsappQrConnect(storeId);
       // Hold the buttons disabled until the socket reports `qr`/`open`, so a second
       // click cannot tear down the handshake that is still in flight.

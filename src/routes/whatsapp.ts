@@ -12,11 +12,12 @@ import {
   PairingPhoneError,
   SessionBusyError,
   SessionLimitError,
+  ensurePairableSession,
   livePhone,
   pairingCodeFor,
   qrFor,
   requestPairingCode,
-  startSession,
+  startFreshPairing,
   statusFor,
   stopSession,
   subscribe,
@@ -144,7 +145,10 @@ function registerQrRoutes(app: FastifyInstance): void {
       }
 
       try {
-        const { resumed } = await startSession(storeId);
+        // Not `startSession`: an explicit "Show QR code" must not inherit a stored
+        // pairing, or the merchant waits out a full Baileys query timeout before the
+        // first QR appears. See `startFreshPairing`.
+        const { resumed } = await startFreshPairing(storeId);
         return { ok: true, resumed };
       } catch (err) {
         if (err instanceof SessionLimitError) {
@@ -196,9 +200,11 @@ function registerQrRoutes(app: FastifyInstance): void {
       }
 
       // The code is minted against a live socket, so a session that is not already up is
-      // started here with the same 409s as qr-connect.
+      // started here with the same 409s as qr-connect. A session that is mid-resume of
+      // stored credentials is discarded first (see `ensurePairableSession`), because that
+      // is the one state in which `requestPairingCode` would only ever time out.
       try {
-        await startSession(storeId);
+        await ensurePairableSession(storeId);
       } catch (err) {
         if (err instanceof SessionLimitError) {
           return reply.code(409).send({
