@@ -16,6 +16,15 @@ import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
 import type { Store } from '@/lib/types';
 
+/**
+ * The Meta Cloud API channel card is hidden for now: stores bind a number over WhatsApp
+ * Web (the QR pairing card below) instead, so this offers a second way to do the same job
+ * that reads as a duplicate rather than an option. The endpoint and its client method are
+ * untouched — flip this to true and the card, its fields and its save button all come
+ * back with no other change.
+ */
+const SHOW_WHATSAPP_CLOUD_CHANNEL = false;
+
 export default function SettingsPage() {
   const { storeId, stores, setActiveStoreId } = useSelectedStore();
   const health = useHealth();
@@ -104,46 +113,48 @@ export default function SettingsPage() {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {/* WhatsApp channel */}
-        <Card
-          title="WhatsApp channel"
-          description="Bind a Meta Cloud API phone number to this store."
-          action={<MessageCircle className="h-5 w-5 text-emerald-500" />}
-        >
-          <div className="space-y-4">
-            <Input
-              label="Phone number ID"
-              placeholder="10223344556…"
-              value={whatsapp.phoneNumberId}
-              onChange={(e) => setWhatsapp((w) => ({ ...w, phoneNumberId: e.target.value }))}
-            />
-            <Input
-              label="WABA ID (optional)"
-              placeholder="WhatsApp Business Account ID"
-              value={whatsapp.wabaId}
-              onChange={(e) => setWhatsapp((w) => ({ ...w, wabaId: e.target.value }))}
-            />
-            <Input
-              label="Permanent access token (optional)"
-              type="password"
-              placeholder="System user token"
-              hint="Stored encrypted at rest and never returned by the API."
-              value={whatsapp.accessToken}
-              onChange={(e) => setWhatsapp((w) => ({ ...w, accessToken: e.target.value }))}
-            />
-            <Button
-              onClick={() => saveWhatsapp.mutate()}
-              loading={saveWhatsapp.isPending}
-              disabled={!storeId || !whatsapp.phoneNumberId.trim()}
-              className="w-full sm:w-auto"
-            >
-              Save channel
-            </Button>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Inbound messages are verified with X-Hub-Signature-256 and trigger the agent loop
-              automatically once the webhook is subscribed.
-            </p>
-          </div>
-        </Card>
+        {SHOW_WHATSAPP_CLOUD_CHANNEL && (
+          <Card
+            title="WhatsApp channel"
+            description="Bind a Meta Cloud API phone number to this store."
+            action={<MessageCircle className="h-5 w-5 text-emerald-500" />}
+          >
+            <div className="space-y-4">
+              <Input
+                label="Phone number ID"
+                placeholder="10223344556…"
+                value={whatsapp.phoneNumberId}
+                onChange={(e) => setWhatsapp((w) => ({ ...w, phoneNumberId: e.target.value }))}
+              />
+              <Input
+                label="WABA ID (optional)"
+                placeholder="WhatsApp Business Account ID"
+                value={whatsapp.wabaId}
+                onChange={(e) => setWhatsapp((w) => ({ ...w, wabaId: e.target.value }))}
+              />
+              <Input
+                label="Permanent access token (optional)"
+                type="password"
+                placeholder="System user token"
+                hint="Stored encrypted at rest and never returned by the API."
+                value={whatsapp.accessToken}
+                onChange={(e) => setWhatsapp((w) => ({ ...w, accessToken: e.target.value }))}
+              />
+              <Button
+                onClick={() => saveWhatsapp.mutate()}
+                loading={saveWhatsapp.isPending}
+                disabled={!storeId || !whatsapp.phoneNumberId.trim()}
+                className="w-full sm:w-auto"
+              >
+                Save channel
+              </Button>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Inbound messages are verified with X-Hub-Signature-256 and trigger the agent loop
+                automatically once the webhook is subscribed.
+              </p>
+            </div>
+          </Card>
+        )}
 
         {/* WhatsApp Web pairing — a separate transport from the Meta channel above */}
         {storeId && (
