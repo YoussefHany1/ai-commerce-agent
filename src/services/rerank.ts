@@ -134,7 +134,7 @@ export async function embeddingReRank(
   const sims = new Map<string, number>();
   const rows = (await withTenant(storeId, async (tx) => {
     return tx.execute(
-      sql`select id::text as id, 1 - (embedding <=> ${sql.raw(v)}::vector) as similarity
+      sql`select id::text as id, 1 - (embedding <=> ${v}::vector) as similarity
           from products where store_id = ${storeId} and embedding is not null and ${inArray(products.id, ids)}`,
     );
   })) as any[];

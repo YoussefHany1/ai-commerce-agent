@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mergeResults, validQuery } from './retrieval.js';
+import { mergeResults, validQuery, toVectorLiteral } from './retrieval.js';
 import type { Retrieved } from './retrieval.js';
 
 const p = (id: string, title: string, score: number, source: Retrieved['source'] = 'fts'): Retrieved => ({
@@ -15,6 +15,13 @@ describe('validQuery', () => {
     expect(validQuery('  a  ')).toBe(false);
     expect(validQuery('ok')).toBe(true);
     expect(validQuery('x'.repeat(501))).toBe(false);
+  });
+});
+
+describe('toVectorLiteral', () => {
+  it('emits a comma-joined pgvector literal, not a raw json-like array', () => {
+    expect(toVectorLiteral([0.1, -0.2, 0.3])).toBe('[0.1,-0.2,0.3]');
+    expect(toVectorLiteral([1])).toBe('[1]');
   });
 });
 

@@ -20,9 +20,10 @@ let getSession: typeof import('../lib/session.js').getSession;
 let revokeSession: typeof import('../lib/session.js').revokeSession;
 let eraseStorePii: typeof import('../services/pdpl.js').eraseStorePii;
 let eraseCustomer: typeof import('../services/pdpl.js').eraseCustomer;
+let vectorRetriever: typeof import('../services/retrieval.js').vectorRetriever;
 let admin: ReturnType<typeof postgres> | undefined;
 
-const INJECTED = ['DATABASE_URL', 'REDIS_URL', 'ENCRYPTION_KEY', 'ENCRYPTION_KEY_VERSION'] as const;
+const INJECTED = ['DATABASE_URL', 'REDIS_URL', 'ENCRYPTION_KEY', 'ENCRYPTION_KEY_VERSION', 'OPENAI_API_KEY'] as const;
 
 async function loadModules() {
   vi.resetModules();
@@ -32,6 +33,10 @@ async function loadModules() {
     REDIS_URL: TEST_REDIS_URL!,
     ENCRYPTION_KEY: TEST_ENCRYPTION_KEY,
     ENCRYPTION_KEY_VERSION: 'v1',
+    // Lets the vector retriever build its query path (it bails early when the
+    // embedding key is missing); the query embedding is passed in explicitly so
+    // no external embedding API call is made.
+    OPENAI_API_KEY: 'sk-test-integration',
   });
   try {
     const client = await import('../db/client.js');
@@ -50,6 +55,7 @@ async function loadModules() {
     revokeSession = session.revokeSession;
     eraseStorePii = (await import('../services/pdpl.js')).eraseStorePii;
     eraseCustomer = (await import('../services/pdpl.js')).eraseCustomer;
+    vectorRetriever = (await import('../services/retrieval.js')).vectorRetriever;
   } finally {
     for (const k of Object.keys(process.env)) {
       if (!INJECTED.includes(k as (typeof INJECTED)[number])) continue;
@@ -305,6 +311,38 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
     // absent from our copy — AND-matching would have failed the request entirely.
     expect(await eraseCustomer(a, { email: 'only-mail@example.com', phone: '966599999999' }, true)).toBe(true);
     await expect(adminCount('customers', a)).resolves.toBe(0);
+  });
+
+  it('vector-retrieves products with a real pgvector literal', async () => {
+    // Regression: the query-embedding literal used to be emitted as a bare
+    // `[...]` via sql.raw, which Postgres rejects with `syntax error at or near
+    // "["` — the exact production crash that silenced the WhatsApp agent reply.
+    const a = await storeRepo.create({
+      name: 'VEC RETRIEVE',
+      platform: 'shopify',
+      shopDomain: 'vec-retrieve.myshopify.com',
+    });
+    createdStores.push(a);
+
+    const probe: number[] = Array.from({ length: 1536 }, (_, i) => Math.sin(i) * 0.01);
+    const [row] = await withTenant(a, (tx) =>
+      tx
+        .insert(products)
+        .values({
+          storeId: a,
+          platformProductId: 'vec-1',
+          title: 'Embedding Probe',
+          price: 10,
+          currency: 'USD',
+          available: true,
+          embedding: probe,
+        })
+        .returning({ id: products.id, storeId: products.storeId }),
+    );
+
+    const results = await vectorRetriever.retrieve('query msgs', a, { queryEmbedding: probe });
+    expect(results).toHaveLength(1);
+    expect(results[0].product.id).toBe(row.id);
   });
 
   it('scopes stores and the self row to a client under withClient', async () => {

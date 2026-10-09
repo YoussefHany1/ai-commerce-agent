@@ -17,6 +17,12 @@ export type Retriever = {
   ): Promise<Retrieved[]>;
 };
 
+// pgvector literal for a query embedding. Kept as plain text (bound as a parameter,
+// never inlined) because a bare `[...]` is not valid pgvector input.
+export function toVectorLiteral(values: number[]): string {
+  return `[${values.join(',')}]`;
+}
+
 // Query embeddings are deterministic for a given text, and shoppers repeat common
 // queries ("شحن", "بروتين", a product name). An in-process LRU avoids paying the
 // embeddings API latency twice for the same query — once in the vector retriever
@@ -104,16 +110,15 @@ export const vectorRetriever: Retriever = {
     // already tried and failed, so don't pay for a second API round-trip.
     const vec = opts.queryEmbedding !== undefined ? opts.queryEmbedding : await embedQuery(query);
     if (!vec) return [];
-    const v = `[${vec.join(',')}]`;
     return withTenant(storeId, async (tx) => {
       const rows = await tx
         .select({
           ...FIELDS,
-          score: sql<number>`1 - (embedding <=> ${sql.raw(v)}::vector)`,
+          score: sql<number>`1 - (embedding <=> ${toVectorLiteral(vec)}::vector)`,
         })
         .from(products)
         .where(sql`embedding IS NOT NULL`)
-        .orderBy(sql`embedding <=> ${sql.raw(v)}::vector`)
+        .orderBy(sql`embedding <=> ${toVectorLiteral(vec)}::vector`)
         .limit(limit);
       return rows.map((r) => ({ product: rowToProduct(r), score: r.score, source: 'vector' as const }));
     });
