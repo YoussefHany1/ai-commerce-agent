@@ -686,6 +686,27 @@ describe('disconnect', () => {
     expect(repo.clear).toHaveBeenCalledWith(STORE);
   });
 
+  test('stopStoreWhatsApp stops the socket without unlinking the number', async () => {
+    await session.startSession(STORE);
+    socket.emit('connection.update', { connection: 'open' });
+    await vi.waitFor(() => expect(session.statusFor(STORE)).toBe('open'));
+    await session.stopStoreWhatsApp(STORE);
+    expect(socket.loggedOut).toBe(false);
+    expect(socket.ended).toBe(true);
+    expect(repo.clear).toHaveBeenCalledWith(STORE);
+  });
+
+  test('stopStoreWhatsApp with no live session still drops stored creds', async () => {
+    await session.stopStoreWhatsApp(STORE);
+    expect(repo.clear).toHaveBeenCalledWith(STORE);
+  });
+
+  test('a stop without logout keeps stored state unless keepState is false', async () => {
+    await session.startSession(STORE);
+    await session.stopSession(STORE, { logout: false });
+    expect(repo.clear).not.toHaveBeenCalled();
+  });
+
   test('a hung logout is abandoned so the disconnect still completes', async () => {
     // The regression this guards: a wedged socket never answers the logout IQ, and Baileys
     // waits defaultQueryTimeoutMs (60s) for it. The dashboard's Reconnect is a

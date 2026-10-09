@@ -1127,23 +1127,44 @@ async function teardown(
  * Stops a store's session.
  *
  * `logout: true` unlinks the number from WhatsApp and drops the stored state — the
- * merchant asked to disconnect, so the pairing is finished.
+ * merchant asked to disconnect, so the pairing is finished. `keepState` defaults to
+ * `!logout`; the one other caller is `stopStoreWhatsApp`, which stops a socket and
+ * drops its creds *without* unlinking the number, for when the store itself is going
+ * away.
  */
 export async function stopSession(
   storeId: string,
-  opts: { logout: boolean },
+  opts: { logout: boolean; keepState?: boolean },
 ): Promise<void> {
+  const keepState = opts.keepState ?? !opts.logout;
   const session = live.get(storeId);
   if (!session) {
-    if (opts.logout) await resetSession(storeId);
+    if (!keepState) {
+      // Both halves, as in teardown: the DB row is what the next process reads,
+      // `liveAuth` is what the next socket in this process reads.
+      forgetAuth(storeId);
+      await resetSession(storeId);
+    }
     return;
   }
-  await teardown(session, { logout: opts.logout, keepState: !opts.logout });
+  await teardown(session, { logout: opts.logout, keepState });
   if (opts.logout) {
     lastStatus.set(storeId, 'logged_out');
     await baileysSessionRepo.setStatus(storeId, 'logged_out').catch(() => undefined);
     emit(storeId, { type: 'status', status: 'logged_out' });
   }
+}
+
+/**
+ * Stops a store's socket and drops its stored creds without unlinking the number from
+ * WhatsApp.
+ *
+ * For when the store itself is going away (app uninstall, operator delete): the live
+ * socket must stop and the creds must not survive, but the merchant's WhatsApp number
+ * stays theirs — it may well still be paired to WhatsApp on their phone.
+ */
+export async function stopStoreWhatsApp(storeId: string): Promise<void> {
+  await stopSession(storeId, { logout: false, keepState: false });
 }
 
 /**

@@ -12,6 +12,7 @@ import {
 } from '../db/repos.js';
 import { verifyStoreCredentials } from '../integrations/factory.js';
 import { recordImpressions } from '../services/analytics.js';
+import { stopStoreWhatsApp } from '../services/whatsappSession.js';
 import { answerWithTools, answerWithToolsStream, toChatHistory } from '../services/agent.js';
 import { retrieve } from '../services/retrieval.js';
 import { dbPing, redisPing, rlsPing } from '../lib/health.js';
@@ -138,6 +139,11 @@ export async function api(app: FastifyInstance) {
       const { storeId } = storeIdParam.parse(req.params);
       const store = await storeRepo.get(storeId);
       if (!store) return rep.code(404).send({ error: 'store_not_found' });
+      // Same teardown as app/uninstalled: a live WhatsApp socket must not outlive its
+      // store, and its creds must not survive the row delete. Best-effort.
+      await stopStoreWhatsApp(storeId).catch((err) =>
+        req.log.warn({ err, storeId }, 'whatsapp teardown on store delete failed'),
+      );
       await storeRepo.remove(storeId);
       return { ok: true };
     },

@@ -5,7 +5,9 @@ const mocks = vi.hoisted(() => {
   const orderRepo = { upsert: vi.fn() };
   const storeRepo = { remove: vi.fn() };
   const analytics = { markConversionsForOrder: vi.fn() };
-  return { catalogRepo, orderRepo, storeRepo, analytics };
+  const pdpl = { eraseCustomer: vi.fn(), eraseStorePii: vi.fn(), getCustomerData: vi.fn() };
+  const whatsapp = { stopStoreWhatsApp: vi.fn() };
+  return { catalogRepo, orderRepo, storeRepo, analytics, pdpl, whatsapp };
 });
 
 vi.mock('../db/repos.js', () => ({
@@ -14,6 +16,12 @@ vi.mock('../db/repos.js', () => ({
   storeRepo: mocks.storeRepo,
 }));
 vi.mock('../services/analytics.js', () => ({ markConversionsForOrder: mocks.analytics.markConversionsForOrder }));
+vi.mock('../services/pdpl.js', () => ({
+  eraseCustomer: mocks.pdpl.eraseCustomer,
+  eraseStorePii: mocks.pdpl.eraseStorePii,
+  getCustomerData: mocks.pdpl.getCustomerData,
+}));
+vi.mock('../services/whatsappSession.js', () => ({ stopStoreWhatsApp: mocks.whatsapp.stopStoreWhatsApp }));
 
 import { applyWebhook } from './webhookApply.js';
 import type { WebhookEvent } from './webhooks.js';
@@ -26,19 +34,47 @@ function shopifyEvent(type: string, payload: Record<string, unknown>): WebhookEv
 describe('webhookApply: shopify lifecycle topics', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('removes the store on app/uninstalled', async () => {
+  it('removes the store on app/uninstalled after tearing down whatsapp', async () => {
+    mocks.whatsapp.stopStoreWhatsApp.mockResolvedValue(undefined);
     mocks.storeRepo.remove.mockResolvedValue(undefined);
     await applyWebhook('shopify', shopifyEvent('app/uninstalled', { id: 1 }), 's1');
+    expect(mocks.whatsapp.stopStoreWhatsApp).toHaveBeenCalledWith('s1');
     expect(mocks.storeRepo.remove).toHaveBeenCalledWith('s1');
   });
 
-  it('records pdpl topics without removing the store or touching catalog', async () => {
-    await applyWebhook('shopify', shopifyEvent('customers/data_request', { id: 1 }), 's1');
-    await applyWebhook('shopify', shopifyEvent('customers/redact', { id: 1 }), 's1');
-    await applyWebhook('shopify', shopifyEvent('shop/redact', { id: 1 }), 's1');
+  it('fulfils customers/redact by erasing the customer with OR matching', async () => {
+    mocks.pdpl.eraseCustomer.mockResolvedValue(true);
+    await applyWebhook('shopify', shopifyEvent('customers/redact', { customer: { email: 'c@example.com', phone: '+15550000000' } }), 's1');
+    expect(mocks.pdpl.eraseCustomer).toHaveBeenCalledWith('s1', { email: 'c@example.com', phone: '+15550000000' }, true);
     expect(mocks.storeRepo.remove).not.toHaveBeenCalled();
     expect(mocks.catalogRepo.upsertWebhook).not.toHaveBeenCalled();
-    expect(mocks.orderRepo.upsert).not.toHaveBeenCalled();
+  });
+
+  it('passes only the identifiers the customers/redact payload carries', async () => {
+    mocks.pdpl.eraseCustomer.mockResolvedValue(false);
+    await applyWebhook('shopify', shopifyEvent('customers/redact', { customer: { email: 'only@example.com' } }), 's1');
+    expect(mocks.pdpl.eraseCustomer).toHaveBeenCalledWith('s1', { email: 'only@example.com', phone: undefined }, true);
+  });
+
+  it('fulfils shop/redact by erasing store PII without removing the store', async () => {
+    mocks.pdpl.eraseStorePii.mockResolvedValue({ conversations: 2, attributions: 3, customers: 4, total: 9 });
+    await applyWebhook('shopify', shopifyEvent('shop/redact', { shop_id: 5 }), 's1');
+    expect(mocks.pdpl.eraseStorePii).toHaveBeenCalledWith('s1');
+    expect(mocks.storeRepo.remove).not.toHaveBeenCalled();
+  });
+
+  it('records customers/data_request as a gather for the operator', async () => {
+    mocks.pdpl.getCustomerData.mockResolvedValue({ customer: { id: 'x' }, orders: [{}], conversations: [] });
+    await applyWebhook('shopify', shopifyEvent('customers/data_request', { customer: { email: 'ask@example.com' } }), 's1');
+    expect(mocks.pdpl.getCustomerData).toHaveBeenCalledWith('s1', { email: 'ask@example.com', phone: undefined });
+    expect(mocks.storeRepo.remove).not.toHaveBeenCalled();
+  });
+
+  it('swallows a failing redaction so the webhook never 500s', async () => {
+    mocks.pdpl.eraseStorePii.mockRejectedValue(new Error('db down'));
+    await expect(applyWebhook('shopify', shopifyEvent('shop/redact', { shop_id: 5 }), 's1')).resolves.toBeUndefined();
+    expect(mocks.storeRepo.remove).not.toHaveBeenCalled();
+    expect(mocks.catalogRepo.upsertWebhook).not.toHaveBeenCalled();
   });
 
   it('upserts products on products/create and orders on orders/create', async () => {

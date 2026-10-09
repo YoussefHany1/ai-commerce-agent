@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { and, eq, inArray, or, sql, type SQL } from 'drizzle-orm';
 import { withTenant, type Db } from '../db/client.js';
 import { attributions, automationLogs, conversations, customers, messages, orders } from '../db/schema.js';
 import { decryptPii } from './pii.js';
@@ -22,12 +22,37 @@ export function retentionCutoffs(now: Date, settings: RetentionSettings) {
   };
 }
 
-export type CustomerRef = { storeId: string; phone?: string | null; email?: string | null };
+export type CustomerRef = { storeId?: string; phone?: string | null; email?: string | null };
 
-async function resolveCustomerIds(tx: Db, storeId: string, ref: CustomerRef): Promise<string[]> {
+/**
+ * Resolves customer rows for a reference.
+ *
+ * The manual operator endpoints match *all* provided identifiers (phone AND email),
+ * because the operator controls the input and a partial match risks erasing the wrong
+ * person. Webhook-fed gather/erase requests match *any* provided identifier instead
+ * (phone OR email): Shopify's `customers/redact` payload carries the identifiers it
+ * knows (often only email), and a partial match on the store's own copy is the best
+ * available resolution — missing the request entirely is worse than over-matching one
+ * row. With no identifier at all the request must not match the whole store, so it
+ * resolves to nothing.
+ */
+async function resolveCustomerIds(
+  tx: Db,
+  storeId: string,
+  ref: CustomerRef,
+  matchAny = false,
+): Promise<string[]> {
+  const byPhone = ref.phone ? eq(customers.phone, ref.phone) : null;
+  const byEmail = ref.email ? eq(customers.email, ref.email) : null;
+  if (!byPhone && !byEmail) return [];
   const conds: SQL[] = [eq(customers.storeId, storeId)];
-  if (ref.phone) conds.push(eq(customers.phone, ref.phone));
-  if (ref.email) conds.push(eq(customers.email, ref.email));
+  if (matchAny && byPhone && byEmail) {
+    conds.push(or(byPhone, byEmail)!);
+  } else if (byPhone) {
+    conds.push(byPhone);
+  } else if (byEmail) {
+    conds.push(byEmail);
+  }
   const rows = await tx.select({ id: customers.id }).from(customers).where(and(...conds));
   return rows.map((r) => r.id);
 }
@@ -145,9 +170,13 @@ export async function getCustomerData(storeId: string, ref: CustomerRef) {
   });
 }
 
-export async function eraseCustomer(storeId: string, ref: CustomerRef): Promise<boolean> {
+export async function eraseCustomer(
+  storeId: string,
+  ref: CustomerRef,
+  matchAny = false,
+): Promise<boolean> {
   const ids = await withTenant(storeId, async (tx) => {
-    const resolved = await resolveCustomerIds(tx, storeId, ref);
+    const resolved = await resolveCustomerIds(tx, storeId, ref, matchAny);
     if (!resolved.length) return [] as string[];
     const convs = await tx.select({ id: conversations.id }).from(conversations).where(inArray(conversations.customerId, resolved));
     const convIds = convs.map((c) => c.id);
@@ -166,4 +195,51 @@ export async function eraseCustomer(storeId: string, ref: CustomerRef): Promise<
   if (!ids.length) return false;
   await revokeSessionsForCustomers(storeId, ids).catch(() => {});
   return true;
+}
+
+export type EraseStoreCounts = {
+  conversations: number;
+  attributions: number;
+  customers: number;
+  total: number;
+};
+
+/**
+ * Erases every customer's personal data for a store, leaving the store itself and its
+ * platform connection intact.
+ *
+ * This is the shop-level counterpart to `eraseCustomer`, for Shopify's `shop/redact`:
+ * a redact request must clear the whole store's held data, not just what retention
+ * cutoffs have already aged out (which is what `purgeStorePii` does). Conversations are
+ * deleted directly and their messages go with them via the FK cascade; attributions are
+ * deleted by store id too, because impression-only rows have no conversation to cascade
+ * from. Order PII is nulled (not deleted — the merchant keeps their ledger), and the
+ * store row, token and configuration all survive.
+ */
+export async function eraseStorePii(storeId: string): Promise<EraseStoreCounts> {
+  return withTenant(storeId, async (tx) => {
+    await tx.delete(automationLogs).where(eq(automationLogs.storeId, storeId));
+    const conversationsResult = await tx
+      .delete(conversations)
+      .where(eq(conversations.storeId, storeId))
+      .returning({ id: conversations.id });
+    const attributionsResult = await tx
+      .delete(attributions)
+      .where(eq(attributions.storeId, storeId))
+      .returning({ id: attributions.id });
+    await tx
+      .update(orders)
+      .set({ customerId: null, customerName: null, customerPhone: null, customerEmail: null })
+      .where(eq(orders.storeId, storeId));
+    const customersResult = await tx
+      .delete(customers)
+      .where(eq(customers.storeId, storeId))
+      .returning({ id: customers.id });
+    return {
+      conversations: conversationsResult.length,
+      attributions: attributionsResult.length,
+      customers: customersResult.length,
+      total: conversationsResult.length + attributionsResult.length + customersResult.length,
+    };
+  });
 }

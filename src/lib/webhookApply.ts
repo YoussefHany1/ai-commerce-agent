@@ -1,5 +1,7 @@
 import { catalogRepo, orderRepo, storeRepo } from '../db/repos.js';
 import { markConversionsForOrder } from '../services/analytics.js';
+import { eraseCustomer, eraseStorePii, getCustomerData } from '../services/pdpl.js';
+import { stopStoreWhatsApp } from '../services/whatsappSession.js';
 import { logger } from './logger.js';
 import type { Product, Order, Platform } from '../types.js';
 import type { WebhookEvent } from './webhooks.js';
@@ -74,14 +76,22 @@ export async function applyWebhook(
 ): Promise<void> {
   if (platform === 'shopify') {
     if (event.type === 'app/uninstalled') {
+      // Best-effort teardown before the store row goes away: a live WhatsApp socket
+      // would otherwise outlive the store, and its stored creds would be orphaned
+      // once the row (and the cascaded baileys-session rows) are gone.
+      await stopStoreWhatsApp(storeId).catch((err) =>
+        logger.warn({ err, storeId }, 'shopify: whatsapp teardown on uninstall failed'),
+      );
       await storeRepo.remove(storeId);
       logger.info({ storeId }, 'shopify: app/uninstalled — removed store and tenant data');
       return;
     }
     if (event.type === 'customers/data_request' || event.type === 'customers/redact' || event.type === 'shop/redact') {
-      // Shopify PDPL/GDPR topics are recorded as events (audit trail) and fulfilled
-      // manually through /api/pdpl/access + /api/pdpl/erase by the operator.
-      logger.info({ storeId, type: event.type }, 'shopify: pdpl webhook recorded');
+      // App-level Shopify privacy webhooks (customers/data_request, customers/redact,
+      // shop/redact). Fulfilled here — erase the customer, erase the store's PII, or
+      // gather the export — always best-effort so a failing redact never pushes the
+      // webhook into a Shopify retry loop.
+      await fulfillShopifyPrivacy(storeId, event);
       return;
     }
     if ((event.type === 'products/create' || event.type === 'products/update') && event.payload) {
@@ -126,5 +136,55 @@ export async function applyWebhook(
     } else {
       logger.warn({ platform, type }, 'webhook: product payload resolved to no id — skipped');
     }
+  }
+}
+
+/**
+ * Fulfils a Shopify app-level privacy webhook.
+ *
+ * Never throws: the callers are webhook dispatchers, and an exception there turns
+ * Shopify's delivery into a retry loop against a request the handler already decided
+ * to accept. Failures are logged with just enough detail to resolve without echoing
+ * PII (booleans, never the identifiers themselves).
+ */
+async function fulfillShopifyPrivacy(storeId: string, event: WebhookEvent): Promise<void> {
+  const payload = (event.payload ?? {}) as { customer?: Record<string, unknown> };
+  const customer = payload.customer ?? {};
+  const email = typeof customer.email === 'string' && customer.email ? customer.email : undefined;
+  const phone = typeof customer.phone === 'string' && customer.phone ? customer.phone : undefined;
+
+  if (event.type === 'customers/redact') {
+    try {
+      // matchAny (OR) on purpose: the payload carries whatever Shopify knows —
+      // often only email — and a mismatch on one identifier must not fail the erase.
+      const erased = await eraseCustomer(storeId, { email, phone }, true);
+      logger.info({ storeId, erased, hasEmail: !!email, hasPhone: !!phone }, 'shopify: customers/redact fulfilled');
+    } catch (err) {
+      logger.warn({ err, storeId }, 'shopify: customers/redact fulfillment failed');
+    }
+    return;
+  }
+
+  if (event.type === 'shop/redact') {
+    try {
+      const counts = await eraseStorePii(storeId);
+      logger.info({ storeId, counts }, 'shopify: shop/redact fulfilled');
+    } catch (err) {
+      logger.warn({ err, storeId }, 'shopify: shop/redact fulfillment failed');
+    }
+    return;
+  }
+
+  // customers/data_request: there is no mail-out transport in this product, so the
+  // export is gathered and made available to the operator (it remains retrievable
+  // through /api/pdpl/access); record what was found for the audit event.
+  try {
+    const data = await getCustomerData(storeId, { email, phone });
+    logger.info(
+      { storeId, found: !!data, orders: data?.orders?.length ?? 0, conversations: data?.conversations?.length ?? 0 },
+      'shopify: customers/data_request recorded',
+    );
+  } catch (err) {
+    logger.warn({ err, storeId }, 'shopify: customers/data_request failed');
   }
 }

@@ -12,6 +12,15 @@ automatically_update_urls_on_dev = true
 [webhooks]
 api_version = "2026-07"
 
+# App-level privacy webhooks (delivered to /webhooks/shopify with the standard
+# X-Shopify-* headers; not store-level GraphQL subscriptions). Registered by
+# `shopify app deploy` or by hand under Partner Dashboard > App setup > Privacy
+# webhooks — same URL for all three, served by src/routes/webhooks.ts.
+[webhooks.privacy_compliance]
+customers_data_request_url = "https://agent-api-84tq.onrender.com/webhooks/shopify"
+customers_redact_url = "https://agent-api-84tq.onrender.com/webhooks/shopify"
+shop_redact_url = "https://agent-api-84tq.onrender.com/webhooks/shopify"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_inventory,read_orders,read_products,write_products,read_customers"

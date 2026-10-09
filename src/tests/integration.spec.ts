@@ -18,6 +18,8 @@ let products: typeof import('../db/schema.js').products;
 let createSession: typeof import('../lib/session.js').createSession;
 let getSession: typeof import('../lib/session.js').getSession;
 let revokeSession: typeof import('../lib/session.js').revokeSession;
+let eraseStorePii: typeof import('../services/pdpl.js').eraseStorePii;
+let eraseCustomer: typeof import('../services/pdpl.js').eraseCustomer;
 let admin: ReturnType<typeof postgres> | undefined;
 
 const INJECTED = ['DATABASE_URL', 'REDIS_URL', 'ENCRYPTION_KEY', 'ENCRYPTION_KEY_VERSION'] as const;
@@ -46,6 +48,8 @@ async function loadModules() {
     createSession = session.createSession;
     getSession = session.getSession;
     revokeSession = session.revokeSession;
+    eraseStorePii = (await import('../services/pdpl.js')).eraseStorePii;
+    eraseCustomer = (await import('../services/pdpl.js')).eraseCustomer;
   } finally {
     for (const k of Object.keys(process.env)) {
       if (!INJECTED.includes(k as (typeof INJECTED)[number])) continue;
@@ -61,6 +65,9 @@ const TABLE = {
   stores: { name: 'stores', idCol: 'id' },
   conversations: { name: 'conversations', idCol: 'store_id' },
   platform_connections: { name: 'platform_connections', idCol: 'store_id' },
+  customers: { name: 'customers', idCol: 'store_id' },
+  messages: { name: 'messages', idCol: 'store_id' },
+  attributions: { name: 'attributions', idCol: 'store_id' },
 } as const;
 
 async function adminCount(table: keyof typeof TABLE, storeId: string): Promise<number> {
@@ -231,6 +238,73 @@ describe.skipIf(!enabled)('integration (real Postgres + Redis, RLS applied)', ()
     expect(await storeRepo.remove(a)).toBe(true);
     await expect(adminCount('platform_connections', a)).resolves.toBe(0);
     await expect(adminCount('stores', a)).resolves.toBe(0);
+  });
+
+  it('eraseStorePii clears customer PII but keeps the store and its connection', async () => {
+    const a = await storeRepo.create({
+      name: 'PII ERASE',
+      platform: 'shopify',
+      shopDomain: 'pii-erase.myshopify.com',
+      accessToken: 'shpat_pii_erase',
+    });
+    createdStores.push(a);
+
+    const { customers, conversations, messages, orders, attributions } = await import('../db/schema.js');
+    const { eq } = await import('drizzle-orm');
+    await withTenant(a, async (tx) => {
+      const [cust] = await tx
+        .insert(customers)
+        .values({ storeId: a, name: 'سارة', phone: '966500000001', email: 'pii-s@example.com' })
+        .returning({ id: customers.id });
+      const [conv] = await tx
+        .insert(conversations)
+        .values({ storeId: a, customerId: cust.id, channel: 'web', status: 'open' })
+        .returning({ id: conversations.id });
+      await tx.insert(messages).values({ storeId: a, conversationId: conv.id, role: 'user', content: 'مرحبا' });
+      await tx.insert(attributions).values({ storeId: a, conversationId: conv.id, productId: 'p1', channel: 'web' });
+      await tx.insert(orders).values({
+        storeId: a,
+        platformOrderId: 'gid://shopify/Order/PII-ERASE-1',
+        total: 10,
+        currency: 'SAR',
+        status: 'open',
+        customerId: cust.id,
+        customerName: 'سارة',
+        customerPhone: '966500000001',
+        customerEmail: 'pii-s@example.com',
+      });
+    });
+
+    const counts = await eraseStorePii(a);
+    expect(counts).toMatchObject({ conversations: 1, attributions: 1, customers: 1, total: 3 });
+
+    await expect(adminCount('customers', a)).resolves.toBe(0);
+    await expect(adminCount('conversations', a)).resolves.toBe(0);
+    await expect(adminCount('messages', a)).resolves.toBe(0);
+    await expect(adminCount('attributions', a)).resolves.toBe(0);
+    const rows = await withTenant(a, (tx) => tx.select().from(orders).where(eq(orders.storeId, a)));
+    expect(rows[0].customerId).toBeNull();
+    expect(rows[0].customerName).toBeNull();
+    expect(rows[0].customerPhone).toBeNull();
+    expect(rows[0].customerEmail).toBeNull();
+
+    // A shop/redact must not take the store or its connection with it.
+    expect(await storeRepo.get(a)).not.toBeNull();
+    await expect(adminCount('platform_connections', a)).resolves.toBe(1);
+  });
+
+  it('eraseCustomer matches any provided identifier for webhook redaction', async () => {
+    const a = await storeRepo.create({ name: 'OR ERASE', platform: 'shopify', shopDomain: 'or-erase.myshopify.com' });
+    createdStores.push(a);
+    const { customers } = await import('../db/schema.js');
+    await withTenant(a, (tx) =>
+      tx.insert(customers).values({ storeId: a, name: 'Only Mail', email: 'only-mail@example.com', phone: '966511111111' }),
+    );
+
+    // Shopify's customers/redact carried only the email, and the phone it knew was
+    // absent from our copy — AND-matching would have failed the request entirely.
+    expect(await eraseCustomer(a, { email: 'only-mail@example.com', phone: '966599999999' }, true)).toBe(true);
+    await expect(adminCount('customers', a)).resolves.toBe(0);
   });
 
   it('scopes stores and the self row to a client under withClient', async () => {
