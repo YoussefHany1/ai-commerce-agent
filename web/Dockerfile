@@ -38,6 +38,10 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3001
 COPY --from=builder /app/web/.next/standalone ./
 COPY --from=builder /app/web/.next/static ./.next/static
+# The standalone bundle does not include public/. Without this copy the storefront
+# widget and any other public asset 404 in the image (the API-only origins checked
+# in the health probes would not catch it — /widget.js is served by the web app).
+COPY --from=builder /app/web/public ./public
 EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "const p=process.env.PORT||3001;fetch('http://127.0.0.1:'+p+'/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"

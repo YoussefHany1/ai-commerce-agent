@@ -70,8 +70,9 @@ jobs:
           trap 'docker logs web-reachability; docker rm -f web-reachability' EXIT
 
           for i in $(seq 1 30); do
-            if curl -fsS -o /dev/null http://127.0.0.1:18081/login; then
-              echo "web image served /login on the published port"
+            if curl -fsS -o /dev/null http://127.0.0.1:18081/login \
+              && curl -fsS http://127.0.0.1:18081/widget.js | grep -q 'aca-widget'; then
+              echo "web image served /login and /widget.js on the published port"
               exit 0
             fi
             sleep 2
